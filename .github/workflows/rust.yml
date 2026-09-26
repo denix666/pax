@@ -1,0 +1,29 @@
+name: Build
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  linux_build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build --release
+
+    - shell: bash
+      run: |
+        mv target/release/pax pax
+        chmod 777 pax
+        tar cpfz pax_linux_x86_64.tar.gz pax
+
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: pax_linux_x86_64.tar.gz
