@@ -1,0 +1,21 @@
+[package]
+name = "pax-exec"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pax-core = { path = "../pax-core" }
+pax-alpm = { path = "../pax-alpm" }
+pax-resolver = { path = "../pax-resolver" }
+thiserror.workspace = true
+ureq.workspace = true
+sha2.workspace = true
+indicatif.workspace = true
+tempfile.workspace = true
+zstd.workspace = true
+xz2.workspace = true
+tar.workspace = true
+rayon.workspace = true
+flate2.workspace = true
+md5.workspace = true
+libc.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "pax"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pax"
+path = "src/main.rs"
+
+[dependencies]
+pax-core = { path = "../pax-core" }
+pax-alpm = { path = "../pax-alpm" }
+pax-resolver = { path = "../pax-resolver" }
+pax-exec = { path = "../pax-exec" }
+pax-aur = { path = "../pax-aur" }
+clap.workspace = true
+indicatif.workspace = true
+owo-colors.workspace = true
+anyhow.workspace = true
+libc.workspace = true

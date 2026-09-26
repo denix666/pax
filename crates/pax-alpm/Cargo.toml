@@ -1,0 +1,10 @@
+[package]
+name = "pax-alpm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pax-core = { path = "../pax-core" }
+flate2.workspace = true
+tar.workspace = true
+rayon.workspace = true

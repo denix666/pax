@@ -1,0 +1,11 @@
+pub mod aur;
+pub mod aur_search;
+pub mod files;
+pub mod info;
+pub mod install;
+pub mod owner;
+pub mod query;
+pub mod remove;
+pub mod search;
+pub mod sync;
+pub mod upgrade;

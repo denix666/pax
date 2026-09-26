@@ -1,0 +1,8 @@
+[package]
+name = "pax-resolver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pax-core = { path = "../pax-core" }
+thiserror.workspace = true
