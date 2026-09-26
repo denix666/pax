@@ -68,10 +68,11 @@ fn main() -> Result<()> {
         Command::Install {
             packages,
             dry_run,
+            download_only,
             noconfirm,
             needed,
             reinstall,
-        } => commands::install::run(&mut db, packages, *dry_run, *noconfirm, *needed, *reinstall),
+        } => commands::install::run(&mut db, packages, *dry_run, *download_only, *noconfirm, *needed, *reinstall),
         Command::AurInstall {
             packages,
             skip_review,

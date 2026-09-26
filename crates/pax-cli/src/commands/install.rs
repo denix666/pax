@@ -17,7 +17,7 @@ struct SyncInfo {
     sha256sum: Option<String>,
 }
 
-pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, noconfirm: bool, needed: bool, reinstall: bool) -> Result<()> {
+pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, needed: bool, reinstall: bool) -> Result<()> {
     if packages.is_empty() {
         eprintln!("error: no targets specified");
         std::process::exit(1);
@@ -48,13 +48,13 @@ pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, noconfir
             println!("there is nothing to do");
             return Ok(());
         }
-        return run_inner(db, &filtered, dry_run, noconfirm, reinstall);
+        return run_inner(db, &filtered, dry_run, download_only, noconfirm, reinstall);
     }
 
-    run_inner(db, packages, dry_run, noconfirm, reinstall)
+    run_inner(db, packages, dry_run, download_only, noconfirm, reinstall)
 }
 
-fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, noconfirm: bool, reinstall: bool) -> Result<()> {
+fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, reinstall: bool) -> Result<()> {
 
     let ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
     let capacity = db.sync()?.package_count() + db.local()?.len();
@@ -178,6 +178,10 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, noconf
         downloaded.len(),
         cache_dir.display()
     );
+
+    if download_only {
+        return Ok(());
+    }
 
     let old_install_scripts = collect_old_install_scripts(&db.config.db_path, &tx);
     let old_backup_md5 = collect_old_backup_md5(&db.config.db_path, &tx);

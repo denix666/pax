@@ -65,6 +65,9 @@ sudo pax install nginx
 # Install with dry-run
 pax install nginx --dry-run
 
+# Download package without installing
+sudo pax install nginx --download-only
+
 # Reinstall a package
 sudo pax install nginx --reinstall
 
@@ -116,6 +119,7 @@ pax aur-search telegram
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Show what would be installed without installing |
+| `-w`, `--download-only` | Download packages to cache without installing |
 | `--noconfirm` | Skip confirmation prompt |
 | `--needed` | Skip already installed up-to-date packages |
 | `--reinstall` | Reinstall already installed packages |
