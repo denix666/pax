@@ -61,6 +61,10 @@ fn main() -> Result<()> {
             noconfirm,
             recursive,
         } => commands::remove::run(&mut db, packages, *noconfirm, *recursive),
+        Command::LocalInstall {
+            files,
+            noconfirm,
+        } => commands::localinstall::run(&mut db, files, *noconfirm),
         Command::Install {
             packages,
             dry_run,

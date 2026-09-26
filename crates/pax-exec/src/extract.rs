@@ -169,6 +169,88 @@ fn compute_md5(path: &Path) -> Result<String> {
     Ok(format!("{:x}", md5::compute(&buf)))
 }
 
+pub struct PkgFileInfo {
+    pub name: String,
+    pub version: String,
+    pub installed_size: u64,
+}
+
+pub fn read_pkginfo(pkg_path: &Path) -> Result<PkgFileInfo> {
+    let filename = pkg_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let file = std::fs::File::open(pkg_path)?;
+    let decompressor = decompress(file, &filename)?;
+    let mut archive = Archive::new(decompressor);
+
+    let mut pkginfo = String::new();
+
+    for entry_result in archive.entries().map_err(|e| ExecError::Extraction {
+        pkg: filename.clone(),
+        message: e.to_string(),
+    })? {
+        let mut entry = entry_result.map_err(|e| ExecError::Extraction {
+            pkg: filename.clone(),
+            message: e.to_string(),
+        })?;
+
+        let path = entry.path().map_err(|e| ExecError::Extraction {
+            pkg: filename.clone(),
+            message: e.to_string(),
+        })?;
+        let path_str = path.to_string_lossy();
+        let path_str = path_str.strip_prefix("./").unwrap_or(&path_str);
+
+        if path_str == ".PKGINFO" {
+            entry.read_to_string(&mut pkginfo).map_err(|e| ExecError::Extraction {
+                pkg: filename.clone(),
+                message: format!(".PKGINFO: {e}"),
+            })?;
+            break;
+        }
+    }
+
+    if pkginfo.is_empty() {
+        return Err(ExecError::Extraction {
+            pkg: filename,
+            message: "missing .PKGINFO".to_string(),
+        });
+    }
+
+    let name = pkginfo
+        .lines()
+        .find_map(|l| l.strip_prefix("pkgname = "))
+        .ok_or_else(|| ExecError::Extraction {
+            pkg: filename.clone(),
+            message: "missing pkgname in .PKGINFO".to_string(),
+        })?
+        .to_string();
+
+    let version = pkginfo
+        .lines()
+        .find_map(|l| l.strip_prefix("pkgver = "))
+        .ok_or_else(|| ExecError::Extraction {
+            pkg: filename.clone(),
+            message: "missing pkgver in .PKGINFO".to_string(),
+        })?
+        .to_string();
+
+    let installed_size = pkginfo
+        .lines()
+        .find_map(|l| l.strip_prefix("size = "))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    Ok(PkgFileInfo {
+        name,
+        version,
+        installed_size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

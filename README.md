@@ -49,6 +49,7 @@ pax [OPTIONS] [COMMAND]
 | `query` | `q` | Query installed packages |
 | `files` | `f` | List files owned by a package |
 | `owner` | `o` | Find which package owns a file |
+| `local-install` | `U` | Install local package files (`.pkg.tar.zst`, `.pkg.tar.xz`, `.pkg.tar.gz`) |
 | `aur-install` | — | Install packages from AUR |
 | `aur-search` | — | Search AUR for packages |
 
@@ -90,6 +91,12 @@ pax owner /usr/bin/vim
 
 # Install a package from AUR
 sudo pax aur-install resistor
+
+# Install a local package file
+sudo pax local-install ./package-1.0-1-x86_64.pkg.tar.zst
+
+# Install multiple local packages at once
+sudo pax local-install pkg1.pkg.tar.zst pkg2.pkg.tar.zst
 
 # Search AUR
 pax aur-search telegram

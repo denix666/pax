@@ -12,7 +12,7 @@ pub mod verify;
 pub use download::{download_packages, DownloadTarget, DownloadedPackage};
 pub use error::ExecError;
 pub use execute::{execute_transaction, InstallContext};
-pub use extract::{extract_package, PackageMetadata};
+pub use extract::{extract_package, read_pkginfo, PackageMetadata, PkgFileInfo};
 pub use hooks::{load_hooks, run_hooks, HookWhen, TransactionPackages};
 pub use register::register_package;
 pub use removal::{remove_package, RemovalTarget};

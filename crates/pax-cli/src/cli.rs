@@ -78,6 +78,17 @@ pub enum Command {
         file: PathBuf,
     },
 
+    /// Install local package files (.pkg.tar.zst, .pkg.tar.xz, .pkg.tar.gz)
+    #[command(alias = "U")]
+    LocalInstall {
+        /// Paths to package files
+        files: Vec<PathBuf>,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        noconfirm: bool,
+    },
+
     /// Install packages (resolves dependencies)
     #[command(alias = "S")]
     Install {
