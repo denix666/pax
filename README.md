@@ -52,6 +52,7 @@ pax [OPTIONS] [COMMAND]
 | `local-install` | `U` | Install local package files (`.pkg.tar.zst`, `.pkg.tar.xz`, `.pkg.tar.gz`) |
 | `clean` | `c` | Clean package cache |
 | `aur-install` | — | Install packages from AUR |
+| `aur-upgrade` | — | Upgrade installed AUR packages |
 | `aur-search` | — | Search AUR for packages |
 
 ### Examples
@@ -107,6 +108,9 @@ sudo pax clean
 
 # Remove all cached packages
 sudo pax clean --all
+
+# Upgrade all AUR packages
+sudo pax aur-upgrade
 
 # Search AUR
 pax aur-search telegram

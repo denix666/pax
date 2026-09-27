@@ -4,6 +4,7 @@ use std::io::Write;
 use anyhow::Result;
 use indicatif::MultiProgress;
 use pax_alpm::db::DatabaseHandle;
+use pax_core::config::SigLevel;
 use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
 use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveOptions};
 
@@ -15,6 +16,7 @@ struct SyncInfo {
     repository: String,
     filename: String,
     sha256sum: Option<String>,
+    sig_level: SigLevel,
 }
 
 pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, needed: bool, reinstall: bool) -> Result<()> {
@@ -64,16 +66,34 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         pool.add_local(pkg.info.clone());
     }
 
+    let global_sig_level = db.config.sig_level.package;
+    let repo_sig_levels: HashMap<String, SigLevel> = db
+        .config
+        .repos
+        .iter()
+        .map(|r| {
+            let level = r.sig_level.map(|s| s.package).unwrap_or(global_sig_level);
+            (r.name.clone(), level)
+        })
+        .collect();
+
     let sync_pkgs = db.sync_packages_with_repo_index()?;
     let mut sync_map: HashMap<String, SyncInfo> = HashMap::with_capacity(sync_pkgs.len());
 
     for (pkg, idx) in &sync_pkgs {
-        sync_map.entry(pkg.info.name.clone()).or_insert_with(|| SyncInfo {
-            compressed_size: pkg.compressed_size,
-            installed_size: pkg.installed_size,
-            repository: pkg.repository.clone(),
-            filename: pkg.filename.clone(),
-            sha256sum: pkg.sha256sum.clone(),
+        sync_map.entry(pkg.info.name.clone()).or_insert_with(|| {
+            let sig_level = repo_sig_levels
+                .get(&pkg.repository)
+                .copied()
+                .unwrap_or(global_sig_level);
+            SyncInfo {
+                compressed_size: pkg.compressed_size,
+                installed_size: pkg.installed_size,
+                repository: pkg.repository.clone(),
+                filename: pkg.filename.clone(),
+                sha256sum: pkg.sha256sum.clone(),
+                sig_level,
+            }
         });
         pool.add_sync(pkg.info.clone(), *idx);
     }
@@ -157,6 +177,7 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
             expected_sha256: info.sha256sum.clone(),
             compressed_size: info.compressed_size,
             mirrors: servers,
+            sig_level: info.sig_level,
         });
     }
 
@@ -170,6 +191,7 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         cache_dir,
         db.config.parallel_downloads,
         &multi,
+        &db.config.gpg_dir,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 

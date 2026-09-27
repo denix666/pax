@@ -11,18 +11,59 @@ pub struct BuildResult {
     pub build_dir: PathBuf,
 }
 
-fn real_user() -> Option<(String, u32, u32)> {
-    let user = std::env::var("SUDO_USER").ok()?;
-    let uid: u32 = std::env::var("SUDO_UID").ok()?.parse().ok()?;
-    let gid: u32 = std::env::var("SUDO_GID").ok()?.parse().ok()?;
-    Some((user, uid, gid))
+struct BuildUser {
+    uid: u32,
+    gid: u32,
+    home: PathBuf,
 }
 
-fn as_real_user(cmd: &mut Command) {
-    if let Some((user, uid, gid)) = real_user() {
-        cmd.env("HOME", format!("/home/{user}"))
-            .uid(uid)
-            .gid(gid);
+fn build_user(allow_root: bool) -> Option<BuildUser> {
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        let uid: u32 = std::env::var("SUDO_UID").ok()?.parse().ok()?;
+        let gid: u32 = std::env::var("SUDO_GID").ok()?.parse().ok()?;
+        return Some(BuildUser {
+            home: PathBuf::from(format!("/home/{user}")),
+            uid,
+            gid,
+        });
+    }
+
+    if allow_root && unsafe { libc::geteuid() } == 0 {
+        return Some(BuildUser {
+            uid: 65534,
+            gid: 65534,
+            home: PathBuf::from("/var/tmp/pax-aur"),
+        });
+    }
+
+    None
+}
+
+fn as_build_user(cmd: &mut Command, user: &BuildUser) {
+    cmd.env("HOME", &user.home)
+        .uid(user.uid)
+        .gid(user.gid);
+}
+
+fn chown_recursive(path: &Path, uid: u32, gid: u32) {
+    let c_path = match std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    unsafe { libc::chown(c_path.as_ptr(), uid, gid); }
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let c = match std::ffi::CString::new(p.to_string_lossy().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            unsafe { libc::chown(c.as_ptr(), uid, gid); }
+            if p.is_dir() {
+                chown_recursive(&p, uid, gid);
+            }
+        }
     }
 }
 
@@ -30,33 +71,33 @@ pub fn clone_and_build(
     pkg: &AurPackage,
     build_base: &Path,
     skip_review: bool,
+    allow_root: bool,
 ) -> Result<BuildResult> {
-    if let Some((_, uid, gid)) = real_user() {
-        std::fs::create_dir_all(build_base)?;
-        unsafe {
-            libc::chown(
-                std::ffi::CString::new(build_base.to_string_lossy().as_bytes())
-                    .unwrap()
-                    .as_ptr(),
-                uid,
-                gid,
-            );
-        }
+    let user = build_user(allow_root);
+
+    let effective_base = match user.as_ref() {
+        Some(u) if u.uid == 65534 => u.home.as_path(),
+        _ => build_base,
+    };
+
+    if let Some(ref u) = user {
+        std::fs::create_dir_all(effective_base)?;
+        chown_recursive(effective_base, u.uid, u.gid);
     }
 
-    let build_dir = build_base.join(&pkg.package_base);
+    let build_dir = effective_base.join(&pkg.package_base);
 
     if build_dir.exists() {
-        pull_updates(&build_dir, &pkg.name)?;
+        pull_updates(&build_dir, &pkg.name, user.as_ref())?;
     } else {
-        clone_repo(&pkg.package_base, &build_dir)?;
+        clone_repo(&pkg.package_base, &build_dir, user.as_ref())?;
     }
 
     if !skip_review {
         show_pkgbuild(&build_dir, &pkg.name)?;
     }
 
-    let pkg_path = run_makepkg(&build_dir, &pkg.name)?;
+    let pkg_path = run_makepkg(&build_dir, &pkg.name, user.as_ref())?;
 
     Ok(BuildResult {
         name: pkg.name.clone(),
@@ -65,7 +106,7 @@ pub fn clone_and_build(
     })
 }
 
-fn clone_repo(package_base: &str, dest: &Path) -> Result<()> {
+fn clone_repo(package_base: &str, dest: &Path, user: Option<&BuildUser>) -> Result<()> {
     let url = format!("https://aur.archlinux.org/{package_base}.git");
 
     let mut cmd = Command::new("git");
@@ -73,7 +114,9 @@ fn clone_repo(package_base: &str, dest: &Path) -> Result<()> {
         .arg(dest)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
-    as_real_user(&mut cmd);
+    if let Some(u) = user {
+        as_build_user(&mut cmd, u);
+    }
     let output = cmd.output()?;
 
     if !output.status.success() {
@@ -86,13 +129,15 @@ fn clone_repo(package_base: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn pull_updates(build_dir: &Path, pkg_name: &str) -> Result<()> {
+fn pull_updates(build_dir: &Path, pkg_name: &str, user: Option<&BuildUser>) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.args(["pull", "--ff-only"])
         .current_dir(build_dir)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
-    as_real_user(&mut cmd);
+    if let Some(u) = user {
+        as_build_user(&mut cmd, u);
+    }
     let output = cmd.output()?;
 
     if !output.status.success() {
@@ -122,13 +167,15 @@ fn show_pkgbuild(build_dir: &Path, pkg_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_makepkg(build_dir: &Path, pkg_name: &str) -> Result<PathBuf> {
+fn run_makepkg(build_dir: &Path, pkg_name: &str, user: Option<&BuildUser>) -> Result<PathBuf> {
     let mut cmd = Command::new("makepkg");
     cmd.args(["-sf", "--noconfirm", "--needed"])
         .current_dir(build_dir)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
-    as_real_user(&mut cmd);
+    if let Some(u) = user {
+        as_build_user(&mut cmd, u);
+    }
     let output = cmd.output()?;
 
     if !output.status.success() {

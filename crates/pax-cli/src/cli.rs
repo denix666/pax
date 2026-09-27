@@ -144,6 +144,25 @@ pub enum Command {
         /// Skip confirmation prompt
         #[arg(long)]
         noconfirm: bool,
+
+        /// Allow running as root (not recommended)
+        #[arg(long)]
+        allow_root: bool,
+    },
+
+    /// Upgrade installed AUR packages
+    AurUpgrade {
+        /// Skip PKGBUILD review
+        #[arg(long)]
+        skip_review: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        noconfirm: bool,
+
+        /// Allow running as root (not recommended)
+        #[arg(long)]
+        allow_root: bool,
     },
 
     /// Search AUR for packages

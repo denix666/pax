@@ -24,6 +24,76 @@ pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Resul
 
     db.local()?;
 
+    let mut pkg_info_list = Vec::with_capacity(files.len());
+    for file in files {
+        let info = read_pkginfo(file).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let version = Version::parse(&info.version)
+            .map_err(|e| anyhow::anyhow!("{}: invalid version: {e}", file.display()))?;
+        let local_ver = db.local_info(&info.name)?.map(|p| p.info.version.clone());
+        pkg_info_list.push((info, version, local_ver));
+    }
+
+    let has_work = pkg_info_list.iter().any(|(_, _, _)| true);
+    if !has_work {
+        println!("there is nothing to do");
+        return Ok(());
+    }
+
+    let mut install_count = 0usize;
+    let mut upgrade_count = 0usize;
+
+    for (info, version, local_ver) in &pkg_info_list {
+        if let Some(old_ver) = local_ver {
+            if upgrade_count == 0 {
+                println!("\n{}", "Packages to upgrade:".bold());
+            }
+            println!(
+                "  {}/{} {} -> {}",
+                "local".purple(),
+                info.name.bold(),
+                old_ver.red(),
+                version.green(),
+            );
+            upgrade_count += 1;
+        } else {
+            if install_count == 0 {
+                println!("\n{}", "Packages to install:".bold());
+            }
+            println!(
+                "  {}/{} {}",
+                "local".purple(),
+                info.name.bold(),
+                version.green(),
+            );
+            install_count += 1;
+        }
+    }
+
+    let total_count = install_count + upgrade_count;
+    println!("\nTotal packages: {}", total_count.to_string().bold());
+
+    if !noconfirm {
+        print!("\nProceed with installation? [Y/n] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_lowercase();
+        if !answer.is_empty() && answer != "y" && answer != "yes" {
+            println!("Installation cancelled.");
+            return Ok(());
+        }
+    }
+
+    install_pkg_files(db, files)?;
+
+    println!("{total_count} package(s) installed successfully.");
+
+    Ok(())
+}
+
+pub fn install_pkg_files(db: &mut DatabaseHandle, files: &[PathBuf]) -> Result<()> {
+    db.local()?;
+
     let mut installs = Vec::new();
     let mut upgrades = Vec::new();
     let mut total_installed_size: u64 = 0;
@@ -63,51 +133,6 @@ pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Resul
         });
     }
 
-    if installs.is_empty() && upgrades.is_empty() {
-        println!("there is nothing to do");
-        return Ok(());
-    }
-
-    if !installs.is_empty() {
-        println!("\n{}", "Packages to install:".bold());
-        for inst in &installs {
-            println!(
-                "  {}/{} {}",
-                "local".purple(),
-                inst.name.bold(),
-                inst.version.green(),
-            );
-        }
-    }
-
-    if !upgrades.is_empty() {
-        println!("\n{}", "Packages to upgrade:".bold());
-        for upg in &upgrades {
-            println!(
-                "  {}/{} {} -> {}",
-                "local".purple(),
-                upg.name.bold(),
-                upg.old_version.red(),
-                upg.new_version.green(),
-            );
-        }
-    }
-
-    let total_count = installs.len() + upgrades.len();
-    println!("\nTotal packages: {}", total_count.to_string().bold());
-
-    if !noconfirm {
-        print!("\nProceed with installation? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Installation cancelled.");
-            return Ok(());
-        }
-    }
-
     let tx = Transaction {
         installs,
         upgrades,
@@ -115,6 +140,10 @@ pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Resul
         total_download_size: 0,
         total_installed_size,
     };
+
+    if tx.is_empty() {
+        return Ok(());
+    }
 
     let old_install_scripts = collect_old_install_scripts(&db.config.db_path, &tx);
     let old_backup_md5 = collect_old_backup_md5(&db.config.db_path, &tx);
@@ -129,8 +158,6 @@ pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Resul
     };
 
     execute_transaction(&tx, &ctx).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    println!("{total_count} package(s) installed successfully.");
 
     Ok(())
 }

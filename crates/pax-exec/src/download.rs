@@ -6,6 +6,8 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use pax_core::config::SigLevel;
+
 use crate::error::{ExecError, Result};
 use crate::verify;
 
@@ -15,6 +17,7 @@ pub struct DownloadTarget {
     pub expected_sha256: Option<String>,
     pub compressed_size: u64,
     pub mirrors: Vec<String>,
+    pub sig_level: SigLevel,
 }
 
 pub struct DownloadedPackage {
@@ -27,6 +30,7 @@ pub fn download_packages(
     cache_dir: &Path,
     parallel: u32,
     multi_progress: &MultiProgress,
+    gpg_dir: &Path,
 ) -> Result<Vec<DownloadedPackage>> {
     let to_download: Vec<_> = targets
         .iter()
@@ -57,10 +61,11 @@ pub fn download_packages(
             message: e.to_string(),
         })?;
 
+    let gpg_dir = gpg_dir.to_path_buf();
     let results: Vec<Result<DownloadedPackage>> = pool.install(|| {
         to_download
             .par_iter()
-            .map(|target| download_one(target, cache_dir, multi_progress))
+            .map(|target| download_one(target, cache_dir, multi_progress, &gpg_dir))
             .collect()
     });
 
@@ -98,6 +103,7 @@ fn download_one(
     target: &DownloadTarget,
     cache_dir: &Path,
     multi_progress: &MultiProgress,
+    gpg_dir: &Path,
 ) -> Result<DownloadedPackage> {
     let style = ProgressStyle::with_template(
         " {spinner:.green} {msg:<30} [{bar:25.cyan/dim}] {bytes}/{total_bytes} {bytes_per_sec}",
@@ -115,6 +121,35 @@ fn download_one(
         let url = format!("{mirror_url}/{}", target.filename);
         match try_download(&url, cache_dir, target, &pb) {
             Ok(path) => {
+                if target.sig_level != SigLevel::Never {
+                    let sig_url = format!("{url}.sig");
+                    let sig_path = PathBuf::from(format!("{}.sig", path.display()));
+
+                    match try_download_sig(&sig_url, &sig_path) {
+                        Ok(()) => {
+                            if let Err(e) = verify::verify_pgp(&path, &sig_path, gpg_dir) {
+                                if target.sig_level == SigLevel::Required {
+                                    pb.finish_with_message(format!("{} SIG FAIL", target.name));
+                                    return Err(e);
+                                }
+                                pb.finish_with_message(format!("{} done (sig warning)", target.name));
+                                return Ok(DownloadedPackage {
+                                    name: target.name.clone(),
+                                    path,
+                                });
+                            }
+                        }
+                        Err(_) if target.sig_level == SigLevel::Required => {
+                            pb.finish_with_message(format!("{} SIG MISSING", target.name));
+                            return Err(ExecError::SignatureFailure {
+                                pkg: target.name.clone(),
+                                message: "signature file not available on mirror".to_string(),
+                            });
+                        }
+                        Err(_) => {}
+                    }
+                }
+
                 pb.finish_with_message(format!("{} done", target.name));
                 return Ok(DownloadedPackage {
                     name: target.name.clone(),
@@ -184,4 +219,25 @@ fn try_download(
     })?;
 
     Ok(dest)
+}
+
+fn try_download_sig(url: &str, dest: &Path) -> Result<()> {
+    let response = crate::http_agent()
+        .get(url)
+        .call()
+        .map_err(|e| ExecError::Download {
+            pkg: String::new(),
+            message: e.to_string(),
+        })?;
+
+    let body = response
+        .into_body()
+        .read_to_vec()
+        .map_err(|e| ExecError::Download {
+            pkg: String::new(),
+            message: e.to_string(),
+        })?;
+
+    std::fs::write(dest, &body)?;
+    Ok(())
 }
