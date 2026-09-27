@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use pax_core::package::{InstallReason, Validation};
@@ -6,7 +6,7 @@ use pax_resolver::Transaction;
 
 use crate::download::DownloadedPackage;
 use crate::error::{ExecError, Result};
-use crate::extract::extract_package;
+use crate::extract::{extract_package, read_archive_file_list};
 use crate::hooks::{load_hooks, run_hooks, HookWhen, TransactionPackages};
 use crate::register::{register_package, remove_db_entry};
 use crate::scriptlet::{run_scriptlet, ScriptletOp};
@@ -24,6 +24,8 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
     if unsafe { libc::geteuid() } != 0 {
         return Err(ExecError::NotRoot);
     }
+
+    check_file_conflicts(ctx.db_path, ctx.downloaded, tx)?;
 
     let hooks = load_hooks(ctx.hook_dirs);
 
@@ -215,6 +217,109 @@ fn remove_old_files(db_path: &Path, root_dir: &Path, name: &str, version: &str) 
     }
 
     Ok(())
+}
+
+fn check_file_conflicts(
+    db_path: &Path,
+    downloaded: &[DownloadedPackage],
+    tx: &Transaction,
+) -> Result<()> {
+    if downloaded.is_empty() {
+        return Ok(());
+    }
+
+    let local_dir = db_path.join("local");
+    let mut file_owners: HashMap<String, String> = HashMap::new();
+
+    if let Ok(entries) = std::fs::read_dir(&local_dir) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+
+            let desc_path = entry.path().join("desc");
+            let pkg_name = match std::fs::read_to_string(&desc_path) {
+                Ok(content) => parse_name_from_desc(&content),
+                Err(_) => continue,
+            };
+            let Some(pkg_name) = pkg_name else { continue };
+
+            let files_path = entry.path().join("files");
+            let content = match std::fs::read_to_string(&files_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let mut in_files = false;
+            for line in content.lines() {
+                if line == "%FILES%" {
+                    in_files = true;
+                    continue;
+                }
+                if line.starts_with('%') || line.is_empty() {
+                    in_files = false;
+                    continue;
+                }
+                if in_files && !line.ends_with('/') {
+                    file_owners.insert(line.to_string(), pkg_name.clone());
+                }
+            }
+        }
+    }
+
+    let skip_names: HashSet<&str> = tx
+        .upgrades
+        .iter()
+        .map(|u| u.name.as_str())
+        .chain(tx.removals.iter().map(|r| r.name.as_str()))
+        .collect();
+    file_owners.retain(|_, owner| !skip_names.contains(owner.as_str()));
+
+    let pkg_map: HashMap<&str, &DownloadedPackage> = downloaded
+        .iter()
+        .map(|d| (d.name.as_str(), d))
+        .collect();
+
+    let mut conflicts: Vec<String> = Vec::new();
+
+    let all_names: Vec<&str> = tx
+        .installs
+        .iter()
+        .map(|i| i.name.as_str())
+        .chain(tx.upgrades.iter().map(|u| u.name.as_str()))
+        .collect();
+
+    for name in all_names {
+        let Some(pkg) = pkg_map.get(name) else { continue };
+        let archive_files = read_archive_file_list(&pkg.path)?;
+        for file in &archive_files {
+            if let Some(owner) = file_owners.get(file.as_str()) {
+                conflicts.push(format!(
+                    "  {name}: /{file} already owned by {owner}"
+                ));
+            }
+        }
+    }
+
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(ExecError::FileConflict(conflicts.join("\n")))
+    }
+}
+
+fn parse_name_from_desc(content: &str) -> Option<String> {
+    let mut found = false;
+    for line in content.lines() {
+        if line == "%NAME%" {
+            found = true;
+            continue;
+        }
+        if found {
+            return Some(line.to_string());
+        }
+    }
+    None
 }
 
 fn get_existing_reason(db_path: &Path, name: &str, version: &str) -> InstallReason {

@@ -30,6 +30,9 @@ pub enum ExecError {
     #[error("hook failed: {name}: {message}")]
     Hook { name: String, message: String },
 
+    #[error("conflicting files:\n{0}")]
+    FileConflict(String),
+
     #[error("not running as root")]
     NotRoot,
 
