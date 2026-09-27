@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::io::Write;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use pax_alpm::db::DatabaseHandle;
+use pax_core::package::InstallReason;
 use pax_exec::hooks::{load_hooks, run_hooks, HookWhen, TransactionPackages};
 use pax_exec::{remove_package, RemovalTarget};
 
@@ -10,7 +12,7 @@ pub fn run(
     db: &mut DatabaseHandle,
     packages: &[String],
     noconfirm: bool,
-    _recursive: bool,
+    recursive: bool,
 ) -> Result<()> {
     if packages.is_empty() {
         eprintln!("error: no targets specified");
@@ -32,9 +34,28 @@ pub fn run(
         });
     }
 
+    if recursive {
+        let orphan_targets = find_recursive_orphans(db, &targets)?;
+        for t in orphan_targets {
+            if !targets.iter().any(|existing| existing.name == t.name) {
+                targets.push(t);
+            }
+        }
+    }
+
     println!("{}", "Packages to remove:".bold());
     for target in &targets {
-        println!("  {}-{}", target.name.bold(), target.version.green());
+        let is_dep = !packages.contains(&target.name);
+        if is_dep {
+            println!(
+                "  {}-{} {}",
+                target.name.bold(),
+                target.version.green(),
+                "(dependency)".dimmed()
+            );
+        } else {
+            println!("  {}-{}", target.name.bold(), target.version.green());
+        }
     }
     println!("\nTotal packages: {}", targets.len().bold());
 
@@ -86,4 +107,90 @@ pub fn run(
     println!("{} package(s) removed.", targets.len());
 
     Ok(())
+}
+
+fn find_recursive_orphans(
+    db: &mut DatabaseHandle,
+    initial_targets: &[RemovalTarget],
+) -> Result<Vec<RemovalTarget>> {
+    let all_packages = db.installed_packages()?;
+
+    let mut to_remove: HashSet<String> = initial_targets.iter().map(|t| t.name.clone()).collect();
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+
+        let deps_of_removed: HashSet<String> = all_packages
+            .iter()
+            .filter(|pkg| to_remove.contains(&pkg.info.name))
+            .flat_map(|pkg| pkg.info.depends.iter().map(|d| d.name.clone()))
+            .collect();
+
+        for dep_name in &deps_of_removed {
+            if to_remove.contains(dep_name) {
+                continue;
+            }
+
+            let Some(dep_pkg) = all_packages.iter().find(|p| p.info.name == *dep_name) else {
+                continue;
+            };
+
+            if dep_pkg.reason != InstallReason::Dependency {
+                continue;
+            }
+
+            let still_needed = all_packages.iter().any(|pkg| {
+                if to_remove.contains(&pkg.info.name) {
+                    return false;
+                }
+                pkg.info
+                    .depends
+                    .iter()
+                    .any(|d| d.name == *dep_name)
+                    || pkg
+                        .info
+                        .provides
+                        .iter()
+                        .any(|_| false)
+                    || pkg
+                        .info
+                        .optdepends
+                        .iter()
+                        .any(|d| d.dep.name == *dep_name)
+            });
+
+            if !still_needed {
+                let provides_needed = all_packages.iter().any(|pkg| {
+                    if to_remove.contains(&pkg.info.name) {
+                        return false;
+                    }
+                    dep_pkg.info.provides.iter().any(|prov| {
+                        pkg.info.depends.iter().any(|d| d.name == prov.name)
+                    })
+                });
+
+                if !provides_needed {
+                    to_remove.insert(dep_name.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    for name in &to_remove {
+        if initial_targets.iter().any(|t| &t.name == name) {
+            continue;
+        }
+        if let Some(pkg) = all_packages.iter().find(|p| &p.info.name == name) {
+            result.push(RemovalTarget {
+                name: pkg.info.name.clone(),
+                version: pkg.info.version.to_string(),
+            });
+        }
+    }
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(result)
 }

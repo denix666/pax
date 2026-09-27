@@ -1,5 +1,6 @@
 pub mod aur;
 pub mod aur_search;
+pub mod clean;
 pub mod files;
 pub mod info;
 pub mod install;

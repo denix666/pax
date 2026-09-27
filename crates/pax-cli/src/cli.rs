@@ -152,6 +152,18 @@ pub enum Command {
         query: String,
     },
 
+    /// Clean package cache
+    #[command(alias = "c")]
+    Clean {
+        /// Remove all cached packages, not just outdated ones
+        #[arg(long)]
+        all: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        noconfirm: bool,
+    },
+
     /// Synchronize package databases
     #[command(alias = "y")]
     Sync,

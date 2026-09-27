@@ -50,6 +50,7 @@ pax [OPTIONS] [COMMAND]
 | `files` | `f` | List files owned by a package |
 | `owner` | `o` | Find which package owns a file |
 | `local-install` | `U` | Install local package files (`.pkg.tar.zst`, `.pkg.tar.xz`, `.pkg.tar.gz`) |
+| `clean` | `c` | Clean package cache |
 | `aur-install` | — | Install packages from AUR |
 | `aur-search` | — | Search AUR for packages |
 
@@ -100,6 +101,12 @@ sudo pax local-install ./package-1.0-1-x86_64.pkg.tar.zst
 
 # Install multiple local packages at once
 sudo pax local-install pkg1.pkg.tar.zst pkg2.pkg.tar.zst
+
+# Clean uninstalled packages from cache
+sudo pax clean
+
+# Remove all cached packages
+sudo pax clean --all
 
 # Search AUR
 pax aur-search telegram

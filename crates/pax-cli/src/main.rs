@@ -79,6 +79,7 @@ fn main() -> Result<()> {
             noconfirm,
         } => commands::aur::run(&mut db, packages, *skip_review, *noconfirm),
         Command::AurSearch { query } => commands::aur_search::run(query),
+        Command::Clean { all, noconfirm } => commands::clean::run(&mut db, *all, *noconfirm),
         Command::Sync => commands::sync::run(&mut db),
         Command::Upgrade { dry_run, noconfirm } => {
             commands::upgrade::run(&mut db, *dry_run, *noconfirm)
