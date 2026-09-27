@@ -194,6 +194,10 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
 
+        /// Download packages without installing
+        #[arg(short = 'w', long)]
+        download_only: bool,
+
         /// Skip confirmation prompt
         #[arg(long)]
         noconfirm: bool,

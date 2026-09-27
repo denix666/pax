@@ -22,7 +22,7 @@ struct SyncInfo {
     sig_level: SigLevel,
 }
 
-pub fn run(db: &mut DatabaseHandle, dry_run: bool, noconfirm: bool) -> Result<()> {
+pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfirm: bool) -> Result<()> {
     db.ensure_both()?;
 
     let ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
@@ -170,6 +170,10 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, noconfirm: bool) -> Result<()
         downloaded.len(),
         cache_dir.display()
     );
+
+    if download_only {
+        return Ok(());
+    }
 
     let old_install_scripts = collect_old_install_scripts(&db.config.db_path, &tx);
     let old_backup_md5 = collect_old_backup_md5(&db.config.db_path, &tx);
