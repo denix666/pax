@@ -61,6 +61,30 @@ pub fn run(
     }
     println!("\nTotal packages: {}", targets.len().bold());
 
+    if !db.config.hold_pkgs.is_empty() {
+        let hold: HashSet<&str> = db.config.hold_pkgs.iter().map(|s| s.as_str()).collect();
+        for target in &targets {
+            if hold.contains(target.name.as_str()) {
+                eprintln!(
+                    "{}: {} is designated as a HoldPkg.",
+                    "warning".yellow().bold(),
+                    target.name.bold()
+                );
+                if !noconfirm {
+                    print!("  Remove {} anyway? [y/N] ", target.name.bold());
+                    std::io::stdout().flush()?;
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    let answer = answer.trim().to_lowercase();
+                    if answer != "y" && answer != "yes" {
+                        println!("Removal cancelled.");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
     if !noconfirm {
         print!("\nProceed with removal? [Y/n] ");
         std::io::stdout().flush()?;

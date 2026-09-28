@@ -62,11 +62,22 @@ pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download
 
 fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, reinstall: bool) -> Result<()> {
 
-    let ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
+    let mut ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
+    let ignore_groups: HashSet<String> = db.config.ignore_groups.iter().cloned().collect();
     let capacity = db.sync()?.package_count() + db.local()?.len();
+
+    let installed = db.installed_packages()?;
+    if !ignore_groups.is_empty() {
+        for pkg in &installed {
+            if pkg.info.groups.iter().any(|g| ignore_groups.contains(g)) {
+                ignored.insert(pkg.info.name.clone());
+            }
+        }
+    }
+
     let mut pool = ConcretePool::with_capacity(ignored, capacity);
 
-    for pkg in db.installed_packages()? {
+    for pkg in installed {
         pool.add_local(pkg.info.clone());
     }
 

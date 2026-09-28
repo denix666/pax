@@ -191,10 +191,21 @@ pub fn run(
 }
 
 fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result<()> {
-    let ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
+    let mut ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
+    let ignore_groups: HashSet<String> = db.config.ignore_groups.iter().cloned().collect();
+
+    let installed = db.installed_packages()?;
+    if !ignore_groups.is_empty() {
+        for pkg in &installed {
+            if pkg.info.groups.iter().any(|g| ignore_groups.contains(g)) {
+                ignored.insert(pkg.info.name.clone());
+            }
+        }
+    }
+
     let mut pool = ConcretePool::new(ignored);
 
-    for pkg in db.installed_packages()? {
+    for pkg in installed {
         pool.add_local(pkg.info.clone());
     }
 
