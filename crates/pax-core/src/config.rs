@@ -75,6 +75,7 @@ pub struct PacmanConfig {
     pub parallel_downloads: u32,
     pub sig_level: SigConfig,
     pub repos: Vec<Repository>,
+    cache_dirs_overridden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +103,7 @@ impl Default for PacmanConfig {
             parallel_downloads: 1,
             sig_level: SigConfig::default(),
             repos: vec![],
+            cache_dirs_overridden: false,
         }
     }
 }
@@ -159,7 +161,13 @@ impl PacmanConfig {
                     match key {
                         "RootDir" => config.root_dir = PathBuf::from(value),
                         "DBPath" => config.db_path = PathBuf::from(value),
-                        "CacheDir" => config.cache_dirs = vec![PathBuf::from(value)],
+                        "CacheDir" => {
+                            if !config.cache_dirs_overridden {
+                                config.cache_dirs.clear();
+                                config.cache_dirs_overridden = true;
+                            }
+                            config.cache_dirs.push(PathBuf::from(value));
+                        }
                         "LogFile" => config.log_file = PathBuf::from(value),
                         "GPGDir" => config.gpg_dir = PathBuf::from(value),
                         "HookDir" => config.hook_dirs.push(PathBuf::from(value)),

@@ -239,16 +239,20 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
     where
         'a: 'b,
     {
+        let mut best: Option<&PackageCandidate<'b>> = None;
         for c in candidates {
             if matches!(c.source, PackageSource::Sync { .. }) {
-                return PackageCandidate {
-                    id: c.id,
-                    source: c.source,
-                    info: c.info,
-                };
+                match best {
+                    Some(prev) => {
+                        if c.info.version > prev.info.version {
+                            best = Some(c);
+                        }
+                    }
+                    None => best = Some(c),
+                }
             }
         }
-        let c = &candidates[0];
+        let c = best.unwrap_or(&candidates[0]);
         PackageCandidate {
             id: c.id,
             source: c.source,

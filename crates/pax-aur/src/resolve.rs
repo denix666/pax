@@ -20,36 +20,49 @@ pub fn resolve_aur_targets(
     let mut queue: VecDeque<String> = names.iter().map(|n| n.to_string()).collect();
     let mut visited: HashSet<String> = HashSet::new();
 
-    while let Some(name) = queue.pop_front() {
-        if visited.contains(&name) || installed.contains(&name) {
-            continue;
-        }
-        visited.insert(name.clone());
-
-        if sync_available.contains(&name) {
-            continue;
-        }
-
-        let results = rpc::info(&[name.as_str()])?;
-        let Some(pkg) = results.into_iter().next() else {
-            return Err(AurError::NotFound(name));
-        };
-
-        for dep in &pkg.depends {
-            let dep_name = dep_name(dep);
-            if !installed.contains(dep_name) && !sync_available.contains(dep_name) {
-                queue.push_back(dep_name.to_string());
+    while !queue.is_empty() {
+        let mut batch: Vec<String> = Vec::new();
+        while let Some(name) = queue.pop_front() {
+            if visited.contains(&name) || installed.contains(&name) || sync_available.contains(&name) {
+                continue;
             }
+            visited.insert(name.clone());
+            batch.push(name);
         }
 
-        for dep in &pkg.make_depends {
-            let dep_name = dep_name(dep);
-            if !installed.contains(dep_name) && !sync_available.contains(dep_name) {
-                queue.push_back(dep_name.to_string());
+        if batch.is_empty() {
+            break;
+        }
+
+        let batch_refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
+        let results = rpc::info(&batch_refs)?;
+
+        let mut results_map: HashMap<String, AurPackage> = results
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+
+        for name in &batch {
+            let Some(pkg) = results_map.remove(name) else {
+                return Err(AurError::NotFound(name.clone()));
+            };
+
+            for dep in &pkg.depends {
+                let dn = dep_name(dep);
+                if !installed.contains(dn) && !sync_available.contains(dn) && !visited.contains(dn) {
+                    queue.push_back(dn.to_string());
+                }
             }
-        }
 
-        resolved.insert(name, pkg);
+            for dep in &pkg.make_depends {
+                let dn = dep_name(dep);
+                if !installed.contains(dn) && !sync_available.contains(dn) && !visited.contains(dn) {
+                    queue.push_back(dn.to_string());
+                }
+            }
+
+            resolved.insert(name.clone(), pkg);
+        }
     }
 
     let mut targets: Vec<AurTarget> = Vec::new();

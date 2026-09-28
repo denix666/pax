@@ -6,8 +6,7 @@ pub fn run(db: &mut DatabaseHandle, package: &str) -> Result<()> {
     let files = db.package_files(package).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if files.is_empty() {
-        eprintln!("error: package '{package}' has no files or was not found");
-        std::process::exit(1);
+        anyhow::bail!("package '{package}' has no files or was not found");
     }
 
     for file in &files {

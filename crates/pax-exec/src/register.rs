@@ -11,6 +11,7 @@ pub fn register_package(
     metadata: &PackageMetadata,
     reason: InstallReason,
     validation: &[Validation],
+    root_dir: &Path,
 ) -> Result<()> {
     let (name, version) = parse_name_version(&metadata.pkginfo)?;
 
@@ -44,7 +45,7 @@ pub fn register_package(
         .backup
         .iter()
         .map(|path| {
-            let md5 = compute_file_md5(Path::new("/").join(path))
+            let md5 = compute_file_md5(root_dir.join(path))
                 .unwrap_or_default();
             (path.clone(), md5)
         })

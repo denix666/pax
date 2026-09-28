@@ -4,6 +4,19 @@ use crate::error::{AurError, Result};
 
 const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc/v5";
 
+fn aur_agent() -> ureq::Agent {
+    use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+    ureq::Agent::config_builder()
+        .tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::NativeTls)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build()
+        .new_agent()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct AurPackage {
@@ -56,19 +69,7 @@ struct RpcResponse {
 
 pub fn suggest(prefix: &str) -> Result<Vec<String>> {
     let url = format!("https://aur.archlinux.org/rpc/v5/suggest/{}", urlenc(prefix));
-    let agent = {
-        use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-        ureq::Agent::config_builder()
-            .tls_config(
-                TlsConfig::builder()
-                    .provider(TlsProvider::NativeTls)
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .build(),
-            )
-            .build()
-            .new_agent()
-    };
-    let body = agent
+    let body = aur_agent()
         .get(&url)
         .call()
         .map_err(|e| AurError::Http(e.to_string()))?
@@ -97,19 +98,7 @@ pub fn info(names: &[&str]) -> Result<Vec<AurPackage>> {
 }
 
 fn do_request(url: &str) -> Result<RpcResponse> {
-    let agent = {
-        use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-        ureq::Agent::config_builder()
-            .tls_config(
-                TlsConfig::builder()
-                    .provider(TlsProvider::NativeTls)
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .build(),
-            )
-            .build()
-            .new_agent()
-    };
-    let body = agent
+    let body = aur_agent()
         .get(url)
         .call()
         .map_err(|e| AurError::Http(e.to_string()))?
@@ -127,14 +116,19 @@ fn do_request(url: &str) -> Result<RpcResponse> {
 }
 
 fn urlenc(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                String::from(b as char)
+                out.push(b as char);
             }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

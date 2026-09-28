@@ -6,7 +6,7 @@ use pax_resolver::Transaction;
 
 use crate::download::DownloadedPackage;
 use crate::error::{ExecError, Result};
-use crate::extract::{extract_package, read_archive_file_list};
+use crate::extract::{extract_package, read_archive_file_list, read_install_script};
 use crate::hooks::{load_hooks, run_hooks, HookWhen, TransactionPackages};
 use crate::register::{register_package, remove_db_entry};
 use crate::scriptlet::{run_scriptlet, ScriptletOp};
@@ -29,7 +29,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
     check_file_conflicts(ctx.db_path, ctx.downloaded, tx)?;
 
     if ctx.check_space {
-        check_disk_space(ctx.root_dir, tx)?;
+        check_disk_space(ctx.root_dir, ctx.db_path, tx)?;
     }
 
     let hooks = load_hooks(ctx.hook_dirs);
@@ -100,7 +100,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
         let reason = get_existing_reason(ctx.db_path, &upgrade.name, &upgrade.old_version.to_string());
 
         remove_db_entry(ctx.db_path, &upgrade.name, &upgrade.old_version.to_string())?;
-        register_package(ctx.db_path, &metadata, reason, &validation)?;
+        register_package(ctx.db_path, &metadata, reason, &validation, ctx.root_dir)?;
 
         upgraded_files.extend(metadata.files.iter().cloned());
         removed_files.extend(old_files);
@@ -122,9 +122,8 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
             continue;
         };
 
-        let metadata = extract_package(&downloaded.path, ctx.root_dir, &HashMap::new())?;
-
-        if let Some(ref script) = metadata.install {
+        let pre_script = read_install_script(&downloaded.path)?;
+        if let Some(ref script) = pre_script {
             run_scriptlet(
                 script,
                 ScriptletOp::PreInstall,
@@ -135,6 +134,8 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
             )?;
         }
 
+        let metadata = extract_package(&downloaded.path, ctx.root_dir, &HashMap::new())?;
+
         let reason = if install.explicit {
             InstallReason::Explicit
         } else {
@@ -142,7 +143,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
         };
         let validation = vec![Validation::Sha256];
 
-        register_package(ctx.db_path, &metadata, reason, &validation)?;
+        register_package(ctx.db_path, &metadata, reason, &validation, ctx.root_dir)?;
 
         installed_files.extend(metadata.files.iter().cloned());
 
@@ -224,13 +225,21 @@ fn remove_old_files(db_path: &Path, root_dir: &Path, name: &str, version: &str) 
     Ok(())
 }
 
-fn check_disk_space(root_dir: &Path, tx: &Transaction) -> Result<()> {
-    let needed: u64 = tx
+fn check_disk_space(root_dir: &Path, db_path: &Path, tx: &Transaction) -> Result<()> {
+    let total_new: u64 = tx
         .installs
         .iter()
         .map(|i| i.installed_size)
         .chain(tx.upgrades.iter().map(|u| u.installed_size))
         .sum();
+
+    let freed: u64 = tx
+        .upgrades
+        .iter()
+        .filter_map(|u| read_old_installed_size(db_path, &u.name, &u.old_version.to_string()))
+        .sum();
+
+    let needed = total_new.saturating_sub(freed);
 
     if needed == 0 {
         return Ok(());
@@ -347,6 +356,25 @@ fn check_file_conflicts(
     } else {
         Err(ExecError::FileConflict(conflicts.join("\n")))
     }
+}
+
+fn read_old_installed_size(db_path: &Path, name: &str, version: &str) -> Option<u64> {
+    let desc_path = db_path
+        .join("local")
+        .join(format!("{name}-{version}"))
+        .join("desc");
+    let content = std::fs::read_to_string(&desc_path).ok()?;
+    let mut found = false;
+    for line in content.lines() {
+        if line == "%SIZE%" {
+            found = true;
+            continue;
+        }
+        if found {
+            return line.parse().ok();
+        }
+    }
+    None
 }
 
 fn parse_name_from_desc(content: &str) -> Option<String> {

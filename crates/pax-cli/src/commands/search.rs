@@ -14,8 +14,7 @@ pub fn run(db: &mut DatabaseHandle, query: &str) -> Result<()> {
         .collect();
 
     if results.is_empty() {
-        eprintln!("error: no results for '{query}'");
-        std::process::exit(1);
+        anyhow::bail!("no results for '{query}'");
     }
 
     for pkg in &results {

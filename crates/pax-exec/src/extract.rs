@@ -290,6 +290,50 @@ pub fn read_pkginfo(pkg_path: &Path) -> Result<PkgFileInfo> {
     })
 }
 
+pub fn read_install_script(pkg_path: &Path) -> Result<Option<String>> {
+    let filename = pkg_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let file = std::fs::File::open(pkg_path)?;
+    let decompressor = decompress(file, &filename)?;
+    let mut archive = Archive::new(decompressor);
+
+    for entry_result in archive.entries().map_err(|e| ExecError::Extraction {
+        pkg: filename.clone(),
+        message: e.to_string(),
+    })? {
+        let mut entry = entry_result.map_err(|e| ExecError::Extraction {
+            pkg: filename.clone(),
+            message: e.to_string(),
+        })?;
+
+        let path = entry.path().map_err(|e| ExecError::Extraction {
+            pkg: filename.clone(),
+            message: e.to_string(),
+        })?;
+        let path_str = path.to_string_lossy();
+        let path_str = path_str.strip_prefix("./").unwrap_or(&path_str);
+
+        if path_str == ".INSTALL" {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).map_err(|e| ExecError::Extraction {
+                pkg: filename.clone(),
+                message: format!(".INSTALL: {e}"),
+            })?;
+            return Ok(Some(s));
+        }
+
+        if !path_str.starts_with('.') {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 
 use anyhow::Result;
 use indicatif::MultiProgress;
@@ -11,16 +10,8 @@ use pax_resolver::{
     build_transaction, compute_upgrades, resolve, topological_sort, ConcretePool, ResolveOptions,
 };
 
+use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, SyncInfo};
 use crate::output::print_transaction;
-
-struct SyncInfo {
-    compressed_size: u64,
-    installed_size: u64,
-    repository: String,
-    filename: String,
-    sha256sum: Option<String>,
-    sig_level: SigLevel,
-}
 
 pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfirm: bool) -> Result<()> {
     if !dry_run {
@@ -90,13 +81,8 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
     let upgrade_names: Vec<String> = upgrades.iter().map(|u| u.name.clone()).collect();
 
     let options = ResolveOptions::default();
-    let mut resolved = match resolve(&pool, &upgrade_names, &options) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let mut resolved = resolve(&pool, &upgrade_names, &options)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     topological_sort(&pool, &mut resolved);
 
@@ -123,16 +109,9 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
         return Ok(());
     }
 
-    if !noconfirm {
-        print!("\nProceed with upgrade? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Upgrade cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm("\nProceed with upgrade? [Y/n]")? {
+        println!("Upgrade cancelled.");
+        return Ok(());
     }
 
     let repo_servers: HashMap<String, Vec<String>> = db
@@ -214,53 +193,3 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
     Ok(())
 }
 
-fn collect_old_install_scripts(
-    db_path: &std::path::Path,
-    tx: &pax_resolver::Transaction,
-) -> HashMap<String, String> {
-    let mut scripts = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("install");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            scripts.insert(upgrade.name.clone(), content);
-        }
-    }
-    scripts
-}
-
-fn collect_old_backup_md5(
-    db_path: &std::path::Path,
-    tx: &pax_resolver::Transaction,
-) -> HashMap<String, HashMap<String, String>> {
-    let mut result = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("files");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let mut md5s = HashMap::new();
-            let mut in_backup = false;
-            for line in content.lines() {
-                if line == "%BACKUP%" {
-                    in_backup = true;
-                    continue;
-                }
-                if line.starts_with('%') || line.is_empty() {
-                    in_backup = false;
-                    continue;
-                }
-                if in_backup {
-                    if let Some((p, m)) = line.split_once('\t') {
-                        md5s.insert(p.to_string(), m.to_string());
-                    }
-                }
-            }
-            result.insert(upgrade.name.clone(), md5s);
-        }
-    }
-    result
-}

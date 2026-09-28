@@ -1,11 +1,14 @@
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use pax_alpm::db::DatabaseHandle;
 
+use super::{confirm, confirm_default_no};
+use crate::output::format_size;
+
 pub fn run(db: &mut DatabaseHandle, all: bool, noconfirm: bool) -> Result<()> {
+    super::ensure_root();
     let cache_dirs = db.config.cache_dirs.clone();
 
     if all {
@@ -53,22 +56,16 @@ fn clean_uninstalled(db: &mut DatabaseHandle, cache_dirs: &[std::path::PathBuf],
         format_size(total_size).bold()
     );
 
-    if !noconfirm {
-        print!("\nProceed? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm("\nProceed? [Y/n]")? {
+        println!("Cancelled.");
+        return Ok(());
     }
 
     let mut removed = 0;
     for path in &to_remove {
-        if std::fs::remove_file(path).is_ok() {
-            removed += 1;
+        match std::fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            Err(e) => eprintln!("warning: could not remove {}: {e}", path.display()),
         }
     }
 
@@ -104,16 +101,9 @@ fn clean_all(cache_dirs: &[std::path::PathBuf], noconfirm: bool) -> Result<()> {
         format_size(total_size).bold()
     );
 
-    if !noconfirm {
-        print!("\nRemove ALL cached packages? [y/N] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if answer != "y" && answer != "yes" {
-            println!("Cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm_default_no("\nRemove ALL cached packages? [y/N]")? {
+        println!("Cancelled.");
+        return Ok(());
     }
 
     let mut removed = 0;
@@ -164,23 +154,6 @@ fn extract_pkg_name(filename: &str) -> Option<String> {
         Some(parts[..name_end].join("-"))
     } else {
         None
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-
-    let b = bytes as f64;
-    if b >= GIB {
-        format!("{:.2} GiB", b / GIB)
-    } else if b >= MIB {
-        format!("{:.2} MiB", b / MIB)
-    } else if b >= KIB {
-        format!("{:.2} KiB", b / KIB)
-    } else {
-        format!("{b:.0} B")
     }
 }
 

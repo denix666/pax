@@ -156,13 +156,27 @@ fn show_pkgbuild(build_dir: &Path, pkg_name: &str) -> Result<()> {
         eprintln!("==> PKGBUILD for {pkg_name}:");
         eprintln!("---");
         let content = std::fs::read_to_string(&pkgbuild)?;
+        let line_count = content.lines().count();
         for line in content.lines().take(50) {
             eprintln!("  {line}");
         }
-        if content.lines().count() > 50 {
+        if line_count > 50 {
             eprintln!("  ... (truncated, full PKGBUILD at {})", pkgbuild.display());
         }
         eprintln!("---");
+
+        eprint!("==> Proceed with building {pkg_name}? [Y/n] ");
+        use std::io::Write;
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_lowercase();
+        if !answer.is_empty() && answer != "y" && answer != "yes" {
+            return Err(AurError::BuildFailed {
+                pkg: pkg_name.to_string(),
+                message: "user aborted after PKGBUILD review".to_string(),
+            });
+        }
     }
     Ok(())
 }

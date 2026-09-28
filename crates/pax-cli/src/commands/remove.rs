@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::io::Write;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
@@ -7,6 +6,8 @@ use pax_alpm::db::DatabaseHandle;
 use pax_core::package::InstallReason;
 use pax_exec::hooks::{load_hooks, run_hooks, HookWhen, TransactionPackages};
 use pax_exec::{remove_package, RemovalTarget};
+
+use super::{confirm, confirm_default_no};
 
 pub fn run(
     db: &mut DatabaseHandle,
@@ -17,8 +18,7 @@ pub fn run(
     super::ensure_root();
 
     if packages.is_empty() {
-        eprintln!("error: no targets specified");
-        std::process::exit(1);
+        anyhow::bail!("no targets specified");
     }
 
     db.local()?;
@@ -27,8 +27,7 @@ pub fn run(
 
     for name in packages {
         let Some(pkg) = db.local_info(name)? else {
-            eprintln!("error: target not found: {name}");
-            std::process::exit(1);
+            anyhow::bail!("target not found: {name}");
         };
         targets.push(RemovalTarget {
             name: pkg.info.name.clone(),
@@ -70,31 +69,17 @@ pub fn run(
                     "warning".yellow().bold(),
                     target.name.bold()
                 );
-                if !noconfirm {
-                    print!("  Remove {} anyway? [y/N] ", target.name.bold());
-                    std::io::stdout().flush()?;
-                    let mut answer = String::new();
-                    std::io::stdin().read_line(&mut answer)?;
-                    let answer = answer.trim().to_lowercase();
-                    if answer != "y" && answer != "yes" {
-                        println!("Removal cancelled.");
-                        return Ok(());
-                    }
+                if !noconfirm && !confirm_default_no(&format!("  Remove {} anyway? [y/N]", target.name.bold()))? {
+                    println!("Removal cancelled.");
+                    return Ok(());
                 }
             }
         }
     }
 
-    if !noconfirm {
-        print!("\nProceed with removal? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Removal cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm("\nProceed with removal? [Y/n]")? {
+        println!("Removal cancelled.");
+        return Ok(());
     }
 
     let hooks = load_hooks(&db.config.hook_dirs);
@@ -174,16 +159,6 @@ fn find_recursive_orphans(
                     .depends
                     .iter()
                     .any(|d| d.name == *dep_name)
-                    || pkg
-                        .info
-                        .provides
-                        .iter()
-                        .any(|_| false)
-                    || pkg
-                        .info
-                        .optdepends
-                        .iter()
-                        .any(|d| d.dep.name == *dep_name)
             });
 
             if !still_needed {

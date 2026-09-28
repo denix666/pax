@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 
 use anyhow::Result;
 use indicatif::MultiProgress;
@@ -8,16 +7,8 @@ use pax_core::config::SigLevel;
 use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
 use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveOptions};
 
+use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, SyncInfo};
 use crate::output::print_transaction;
-
-struct SyncInfo {
-    compressed_size: u64,
-    installed_size: u64,
-    repository: String,
-    filename: String,
-    sha256sum: Option<String>,
-    sig_level: SigLevel,
-}
 
 pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, needed: bool, reinstall: bool) -> Result<()> {
     if !dry_run {
@@ -25,8 +16,7 @@ pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download
     }
 
     if packages.is_empty() {
-        eprintln!("error: no targets specified");
-        std::process::exit(1);
+        anyhow::bail!("no targets specified");
     }
 
     db.ensure_both()?;
@@ -114,13 +104,8 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
     }
 
     let options = ResolveOptions::default();
-    let mut resolved = match resolve(&pool, packages, &options) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let mut resolved = resolve(&pool, packages, &options)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     topological_sort(&pool, &mut resolved);
 
@@ -151,16 +136,9 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         return Ok(());
     }
 
-    if !noconfirm {
-        print!("\nProceed with installation? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Installation cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm("\nProceed with installation? [Y/n]")? {
+        println!("Installation cancelled.");
+        return Ok(());
     }
 
     let repo_servers: HashMap<String, Vec<String>> = db
@@ -241,53 +219,3 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
     Ok(())
 }
 
-fn collect_old_install_scripts(
-    db_path: &std::path::Path,
-    tx: &pax_resolver::Transaction,
-) -> HashMap<String, String> {
-    let mut scripts = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let install_path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("install");
-        if let Ok(content) = std::fs::read_to_string(&install_path) {
-            scripts.insert(upgrade.name.clone(), content);
-        }
-    }
-    scripts
-}
-
-fn collect_old_backup_md5(
-    db_path: &std::path::Path,
-    tx: &pax_resolver::Transaction,
-) -> HashMap<String, HashMap<String, String>> {
-    let mut result = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let files_path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("files");
-        if let Ok(content) = std::fs::read_to_string(&files_path) {
-            let mut md5s = HashMap::new();
-            let mut in_backup = false;
-            for line in content.lines() {
-                if line == "%BACKUP%" {
-                    in_backup = true;
-                    continue;
-                }
-                if line.starts_with('%') || line.is_empty() {
-                    in_backup = false;
-                    continue;
-                }
-                if in_backup {
-                    if let Some((path, md5)) = line.split_once('\t') {
-                        md5s.insert(path.to_string(), md5.to_string());
-                    }
-                }
-            }
-            result.insert(upgrade.name.clone(), md5s);
-        }
-    }
-    result
-}

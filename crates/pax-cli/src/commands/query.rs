@@ -29,8 +29,7 @@ pub fn run(
     };
 
     if packages.is_empty() {
-        eprintln!("error: no packages found");
-        std::process::exit(1);
+        anyhow::bail!("no packages found");
     }
 
     for pkg in &packages {

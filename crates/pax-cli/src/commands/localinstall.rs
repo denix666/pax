@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
@@ -9,18 +7,18 @@ use pax_core::version::Version;
 use pax_exec::{execute_transaction, read_pkginfo, DownloadedPackage, InstallContext};
 use pax_resolver::{InstallAction, Transaction, UpgradeAction};
 
+use super::{collect_old_backup_md5, collect_old_install_scripts, confirm};
+
 pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Result<()> {
     super::ensure_root();
 
     if files.is_empty() {
-        eprintln!("error: no targets specified");
-        std::process::exit(1);
+        anyhow::bail!("no targets specified");
     }
 
     for file in files {
         if !file.exists() {
-            eprintln!("error: file not found: {}", file.display());
-            std::process::exit(1);
+            anyhow::bail!("file not found: {}", file.display());
         }
     }
 
@@ -33,12 +31,6 @@ pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Resul
             .map_err(|e| anyhow::anyhow!("{}: invalid version: {e}", file.display()))?;
         let local_ver = db.local_info(&info.name)?.map(|p| p.info.version.clone());
         pkg_info_list.push((info, version, local_ver));
-    }
-
-    let has_work = pkg_info_list.iter().any(|(_, _, _)| true);
-    if !has_work {
-        println!("there is nothing to do");
-        return Ok(());
     }
 
     let mut install_count = 0usize;
@@ -74,16 +66,9 @@ pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Resul
     let total_count = install_count + upgrade_count;
     println!("\nTotal packages: {}", total_count.to_string().bold());
 
-    if !noconfirm {
-        print!("\nProceed with installation? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Installation cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm("\nProceed with installation? [Y/n]")? {
+        println!("Installation cancelled.");
+        return Ok(());
     }
 
     install_pkg_files(db, files)?;
@@ -167,53 +152,3 @@ pub fn install_pkg_files(db: &mut DatabaseHandle, files: &[PathBuf]) -> Result<(
     Ok(())
 }
 
-fn collect_old_install_scripts(
-    db_path: &Path,
-    tx: &Transaction,
-) -> HashMap<String, String> {
-    let mut scripts = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("install");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            scripts.insert(upgrade.name.clone(), content);
-        }
-    }
-    scripts
-}
-
-fn collect_old_backup_md5(
-    db_path: &Path,
-    tx: &Transaction,
-) -> HashMap<String, HashMap<String, String>> {
-    let mut result = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("files");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let mut md5s = HashMap::new();
-            let mut in_backup = false;
-            for line in content.lines() {
-                if line == "%BACKUP%" {
-                    in_backup = true;
-                    continue;
-                }
-                if line.starts_with('%') || line.is_empty() {
-                    in_backup = false;
-                    continue;
-                }
-                if in_backup {
-                    if let Some((p, m)) = line.split_once('\t') {
-                        md5s.insert(p.to_string(), m.to_string());
-                    }
-                }
-            }
-            result.insert(upgrade.name.clone(), md5s);
-        }
-    }
-    result
-}

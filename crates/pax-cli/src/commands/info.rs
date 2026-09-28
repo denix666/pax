@@ -9,8 +9,7 @@ pub fn run(db: &mut DatabaseHandle, package: &str, local: bool) -> Result<()> {
         match db.local_info(package)? {
             Some(pkg) => print_local_info(pkg),
             None => {
-                eprintln!("error: package '{package}' was not found in local database");
-                std::process::exit(1);
+                anyhow::bail!("package '{package}' was not found in local database");
             }
         }
     } else {
@@ -22,8 +21,7 @@ pub fn run(db: &mut DatabaseHandle, package: &str, local: bool) -> Result<()> {
             None => match db.local_info(package)? {
                 Some(pkg) => print_local_info(pkg),
                 None => {
-                    eprintln!("error: package '{package}' was not found");
-                    std::process::exit(1);
+                    anyhow::bail!("package '{package}' was not found");
                 }
             },
         }

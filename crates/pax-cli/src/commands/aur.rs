@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -11,6 +10,7 @@ use pax_core::config::SigLevel;
 use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
 use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveOptions};
 
+use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, dirs_build_base, SyncInfo};
 use crate::output::print_transaction;
 
 fn is_root() -> bool {
@@ -69,15 +69,6 @@ fn install_repo_deps(db: &mut DatabaseHandle, packages: &[String]) -> Result<()>
     }
 }
 
-struct SyncInfo {
-    compressed_size: u64,
-    installed_size: u64,
-    repository: String,
-    filename: String,
-    sha256sum: Option<String>,
-    sig_level: SigLevel,
-}
-
 pub fn run(
     db: &mut DatabaseHandle,
     packages: &[String],
@@ -86,8 +77,7 @@ pub fn run(
     allow_root: bool,
 ) -> Result<()> {
     if packages.is_empty() {
-        eprintln!("error: no targets specified");
-        std::process::exit(1);
+        anyhow::bail!("no targets specified");
     }
 
     check_root(allow_root);
@@ -145,16 +135,9 @@ pub fn run(
         }
     }
 
-    if !noconfirm {
-        print!("\nProceed? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm("\nProceed? [Y/n]")? {
+        println!("Cancelled.");
+        return Ok(());
     }
 
     // Step 1: Install repo deps if needed
@@ -163,7 +146,6 @@ pub fn run(
         install_repo_deps(db, &all_repo_deps)?;
     }
 
-    // Step 2: Build and install AUR packages in order
     let build_base = dirs_build_base();
     std::fs::create_dir_all(&build_base)?;
 
@@ -315,51 +297,6 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
     Ok(())
 }
 
-fn collect_old_install_scripts(
-    db_path: &std::path::Path,
-    tx: &pax_resolver::Transaction,
-) -> HashMap<String, String> {
-    let mut scripts = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("install");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            scripts.insert(upgrade.name.clone(), content);
-        }
-    }
-    scripts
-}
-
-fn collect_old_backup_md5(
-    db_path: &std::path::Path,
-    tx: &pax_resolver::Transaction,
-) -> HashMap<String, HashMap<String, String>> {
-    let mut result = HashMap::new();
-    for upgrade in &tx.upgrades {
-        let path = db_path
-            .join("local")
-            .join(format!("{}-{}", upgrade.name, upgrade.old_version))
-            .join("files");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let mut md5s = HashMap::new();
-            let mut in_backup = false;
-            for line in content.lines() {
-                if line == "%BACKUP%" { in_backup = true; continue; }
-                if line.starts_with('%') || line.is_empty() { in_backup = false; continue; }
-                if in_backup {
-                    if let Some((p, m)) = line.split_once('\t') {
-                        md5s.insert(p.to_string(), m.to_string());
-                    }
-                }
-            }
-            result.insert(upgrade.name.clone(), md5s);
-        }
-    }
-    result
-}
-
 pub(crate) fn check_root(allow_root: bool) {
     let is_root = unsafe { libc::geteuid() } == 0;
     let has_sudo_user = std::env::var("SUDO_USER").is_ok();
@@ -376,12 +313,3 @@ pub(crate) fn check_root(allow_root: bool) {
     }
 }
 
-fn dirs_build_base() -> PathBuf {
-    if let Ok(cache) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(cache).join("pax/aur")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cache/pax/aur")
-    } else {
-        PathBuf::from("/tmp/pax-aur")
-    }
-}

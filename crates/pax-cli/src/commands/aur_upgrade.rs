@@ -1,12 +1,12 @@
 use std::collections::HashSet;
-use std::io::Write;
-use std::path::PathBuf;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use pax_alpm::db::DatabaseHandle;
 use pax_aur::{aur_info, clone_and_build, AurPackage};
 use pax_core::version::Version;
+
+use super::{confirm, dirs_build_base};
 
 struct AurUpgradeTarget {
     package: AurPackage,
@@ -79,16 +79,9 @@ pub fn run(db: &mut DatabaseHandle, skip_review: bool, noconfirm: bool, allow_ro
     }
     println!("\nTotal packages: {}", upgrades.len().to_string().bold());
 
-    if !noconfirm {
-        print!("\nProceed? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            println!("Cancelled.");
-            return Ok(());
-        }
+    if !noconfirm && !confirm("\nProceed? [Y/n]")? {
+        println!("Cancelled.");
+        return Ok(());
     }
 
     let build_base = dirs_build_base();
@@ -117,12 +110,3 @@ pub fn run(db: &mut DatabaseHandle, skip_review: bool, noconfirm: bool, allow_ro
     Ok(())
 }
 
-fn dirs_build_base() -> PathBuf {
-    if let Ok(cache) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(cache).join("pax/aur")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cache/pax/aur")
-    } else {
-        PathBuf::from("/tmp/pax-aur")
-    }
-}

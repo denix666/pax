@@ -131,7 +131,7 @@ _pax() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local subcmds="search info query files owner install remove aur-install aur-search sync upgrade help"
+    local subcmds="search info query files owner install remove local-install aur-install aur-search aur-upgrade sync upgrade clean help"
 
     case "$prev" in
         --completions)
@@ -153,7 +153,7 @@ _pax() {
     local subcmd=""
     for ((i=1; i < COMP_CWORD; i++)); do
         case "${COMP_WORDS[i]}" in
-            search|s|info|i|query|q|files|f|owner|o|install|S|remove|R|aur-install|aur-search|sync|y|upgrade|u)
+            search|s|info|i|query|q|files|f|owner|o|install|S|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|sync|y|upgrade|u|clean|c)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -217,6 +217,24 @@ _pax() {
             fi
             ;;
         aur-search)
+            ;;
+        local-install|U)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--noconfirm --help" -- "$cur"))
+            else
+                compopt -o filenames
+                COMPREPLY=($(compgen -f -- "$cur"))
+            fi
+            ;;
+        aur-upgrade)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--skip-review --noconfirm --allow-root --help" -- "$cur"))
+            fi
+            ;;
+        clean|c)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--all --noconfirm --help" -- "$cur"))
+            fi
             ;;
         upgrade|u)
             if [[ "$cur" == -* ]]; then
@@ -283,10 +301,13 @@ _pax() {
         'owner:Find which package owns a file'
         'install:Install packages'
         'remove:Remove packages'
+        'local-install:Install local package files'
         'aur-install:Install packages from AUR'
         'aur-search:Search AUR for packages'
+        'aur-upgrade:Upgrade installed AUR packages'
         'sync:Synchronize package databases'
         'upgrade:Upgrade installed packages'
+        'clean:Clean package cache'
     )
 
     _arguments -C \
@@ -346,6 +367,22 @@ _pax() {
                         '--noconfirm[Skip confirmation]' \
                         '*:package:_pax_aur_packages'
                     ;;
+                local-install|U)
+                    _arguments \
+                        '--noconfirm[Skip confirmation]' \
+                        '*:file:_files -g "*.pkg.tar.(zst|xz|gz)"'
+                    ;;
+                aur-upgrade)
+                    _arguments \
+                        '--skip-review[Skip PKGBUILD review]' \
+                        '--noconfirm[Skip confirmation]' \
+                        '--allow-root[Allow running as root]'
+                    ;;
+                clean|c)
+                    _arguments \
+                        '--all[Remove all cached packages]' \
+                        '--noconfirm[Skip confirmation]'
+                    ;;
                 upgrade|u)
                     _arguments \
                         '--dry-run[Show what would be upgraded]' \
@@ -360,7 +397,7 @@ _pax "$@"
 "#;
 
 const FISH: &str = r#"
-set -l subcmds search info query files owner install remove aur-install aur-search sync upgrade
+set -l subcmds search info query files owner install remove local-install aur-install aur-search aur-upgrade sync upgrade clean
 
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l help -d "Show help"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l version -d "Show version"
@@ -379,7 +416,10 @@ complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a remove -d "Remo
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a aur-install -d "Install packages from AUR"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a aur-search -d "Search AUR for packages"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a sync -d "Synchronize databases"
+complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a local-install -d "Install local package files"
+complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a aur-upgrade -d "Upgrade AUR packages"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a upgrade -d "Upgrade packages"
+complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a clean -d "Clean package cache"
 
 complete -c pax -n "__fish_seen_subcommand_from install" -l dry-run -d "Show what would be installed"
 complete -c pax -n "__fish_seen_subcommand_from install" -l noconfirm -d "Skip confirmation"
@@ -405,6 +445,16 @@ complete -c pax -n "__fish_seen_subcommand_from aur-install" -l skip-review -d "
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -l noconfirm -d "Skip confirmation"
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -a "(test (string length -- (commandline -ct)) -ge 2; and pax --pkg-list 'aur:'(commandline -ct) 2>/dev/null)" -d "AUR package"
 
+complete -c pax -n "__fish_seen_subcommand_from local-install" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from local-install" -F -d "Package file"
+
+complete -c pax -n "__fish_seen_subcommand_from aur-upgrade" -l skip-review -d "Skip PKGBUILD review"
+complete -c pax -n "__fish_seen_subcommand_from aur-upgrade" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from aur-upgrade" -l allow-root -d "Allow running as root"
+
 complete -c pax -n "__fish_seen_subcommand_from upgrade" -l dry-run -d "Show what would be upgraded"
 complete -c pax -n "__fish_seen_subcommand_from upgrade" -l noconfirm -d "Skip confirmation"
+
+complete -c pax -n "__fish_seen_subcommand_from clean" -l all -d "Remove all cached packages"
+complete -c pax -n "__fish_seen_subcommand_from clean" -l noconfirm -d "Skip confirmation"
 "#;

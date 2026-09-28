@@ -336,7 +336,7 @@ pub fn print_transaction(tx: &Transaction, sync_sizes: &HashMap<String, (u64, u6
     );
 }
 
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;

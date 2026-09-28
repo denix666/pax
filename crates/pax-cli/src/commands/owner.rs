@@ -9,8 +9,7 @@ pub fn run(db: &mut DatabaseHandle, file: &Path) -> Result<()> {
     let results = db.file_owner(&file_str).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if results.is_empty() {
-        eprintln!("error: no package owns {file_str}");
-        std::process::exit(1);
+        anyhow::bail!("no package owns {file_str}");
     }
 
     for (pkg, owned_file) in &results {
