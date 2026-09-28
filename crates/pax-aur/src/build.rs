@@ -148,7 +148,27 @@ fn pull_updates(build_dir: &Path, pkg_name: &str, user: Option<&BuildUser>) -> R
         });
     }
 
+    clean_cached_sources(build_dir);
+
     Ok(())
+}
+
+/// Remove cached source files so makepkg re-downloads them.
+/// Needed when PKGBUILD version changes but source filename stays the same.
+fn clean_cached_sources(build_dir: &Path) {
+    let src_dir = build_dir.join("src");
+    if src_dir.exists() {
+        let _ = std::fs::remove_dir_all(&src_dir);
+    }
+    if let Ok(entries) = std::fs::read_dir(build_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(".tar") && !name.contains(".pkg.tar") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 fn show_pkgbuild(build_dir: &Path, pkg_name: &str, noconfirm: bool) -> Result<()> {
