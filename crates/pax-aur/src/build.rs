@@ -72,6 +72,7 @@ pub fn clone_and_build(
     build_base: &Path,
     skip_review: bool,
     allow_root: bool,
+    noconfirm: bool,
 ) -> Result<BuildResult> {
     let user = build_user(allow_root);
 
@@ -94,7 +95,7 @@ pub fn clone_and_build(
     }
 
     if !skip_review {
-        show_pkgbuild(&build_dir, &pkg.name)?;
+        show_pkgbuild(&build_dir, &pkg.name, noconfirm)?;
     }
 
     let pkg_path = run_makepkg(&build_dir, &pkg.name, user.as_ref())?;
@@ -150,7 +151,7 @@ fn pull_updates(build_dir: &Path, pkg_name: &str, user: Option<&BuildUser>) -> R
     Ok(())
 }
 
-fn show_pkgbuild(build_dir: &Path, pkg_name: &str) -> Result<()> {
+fn show_pkgbuild(build_dir: &Path, pkg_name: &str, noconfirm: bool) -> Result<()> {
     let pkgbuild = build_dir.join("PKGBUILD");
     if pkgbuild.exists() {
         eprintln!("==> PKGBUILD for {pkg_name}:");
@@ -165,17 +166,19 @@ fn show_pkgbuild(build_dir: &Path, pkg_name: &str) -> Result<()> {
         }
         eprintln!("---");
 
-        eprint!("==> Proceed with building {pkg_name}? [Y/n] ");
-        use std::io::Write;
-        std::io::stderr().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
-            return Err(AurError::BuildFailed {
-                pkg: pkg_name.to_string(),
-                message: "user aborted after PKGBUILD review".to_string(),
-            });
+        if !noconfirm {
+            eprint!("==> Proceed with building {pkg_name}? [Y/n] ");
+            use std::io::Write;
+            std::io::stderr().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let answer = answer.trim().to_lowercase();
+            if !answer.is_empty() && answer != "y" && answer != "yes" {
+                return Err(AurError::BuildFailed {
+                    pkg: pkg_name.to_string(),
+                    message: "user aborted after PKGBUILD review".to_string(),
+                });
+            }
         }
     }
     Ok(())

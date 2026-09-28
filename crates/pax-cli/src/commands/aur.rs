@@ -46,7 +46,7 @@ pub(crate) fn install_as_root(db: &mut DatabaseHandle, pkg_path: &Path, pkg_name
     Ok(())
 }
 
-fn install_repo_deps(db: &mut DatabaseHandle, packages: &[String]) -> Result<()> {
+pub(crate) fn install_repo_deps(db: &mut DatabaseHandle, packages: &[String]) -> Result<()> {
     if is_root() {
         install_repo_packages(db, packages)
     } else {
@@ -156,7 +156,7 @@ pub fn run(
             target.package.version.green()
         );
 
-        let result = clone_and_build(&target.package, &build_base, skip_review, allow_root)
+        let result = clone_and_build(&target.package, &build_base, skip_review, allow_root, noconfirm)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         println!(":: Installing {}...", target.package.name.bold());
