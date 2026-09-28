@@ -33,6 +33,13 @@ pub enum ExecError {
     #[error("conflicting files:\n{0}")]
     FileConflict(String),
 
+    #[error("insufficient disk space: need {needed} MiB, only {available} MiB available on {path}")]
+    InsufficientSpace {
+        needed: u64,
+        available: u64,
+        path: String,
+    },
+
     #[error("not running as root")]
     NotRoot,
 

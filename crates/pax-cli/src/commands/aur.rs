@@ -240,6 +240,7 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
         old_install_scripts: &old_install_scripts,
         old_backup_md5: &old_backup_md5,
         hook_dirs: &db.config.hook_dirs,
+        check_space: db.config.check_space,
     };
 
     execute_transaction(&tx, &ctx).map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -20,6 +20,7 @@ pub struct UpgradeAction {
     pub new_version: Version,
     pub repository: String,
     pub download_size: u64,
+    pub installed_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -72,12 +73,14 @@ pub fn build_transaction<P: PackagePool>(
             let same = pkg.version == *installed_ver;
             if dominated || (same && reinstall && target_set.contains(pkg.name.as_str())) {
                 total_download += dl_size;
+                total_installed += inst_size;
                 upgrades.push(UpgradeAction {
                     name: pkg.name.clone(),
                     old_version: installed_ver.clone(),
                     new_version: pkg.version.clone(),
                     repository: repo_name,
                     download_size: dl_size,
+                    installed_size: inst_size,
                 });
             }
         } else {

@@ -215,6 +215,7 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         old_install_scripts: &old_install_scripts,
         old_backup_md5: &old_backup_md5,
         hook_dirs: &db.config.hook_dirs,
+        check_space: db.config.check_space,
     };
 
     execute_transaction(&tx, &ctx).map_err(|e| anyhow::anyhow!("{e}"))?;

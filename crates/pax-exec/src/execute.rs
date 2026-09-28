@@ -18,6 +18,7 @@ pub struct InstallContext<'a> {
     pub old_install_scripts: &'a HashMap<String, String>,
     pub old_backup_md5: &'a HashMap<String, HashMap<String, String>>,
     pub hook_dirs: &'a [PathBuf],
+    pub check_space: bool,
 }
 
 pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()> {
@@ -26,6 +27,10 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
     }
 
     check_file_conflicts(ctx.db_path, ctx.downloaded, tx)?;
+
+    if ctx.check_space {
+        check_disk_space(ctx.root_dir, tx)?;
+    }
 
     let hooks = load_hooks(ctx.hook_dirs);
 
@@ -214,6 +219,42 @@ fn remove_old_files(db_path: &Path, root_dir: &Path, name: &str, version: &str) 
         } else if path.is_dir() {
             let _ = std::fs::remove_dir(&path);
         }
+    }
+
+    Ok(())
+}
+
+fn check_disk_space(root_dir: &Path, tx: &Transaction) -> Result<()> {
+    let needed: u64 = tx
+        .installs
+        .iter()
+        .map(|i| i.installed_size)
+        .chain(tx.upgrades.iter().map(|u| u.installed_size))
+        .sum();
+
+    if needed == 0 {
+        return Ok(());
+    }
+
+    let c_path = match std::ffi::CString::new(root_dir.to_string_lossy().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return Ok(());
+    }
+
+    let available = stat.f_bavail as u64 * stat.f_frsize as u64;
+
+    if available < needed {
+        return Err(ExecError::InsufficientSpace {
+            needed: needed / (1024 * 1024),
+            available: available / (1024 * 1024),
+            path: root_dir.display().to_string(),
+        });
     }
 
     Ok(())

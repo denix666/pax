@@ -108,12 +108,14 @@ pub fn install_pkg_files(db: &mut DatabaseHandle, files: &[PathBuf]) -> Result<(
         let local_ver = db.local_info(&info.name)?.map(|p| p.info.version.clone());
 
         if let Some(old_version) = local_ver {
+            total_installed_size += info.installed_size;
             upgrades.push(UpgradeAction {
                 name: info.name.clone(),
                 old_version,
                 new_version: version,
                 repository: "local".to_string(),
                 download_size: 0,
+                installed_size: info.installed_size,
             });
         } else {
             total_installed_size += info.installed_size;
@@ -155,6 +157,7 @@ pub fn install_pkg_files(db: &mut DatabaseHandle, files: &[PathBuf]) -> Result<(
         old_install_scripts: &old_install_scripts,
         old_backup_md5: &old_backup_md5,
         hook_dirs: &db.config.hook_dirs,
+        check_space: db.config.check_space,
     };
 
     execute_transaction(&tx, &ctx).map_err(|e| anyhow::anyhow!("{e}"))?;

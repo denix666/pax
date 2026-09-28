@@ -22,6 +22,7 @@ pub fn compute_upgrades<P: PackagePool>(pool: &P) -> Vec<UpgradeAction> {
                     new_version: sync.info.version.clone(),
                     repository: String::new(),
                     download_size: 0,
+                    installed_size: 0,
                 });
             }
         }
