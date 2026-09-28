@@ -94,7 +94,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
 
         let metadata = extract_package(&downloaded.path, ctx.root_dir, &backup_md5)?;
 
-        remove_old_files(ctx.db_path, ctx.root_dir, &upgrade.name, &upgrade.old_version.to_string())?;
+        remove_stale_files(ctx.root_dir, &old_files, &metadata.files);
 
         let validation = vec![Validation::Sha256];
         let reason = get_existing_reason(ctx.db_path, &upgrade.name, &upgrade.old_version.to_string());
@@ -161,7 +161,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
 
     for removal in &tx.removals {
         let old_files = read_file_list(ctx.db_path, &removal.name, &removal.version.to_string());
-        remove_old_files(ctx.db_path, ctx.root_dir, &removal.name, &removal.version.to_string())?;
+        remove_all_files(ctx.root_dir, &old_files);
         remove_db_entry(ctx.db_path, &removal.name, &removal.version.to_string())?;
         removed_files.extend(old_files);
     }
@@ -207,13 +207,16 @@ fn read_file_list(db_path: &Path, name: &str, version: &str) -> Vec<String> {
     files
 }
 
-fn remove_old_files(db_path: &Path, root_dir: &Path, name: &str, version: &str) -> Result<()> {
-    let mut files = read_file_list(db_path, name, version);
-
-    files.sort();
-    files.reverse();
-
-    for file in &files {
+fn remove_stale_files(root_dir: &Path, old_files: &[String], new_files: &[String]) {
+    let new_set: HashSet<&str> = new_files.iter().map(|s| s.as_str()).collect();
+    let mut stale: Vec<&str> = old_files
+        .iter()
+        .filter(|f| !new_set.contains(f.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    stale.sort();
+    stale.reverse();
+    for file in &stale {
         let path = root_dir.join(file);
         if path.is_file() || path.is_symlink() {
             let _ = std::fs::remove_file(&path);
@@ -221,8 +224,20 @@ fn remove_old_files(db_path: &Path, root_dir: &Path, name: &str, version: &str) 
             let _ = std::fs::remove_dir(&path);
         }
     }
+}
 
-    Ok(())
+fn remove_all_files(root_dir: &Path, files: &[String]) {
+    let mut sorted: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    sorted.sort();
+    sorted.reverse();
+    for file in &sorted {
+        let path = root_dir.join(file);
+        if path.is_file() || path.is_symlink() {
+            let _ = std::fs::remove_file(&path);
+        } else if path.is_dir() {
+            let _ = std::fs::remove_dir(&path);
+        }
+    }
 }
 
 fn check_disk_space(root_dir: &Path, db_path: &Path, tx: &Transaction) -> Result<()> {

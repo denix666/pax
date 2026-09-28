@@ -52,6 +52,17 @@ impl fmt::Display for Version {
     }
 }
 
+impl Version {
+    /// Compare ignoring pkgrel (used when dep constraint has no pkgrel, matching pacman behavior)
+    pub fn cmp_no_pkgrel(&self, other: &Self) -> Ordering {
+        let epoch_cmp = self.epoch.cmp(&other.epoch);
+        if epoch_cmp != Ordering::Equal {
+            return epoch_cmp;
+        }
+        vercmp_segment(&self.pkgver, &other.pkgver)
+    }
+}
+
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
         let epoch_cmp = self.epoch.cmp(&other.epoch);
@@ -277,6 +288,19 @@ mod tests {
         // Extra numeric segment after separator = newer
         assert!(Version::parse("1.0.1-1").unwrap() > Version::parse("1.0-1").unwrap());
         assert!(Version::parse("1.0.0-1").unwrap() > Version::parse("1.0-1").unwrap());
+    }
+
+    #[test]
+    fn test_cmp_no_pkgrel() {
+        let v = Version::parse("17.2-1").unwrap();
+        let dep_ver = Version::parse("17.2").unwrap();
+        assert_eq!(v.cmp_no_pkgrel(&dep_ver), Ordering::Equal);
+
+        let v2 = Version::parse("17.3-1").unwrap();
+        assert_eq!(v2.cmp_no_pkgrel(&dep_ver), Ordering::Greater);
+
+        let v3 = Version::parse("17.1-2").unwrap();
+        assert_eq!(v3.cmp_no_pkgrel(&dep_ver), Ordering::Less);
     }
 
     #[test]

@@ -22,6 +22,7 @@ This program comes with no warranty. You must use this program at your own risk.
 - **File conflict detection** — checks for file conflicts between packages before extraction
 - **Disk space checking** — verifies sufficient disk space before installation (when `CheckSpace` is enabled)
 - **Privilege escalation** — automatically requests root via sudo/doas when needed
+- **System integrity checks** — verify dependency completeness and file existence (like `pacman -Dk` / `-Dkk`)
 - **IgnoreGroup / HoldPkg** — respects `IgnoreGroup` and `HoldPkg` from pacman.conf
 
 ## Installation
@@ -58,6 +59,8 @@ Most commands that modify the system (install, remove, upgrade, sync) will autom
 | `owner` | `o` | Find which package owns a file |
 | `local-install` | `U` | Install local package files (`.pkg.tar.zst`, `.pkg.tar.xz`, `.pkg.tar.gz`) |
 | `clean` | `c` | Clean package cache |
+| `check` | — | Check for missing dependencies |
+| `check-files` | — | Check that all package files exist on disk |
 | `aur-install` | — | Install packages from AUR |
 | `aur-upgrade` | — | Upgrade installed AUR packages |
 | `aur-search` | — | Search AUR for packages |
@@ -127,6 +130,18 @@ pax aur-upgrade
 
 # Search AUR
 pax aur-search telegram
+
+# Check for missing dependencies (all packages)
+pax check
+
+# Check specific packages only
+pax check vlc bash
+
+# Check that all package files exist on disk
+pax check-files
+
+# Check files for specific packages
+pax check-files bash glibc
 ```
 
 ### Global Options

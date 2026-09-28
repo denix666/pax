@@ -61,7 +61,11 @@ impl Dependency {
         match &self.constraint {
             None => true,
             Some((op, required)) => {
-                let ord = version.cmp(required);
+                let ord = if required.pkgrel.is_empty() {
+                    version.cmp_no_pkgrel(required)
+                } else {
+                    version.cmp(required)
+                };
                 match op {
                     VersionConstraint::Eq => ord == std::cmp::Ordering::Equal,
                     VersionConstraint::Ge => ord != std::cmp::Ordering::Less,

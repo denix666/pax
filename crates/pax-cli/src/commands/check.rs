@@ -137,11 +137,21 @@ pub fn run_files(db: &mut DatabaseHandle, root_dir: &Path, packages: &[String]) 
 
         for file in &files {
             let abs_path = root_dir.join(file);
-            if !abs_path.exists() {
-                eprintln!(
-                    "{name}: /{file} (No such file or directory)",
-                );
-                missing += 1;
+            match abs_path.symlink_metadata() {
+                Err(_) => {
+                    eprintln!("{name}: /{file} (No such file or directory)");
+                    missing += 1;
+                }
+                Ok(meta) if meta.is_symlink() && !abs_path.exists() => {
+                    let target = std::fs::read_link(&abs_path)
+                        .map(|t| t.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    eprintln!(
+                        "{}: {name}: /{file} -> {target} (broken symlink)",
+                        "warning".yellow().bold(),
+                    );
+                }
+                _ => {}
             }
         }
     }
