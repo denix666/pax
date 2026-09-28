@@ -118,10 +118,39 @@ pub fn extract_package(
             }
         }
 
-        entry.unpack(&dest).map_err(|e| ExecError::Extraction {
-            pkg: pkg_name.clone(),
-            message: format!("{}: {e}", dest.display()),
-        })?;
+        let entry_type = entry.header().entry_type();
+        if entry_type == tar::EntryType::Link {
+            let link_target = entry
+                .link_name()
+                .map_err(|e| ExecError::Extraction {
+                    pkg: pkg_name.clone(),
+                    message: format!("{path_str}: {e}"),
+                })?
+                .ok_or_else(|| ExecError::Extraction {
+                    pkg: pkg_name.clone(),
+                    message: format!("{path_str}: hard link with no target"),
+                })?;
+            let target_str = link_target.to_string_lossy();
+            let target_str = target_str.strip_prefix("./").unwrap_or(&target_str);
+            let src = root_dir.join(target_str);
+            if dest.exists() || dest.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(&dest);
+            }
+            std::fs::hard_link(&src, &dest).map_err(|e| ExecError::Extraction {
+                pkg: pkg_name.clone(),
+                message: format!(
+                    "{}: {e} when hard linking {} to {}",
+                    path_str,
+                    src.display(),
+                    dest.display()
+                ),
+            })?;
+        } else {
+            entry.unpack(&dest).map_err(|e| ExecError::Extraction {
+                pkg: pkg_name.clone(),
+                message: format!("{}: {e}", dest.display()),
+            })?;
+        }
     }
 
     Ok(PackageMetadata {
