@@ -20,6 +20,10 @@ struct SyncInfo {
 }
 
 pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, needed: bool, reinstall: bool) -> Result<()> {
+    if !dry_run {
+        super::ensure_root();
+    }
+
     if packages.is_empty() {
         eprintln!("error: no targets specified");
         std::process::exit(1);

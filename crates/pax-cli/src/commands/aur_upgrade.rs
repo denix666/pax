@@ -106,7 +106,7 @@ pub fn run(db: &mut DatabaseHandle, skip_review: bool, noconfirm: bool, allow_ro
 
         println!(":: Installing {}...", upg.package.name.bold());
 
-        super::localinstall::install_pkg_files(db, &[result.package_path])?;
+        super::aur::install_as_root(db, &result.package_path, &upg.package.name)?;
     }
 
     println!(

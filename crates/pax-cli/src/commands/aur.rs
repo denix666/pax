@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use indicatif::MultiProgress;
@@ -12,6 +12,62 @@ use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
 use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveOptions};
 
 use crate::output::print_transaction;
+
+fn is_root() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+}
+
+fn escalate_tool() -> Result<String> {
+    super::privilege_escalation_tool().ok_or_else(|| {
+        anyhow::anyhow!("no privilege escalation tool found (install sudo or doas, or set PAX_SUDO)")
+    })
+}
+
+pub(crate) fn install_as_root(db: &mut DatabaseHandle, pkg_path: &Path, pkg_name: &str) -> Result<()> {
+    if is_root() {
+        super::localinstall::install_pkg_files(db, &[pkg_path.to_path_buf()])?;
+    } else {
+        let tool = escalate_tool()?;
+        let pax_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pax"));
+        let status = std::process::Command::new(&tool)
+            .arg(&pax_bin)
+            .args(["local-install", "--noconfirm"])
+            .arg(pkg_path)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to install {pkg_name}: exited with {status}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn install_repo_deps(db: &mut DatabaseHandle, packages: &[String]) -> Result<()> {
+    if is_root() {
+        install_repo_packages(db, packages)
+    } else {
+        let tool = escalate_tool()?;
+        let pax_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pax"));
+        let status = std::process::Command::new(&tool)
+            .arg(&pax_bin)
+            .args(["install", "--noconfirm"])
+            .args(packages)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to install repo dependencies: exited with {status}"
+            ));
+        }
+        Ok(())
+    }
+}
 
 struct SyncInfo {
     compressed_size: u64,
@@ -104,7 +160,7 @@ pub fn run(
     // Step 1: Install repo deps if needed
     if !all_repo_deps.is_empty() {
         println!("\n:: Installing repo dependencies...");
-        install_repo_packages(db, &all_repo_deps)?;
+        install_repo_deps(db, &all_repo_deps)?;
     }
 
     // Step 2: Build and install AUR packages in order
@@ -123,7 +179,7 @@ pub fn run(
 
         println!(":: Installing {}...", target.package.name.bold());
 
-        super::localinstall::install_pkg_files(db, &[result.package_path])?;
+        install_as_root(db, &result.package_path, &target.package.name)?;
     }
 
     println!(

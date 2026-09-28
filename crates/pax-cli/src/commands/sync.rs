@@ -5,10 +5,7 @@ use pax_alpm::db::DatabaseHandle;
 use pax_exec::SyncTarget;
 
 pub fn run(db: &mut DatabaseHandle) -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("error: you cannot perform this operation unless you are root.");
-        std::process::exit(1);
-    }
+    super::ensure_root();
 
     let sync_dir = db.config.db_path.join("sync");
 

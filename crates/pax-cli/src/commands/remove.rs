@@ -14,6 +14,8 @@ pub fn run(
     noconfirm: bool,
     recursive: bool,
 ) -> Result<()> {
+    super::ensure_root();
+
     if packages.is_empty() {
         eprintln!("error: no targets specified");
         std::process::exit(1);

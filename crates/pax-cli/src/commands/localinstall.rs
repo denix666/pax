@@ -10,6 +10,8 @@ use pax_exec::{execute_transaction, read_pkginfo, DownloadedPackage, InstallCont
 use pax_resolver::{InstallAction, Transaction, UpgradeAction};
 
 pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Result<()> {
+    super::ensure_root();
+
     if files.is_empty() {
         eprintln!("error: no targets specified");
         std::process::exit(1);

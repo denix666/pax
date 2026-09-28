@@ -23,6 +23,10 @@ struct SyncInfo {
 }
 
 pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfirm: bool) -> Result<()> {
+    if !dry_run {
+        super::ensure_root();
+    }
+
     db.ensure_both()?;
 
     let ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
