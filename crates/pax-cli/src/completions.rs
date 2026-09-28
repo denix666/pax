@@ -211,7 +211,7 @@ _pax() {
             ;;
         aur-install)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "--skip-review --noconfirm --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "--skip-review --noconfirm --reinstall --help" -- "$cur"))
             elif [[ ${#cur} -ge 2 ]]; then
                 _pax_complete_packages "aur:$cur" "aur:$cur"
             fi
@@ -373,6 +373,7 @@ _pax() {
                     _arguments \
                         '--skip-review[Skip PKGBUILD review]' \
                         '--noconfirm[Skip confirmation]' \
+                        '--reinstall[Reinstall already installed packages]' \
                         '*:package:_pax_aur_packages'
                     ;;
                 local-install|U)
@@ -459,6 +460,7 @@ complete -c pax -n "__fish_seen_subcommand_from owner" -F -d "File path"
 
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -l skip-review -d "Skip PKGBUILD review"
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from aur-install" -l reinstall -d "Reinstall already installed packages"
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -a "(test (string length -- (commandline -ct)) -ge 2; and pax --pkg-list 'aur:'(commandline -ct) 2>/dev/null)" -d "AUR package"
 
 complete -c pax -n "__fish_seen_subcommand_from local-install" -l noconfirm -d "Skip confirmation"

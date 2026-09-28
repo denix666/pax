@@ -68,6 +68,11 @@ pub fn run(db: &mut DatabaseHandle, skip_review: bool, noconfirm: bool, allow_ro
     let aur_targets = resolve_aur_targets(&upgrade_refs, &installed_names, &sync_names)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    if aur_targets.is_empty() {
+        println!("All AUR packages are up to date.");
+        return Ok(());
+    }
+
     let mut all_repo_deps: Vec<String> = Vec::new();
     for target in &aur_targets {
         all_repo_deps.extend(target.repo_depends.iter().cloned());

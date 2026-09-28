@@ -16,6 +16,7 @@ pub fn resolve_aur_targets(
     installed: &HashSet<String>,
     sync_available: &HashSet<String>,
 ) -> Result<Vec<AurTarget>> {
+    let explicit: HashSet<&str> = names.iter().copied().collect();
     let mut resolved: HashMap<String, AurPackage> = HashMap::new();
     let mut queue: VecDeque<String> = names.iter().map(|n| n.to_string()).collect();
     let mut visited: HashSet<String> = HashSet::new();
@@ -23,7 +24,10 @@ pub fn resolve_aur_targets(
     while !queue.is_empty() {
         let mut batch: Vec<String> = Vec::new();
         while let Some(name) = queue.pop_front() {
-            if visited.contains(&name) || installed.contains(&name) || sync_available.contains(&name) {
+            if visited.contains(&name)
+                || (!explicit.contains(name.as_str()) && installed.contains(&name))
+                || sync_available.contains(&name)
+            {
                 continue;
             }
             visited.insert(name.clone());

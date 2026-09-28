@@ -78,7 +78,8 @@ fn main() -> Result<()> {
             skip_review,
             noconfirm,
             allow_root,
-        } => commands::aur::run(&mut db, packages, *skip_review, *noconfirm, *allow_root),
+            reinstall,
+        } => commands::aur::run(&mut db, packages, *skip_review, *noconfirm, *allow_root, *reinstall),
         Command::AurUpgrade {
             skip_review,
             noconfirm,

@@ -110,6 +110,9 @@ pax owner /usr/bin/vim
 # Install a package from AUR
 pax aur-install resistor
 
+# Reinstall / update a specific AUR package
+pax aur-install resistor --reinstall
+
 # Install AUR package as root (not recommended)
 pax aur-install resistor --allow-root
 
@@ -176,6 +179,7 @@ pax check-files bash glibc
 |------|-------------|
 | `--skip-review` | Skip PKGBUILD review before building |
 | `--noconfirm` | Skip confirmation prompt |
+| `--reinstall` | Reinstall already installed AUR packages (`aur-install` only) |
 | `--allow-root` | Allow building as root (not recommended) |
 
 ### Privilege Escalation

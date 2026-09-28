@@ -147,6 +147,10 @@ pub enum Command {
         /// Allow running as root (not recommended)
         #[arg(long)]
         allow_root: bool,
+
+        /// Reinstall already installed packages
+        #[arg(long)]
+        reinstall: bool,
     },
 
     /// Upgrade installed AUR packages

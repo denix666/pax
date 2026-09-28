@@ -75,6 +75,7 @@ pub fn run(
     skip_review: bool,
     noconfirm: bool,
     allow_root: bool,
+    reinstall: bool,
 ) -> Result<()> {
     if packages.is_empty() {
         anyhow::bail!("no targets specified");
@@ -96,7 +97,27 @@ pub fn run(
         .map(|(p, _)| p.info.name.clone())
         .collect();
 
-    let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
+    let mut to_install: Vec<String> = Vec::new();
+    for name in packages {
+        if installed.contains(name) {
+            if reinstall {
+                to_install.push(name.clone());
+            } else if let Ok(Some(pkg)) = db.local_info(name) {
+                eprintln!(
+                    "{name} {} is already installed (use --reinstall to reinstall)",
+                    pkg.info.version
+                );
+            }
+        } else {
+            to_install.push(name.clone());
+        }
+    }
+
+    if to_install.is_empty() {
+        return Ok(());
+    }
+
+    let pkg_refs: Vec<&str> = to_install.iter().map(|s| s.as_str()).collect();
 
     println!(":: Resolving AUR dependencies...");
     let aur_targets =
