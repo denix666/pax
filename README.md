@@ -18,6 +18,11 @@ This program comes with no warranty. You must use this program at your own risk.
 - **Transaction hooks** — supports alpm hooks (PreTransaction / PostTransaction)
 - **Scriptlets** — runs pre/post install/upgrade/remove scriptlets
 - **Backup file handling** — preserves user-modified config files (`.pacnew` / `.pacsave`)
+- **PGP signature verification** — verifies package signatures respecting SigLevel settings (global and per-repo)
+- **File conflict detection** — checks for file conflicts between packages before extraction
+- **Disk space checking** — verifies sufficient disk space before installation (when `CheckSpace` is enabled)
+- **Privilege escalation** — automatically requests root via sudo/doas when needed
+- **IgnoreGroup / HoldPkg** — respects `IgnoreGroup` and `HoldPkg` from pacman.conf
 
 ## Installation
 
@@ -35,6 +40,8 @@ sudo cp target/release/pax /usr/local/bin/
 ```
 pax [OPTIONS] [COMMAND]
 ```
+
+Most commands that modify the system (install, remove, upgrade, sync) will automatically request root privileges via sudo or doas if not already running as root.
 
 ### Commands
 
@@ -59,25 +66,28 @@ pax [OPTIONS] [COMMAND]
 
 ```bash
 # Synchronize databases
-sudo pax sync
+pax sync
 
 # Install a package
-sudo pax install nginx
+pax install nginx
 
-# Install with dry-run
+# Install with dry-run (no root needed)
 pax install nginx --dry-run
 
-# Download package without installing
-sudo pax install nginx --download-only
+# Download packages without installing
+pax install nginx --download-only
 
 # Reinstall a package
-sudo pax install nginx --reinstall
+pax install nginx --reinstall
 
 # Remove a package and its unused dependencies
-sudo pax remove nginx --recursive
+pax remove nginx --recursive
 
 # Upgrade all packages
-sudo pax upgrade
+pax upgrade
+
+# Download upgrades without installing
+pax upgrade --download-only
 
 # Search for packages
 pax search firefox
@@ -95,22 +105,25 @@ pax query --orphans
 pax owner /usr/bin/vim
 
 # Install a package from AUR
-sudo pax aur-install resistor
+pax aur-install resistor
+
+# Install AUR package as root (not recommended)
+pax aur-install resistor --allow-root
 
 # Install a local package file
-sudo pax local-install ./package-1.0-1-x86_64.pkg.tar.zst
+pax local-install ./package-1.0-1-x86_64.pkg.tar.zst
 
 # Install multiple local packages at once
-sudo pax local-install pkg1.pkg.tar.zst pkg2.pkg.tar.zst
+pax local-install pkg1.pkg.tar.zst pkg2.pkg.tar.zst
 
 # Clean uninstalled packages from cache
-sudo pax clean
+pax clean
 
 # Remove all cached packages
-sudo pax clean --all
+pax clean --all
 
 # Upgrade all AUR packages
-sudo pax aur-upgrade
+pax aur-upgrade
 
 # Search AUR
 pax aur-search telegram
@@ -125,15 +138,54 @@ pax aur-search telegram
 | `--root <PATH>` | Alternate root directory |
 | `--completions <SHELL>` | Generate shell completions (`bash`, `zsh`, `fish`) |
 
-### Install Flags
+### Install / Upgrade Flags
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Show what would be installed without installing |
+| `--dry-run` | Show what would be installed/upgraded without doing it |
 | `-w`, `--download-only` | Download packages to cache without installing |
 | `--noconfirm` | Skip confirmation prompt |
-| `--needed` | Skip already installed up-to-date packages |
-| `--reinstall` | Reinstall already installed packages |
+| `--needed` | Skip already installed up-to-date packages (install only) |
+| `--reinstall` | Reinstall already installed packages (install only) |
+
+### Remove Flags
+
+| Flag | Description |
+|------|-------------|
+| `-s`, `--recursive` | Also remove unneeded dependencies |
+| `--noconfirm` | Skip confirmation prompt |
+
+### AUR Flags
+
+| Flag | Description |
+|------|-------------|
+| `--skip-review` | Skip PKGBUILD review before building |
+| `--noconfirm` | Skip confirmation prompt |
+| `--allow-root` | Allow building as root (not recommended) |
+
+### Privilege Escalation
+
+pax automatically detects and uses the available privilege escalation tool:
+
+1. `PAX_SUDO` environment variable — if set, uses the specified tool
+2. `sudo` — if available in PATH
+3. `doas` — if available in PATH
+
+Example: `PAX_SUDO=doas pax install nginx`
+
+### pacman.conf Support
+
+pax reads and respects the following pacman.conf directives:
+
+| Directive | Description |
+|-----------|-------------|
+| `IgnorePkg` | Packages to skip during upgrades |
+| `IgnoreGroup` | Package groups to skip during upgrades |
+| `HoldPkg` | Packages that require extra confirmation before removal |
+| `CheckSpace` | Verify sufficient disk space before installing |
+| `SigLevel` | PGP signature verification level (global and per-repo) |
+| `ParallelDownloads` | Number of concurrent downloads |
+| `CacheDir` | Package cache directory |
 
 ## Shell Completions
 
