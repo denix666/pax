@@ -131,7 +131,7 @@ _pax() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local subcmds="search info query files owner install remove local-install aur-install aur-search aur-upgrade sync upgrade clean help"
+    local subcmds="search info query files owner install remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean help"
 
     case "$prev" in
         --completions)
@@ -153,7 +153,7 @@ _pax() {
     local subcmd=""
     for ((i=1; i < COMP_CWORD; i++)); do
         case "${COMP_WORDS[i]}" in
-            search|s|info|i|query|q|files|f|owner|o|install|S|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|sync|y|upgrade|u|clean|c)
+            search|s|info|i|query|q|files|f|owner|o|install|S|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|check|check-files|sync|y|upgrade|u|clean|c)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -236,6 +236,12 @@ _pax() {
                 COMPREPLY=($(compgen -W "--all --noconfirm --help" -- "$cur"))
             fi
             ;;
+        check)
+            COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
+            ;;
+        check-files)
+            COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
+            ;;
         upgrade|u)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=($(compgen -W "--dry-run --noconfirm --help" -- "$cur"))
@@ -305,6 +311,8 @@ _pax() {
         'aur-install:Install packages from AUR'
         'aur-search:Search AUR for packages'
         'aur-upgrade:Upgrade installed AUR packages'
+        'check:Check for missing dependencies'
+        'check-files:Check that all package files exist'
         'sync:Synchronize package databases'
         'upgrade:Upgrade installed packages'
         'clean:Clean package cache'
@@ -378,6 +386,12 @@ _pax() {
                         '--noconfirm[Skip confirmation]' \
                         '--allow-root[Allow running as root]'
                     ;;
+                check)
+                    _arguments '*:package:_pax_installed_packages'
+                    ;;
+                check-files)
+                    _arguments '*:package:_pax_installed_packages'
+                    ;;
                 clean|c)
                     _arguments \
                         '--all[Remove all cached packages]' \
@@ -397,7 +411,7 @@ _pax "$@"
 "#;
 
 const FISH: &str = r#"
-set -l subcmds search info query files owner install remove local-install aur-install aur-search aur-upgrade sync upgrade clean
+set -l subcmds search info query files owner install remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean
 
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l help -d "Show help"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l version -d "Show version"
@@ -419,6 +433,8 @@ complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a sync -d "Synchr
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a local-install -d "Install local package files"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a aur-upgrade -d "Upgrade AUR packages"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a upgrade -d "Upgrade packages"
+complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a check -d "Check for missing dependencies"
+complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a check-files -d "Check that all package files exist"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a clean -d "Clean package cache"
 
 complete -c pax -n "__fish_seen_subcommand_from install" -l dry-run -d "Show what would be installed"
@@ -454,6 +470,9 @@ complete -c pax -n "__fish_seen_subcommand_from aur-upgrade" -l allow-root -d "A
 
 complete -c pax -n "__fish_seen_subcommand_from upgrade" -l dry-run -d "Show what would be upgraded"
 complete -c pax -n "__fish_seen_subcommand_from upgrade" -l noconfirm -d "Skip confirmation"
+
+complete -c pax -n "__fish_seen_subcommand_from check" -a "(pax --pkg-list local 2>/dev/null)" -d "Installed package"
+complete -c pax -n "__fish_seen_subcommand_from check-files" -a "(pax --pkg-list local 2>/dev/null)" -d "Installed package"
 
 complete -c pax -n "__fish_seen_subcommand_from clean" -l all -d "Remove all cached packages"
 complete -c pax -n "__fish_seen_subcommand_from clean" -l noconfirm -d "Skip confirmation"

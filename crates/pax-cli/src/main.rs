@@ -85,6 +85,11 @@ fn main() -> Result<()> {
             allow_root,
         } => commands::aur_upgrade::run(&mut db, *skip_review, *noconfirm, *allow_root),
         Command::AurSearch { query } => commands::aur_search::run(query),
+        Command::Check { packages } => commands::check::run_deps(&mut db, packages),
+        Command::CheckFiles { packages } => {
+            let root_dir = db.config.root_dir.clone();
+            commands::check::run_files(&mut db, &root_dir, packages)
+        }
         Command::Clean { all, noconfirm } => commands::clean::run(&mut db, *all, *noconfirm),
         Command::Sync => commands::sync::run(&mut db),
         Command::Upgrade { dry_run, download_only, noconfirm } => {

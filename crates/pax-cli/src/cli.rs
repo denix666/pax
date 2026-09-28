@@ -132,7 +132,6 @@ pub enum Command {
     },
 
     /// Install packages from AUR
-    #[command(alias = "aur-install")]
     AurInstall {
         /// Package names to install from AUR
         packages: Vec<String>,
@@ -181,6 +180,18 @@ pub enum Command {
         /// Skip confirmation prompt
         #[arg(long)]
         noconfirm: bool,
+    },
+
+    /// Check for missing dependencies
+    Check {
+        /// Only check specific packages
+        packages: Vec<String>,
+    },
+
+    /// Check that all package files exist on disk
+    CheckFiles {
+        /// Only check specific packages
+        packages: Vec<String>,
     },
 
     /// Synchronize package databases
