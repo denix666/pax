@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::error::{ExecError, Result};
+use crate::error::Result;
 
 pub enum ScriptletOp {
     PreInstall,
@@ -60,17 +60,20 @@ pub fn run_scriptlet(
                 stdin.write_all(install_script.as_bytes())?;
             }
             child.wait()
-        })
-        .map_err(|_| ExecError::Scriptlet {
-            pkg: pkg_name.to_string(),
-            code: -1,
-        })?;
-
-    if !output.success() {
-        return Err(ExecError::Scriptlet {
-            pkg: pkg_name.to_string(),
-            code: output.code().unwrap_or(-1),
         });
+
+    match output {
+        Ok(status) if !status.success() => {
+            eprintln!(
+                "warning: scriptlet failed for {}: exit code {}",
+                pkg_name,
+                status.code().unwrap_or(-1)
+            );
+        }
+        Err(e) => {
+            eprintln!("warning: scriptlet failed for {}: {e}", pkg_name);
+        }
+        Ok(_) => {}
     }
 
     Ok(())

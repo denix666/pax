@@ -336,7 +336,11 @@ fn run_hook_action(action: &HookAction, targets: &[String], hook_name: &str) -> 
     if action.needs_targets {
         if let Some(ref mut stdin) = child.stdin {
             for target in targets {
-                let _ = writeln!(stdin, "{target}");
+                if target.starts_with('/') {
+                    let _ = writeln!(stdin, "{target}");
+                } else {
+                    let _ = writeln!(stdin, "/{target}");
+                }
             }
         }
         drop(child.stdin.take());

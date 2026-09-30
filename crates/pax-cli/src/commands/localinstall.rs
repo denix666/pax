@@ -12,6 +12,9 @@ use super::{collect_old_backup_md5, collect_old_install_scripts, confirm};
 pub fn run(db: &mut DatabaseHandle, files: &[PathBuf], noconfirm: bool) -> Result<()> {
     super::ensure_root();
 
+    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
+        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
+
     if files.is_empty() {
         anyhow::bail!("no targets specified");
     }

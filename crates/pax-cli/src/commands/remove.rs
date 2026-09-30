@@ -17,6 +17,9 @@ pub fn run(
 ) -> Result<()> {
     super::ensure_root();
 
+    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
+        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
+
     if packages.is_empty() {
         anyhow::bail!("no targets specified");
     }

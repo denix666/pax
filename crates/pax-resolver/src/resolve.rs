@@ -262,8 +262,13 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
 
     fn check_conflicts(&self) -> Result<()> {
         for (pkg_name, conflict) in &self.conflicts {
-            let conflict_present = self.selected.contains_key(&conflict.name)
-                || self.pool.installed_version(&conflict.name).is_some();
+            let conflict_present = self.selected.get(&conflict.name)
+                .and_then(|&id| self.pool.get(id))
+                .map(|c| conflict.satisfies(&c.info.version))
+                .unwrap_or(false)
+                || self.pool.installed_version(&conflict.name)
+                    .map(|v| conflict.satisfies(v))
+                    .unwrap_or(false);
 
             if conflict_present && conflict.name != *pkg_name {
                 let chain_a = self

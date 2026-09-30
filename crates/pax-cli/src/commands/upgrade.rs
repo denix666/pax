@@ -18,6 +18,15 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
         super::ensure_root();
     }
 
+    let _lock = if !dry_run {
+        Some(
+            pax_alpm::DbLock::acquire(&db.config.db_path)
+                .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     db.ensure_both()?;
 
     let mut ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
