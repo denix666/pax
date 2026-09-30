@@ -5,7 +5,7 @@ use indicatif::MultiProgress;
 use pax_alpm::db::DatabaseHandle;
 use pax_core::config::SigLevel;
 use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
-use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveOptions};
+use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveError, ResolveOptions};
 
 use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, SyncInfo};
 use crate::output::print_transaction;
@@ -114,7 +114,18 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
 
     let options = ResolveOptions::default();
     let mut resolved = resolve(&pool, packages, &options)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| {
+            if let ResolveError::TargetNotFound { ref name } = e {
+                if let Ok(results) = pax_aur::rpc::info(&[name.as_str()]) {
+                    if !results.is_empty() {
+                        return anyhow::anyhow!(
+                            "{e}\n  hint: found in AUR — install with: pax aur-install {name}"
+                        );
+                    }
+                }
+            }
+            anyhow::anyhow!("{e}")
+        })?;
 
     topological_sort(&pool, &mut resolved);
 
@@ -227,4 +238,3 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
 
     Ok(())
 }
-

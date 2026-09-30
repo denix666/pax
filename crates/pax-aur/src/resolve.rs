@@ -18,12 +18,16 @@ pub fn resolve_aur_targets(
 ) -> Result<Vec<AurTarget>> {
     let explicit: HashSet<&str> = names.iter().copied().collect();
     let mut resolved: HashMap<String, AurPackage> = HashMap::new();
-    let mut queue: VecDeque<String> = names.iter().map(|n| n.to_string()).collect();
+    let mut queue: VecDeque<(String, Option<String>)> = names
+        .iter()
+        .map(|n| (n.to_string(), None))
+        .collect();
     let mut visited: HashSet<String> = HashSet::new();
+    let mut required_by: HashMap<String, String> = HashMap::new();
 
     while !queue.is_empty() {
         let mut batch: Vec<String> = Vec::new();
-        while let Some(name) = queue.pop_front() {
+        while let Some((name, by)) = queue.pop_front() {
             if visited.contains(&name)
                 || (!explicit.contains(name.as_str()) && installed.contains(&name))
                 || sync_available.contains(&name)
@@ -31,6 +35,9 @@ pub fn resolve_aur_targets(
                 continue;
             }
             visited.insert(name.clone());
+            if let Some(b) = by {
+                required_by.entry(name.clone()).or_insert(b);
+            }
             batch.push(name);
         }
 
@@ -48,20 +55,30 @@ pub fn resolve_aur_targets(
 
         for name in &batch {
             let Some(pkg) = results_map.remove(name) else {
-                return Err(AurError::NotFound(name.clone()));
+                if explicit.contains(name.as_str()) {
+                    let req = required_by
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| "explicit".to_string());
+                    return Err(AurError::NotFound {
+                        pkg: name.clone(),
+                        required_by: req,
+                    });
+                }
+                continue;
             };
 
             for dep in &pkg.depends {
                 let dn = dep_name(dep);
                 if !installed.contains(dn) && !sync_available.contains(dn) && !visited.contains(dn) {
-                    queue.push_back(dn.to_string());
+                    queue.push_back((dn.to_string(), Some(name.clone())));
                 }
             }
 
             for dep in &pkg.make_depends {
                 let dn = dep_name(dep);
                 if !installed.contains(dn) && !sync_available.contains(dn) && !visited.contains(dn) {
-                    queue.push_back(dn.to_string());
+                    queue.push_back((dn.to_string(), Some(name.clone())));
                 }
             }
 

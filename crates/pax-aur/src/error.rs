@@ -9,8 +9,8 @@ pub enum AurError {
     #[error("AUR API error: {0}")]
     Api(String),
 
-    #[error("package not found in AUR: {0}")]
-    NotFound(String),
+    #[error("package not found in AUR: {pkg} (required by: {required_by})")]
+    NotFound { pkg: String, required_by: String },
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
