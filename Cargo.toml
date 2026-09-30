@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.9"
 edition = "2024"
 license = "MIT"
 description = "A modern and fast package manager for Arch-based systems"

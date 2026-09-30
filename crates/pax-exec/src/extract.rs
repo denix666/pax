@@ -25,6 +25,38 @@ pub fn extract_package(
         .to_string_lossy()
         .to_string();
 
+    // First pass: read .PKGINFO to get backup_entries before processing files
+    let backup_entries: Vec<String> = {
+        let file = std::fs::File::open(pkg_path)?;
+        let decompressor = decompress(file, &pkg_name)?;
+        let mut archive = Archive::new(decompressor);
+        let mut pkginfo = String::new();
+        for entry_result in archive.entries().map_err(|e| ExecError::Extraction {
+            pkg: pkg_name.clone(),
+            message: e.to_string(),
+        })? {
+            let mut entry = entry_result.map_err(|e| ExecError::Extraction {
+                pkg: pkg_name.clone(),
+                message: e.to_string(),
+            })?;
+            let path = entry.path().map_err(|e| ExecError::Extraction {
+                pkg: pkg_name.clone(),
+                message: e.to_string(),
+            })?.to_path_buf();
+            let path_str = path.to_string_lossy().to_string();
+            let path_str = path_str.strip_prefix("./").unwrap_or(&path_str).to_string();
+            if path_str == ".PKGINFO" {
+                entry.read_to_string(&mut pkginfo).map_err(|e| ExecError::Extraction {
+                    pkg: pkg_name.clone(),
+                    message: format!(".PKGINFO: {e}"),
+                })?;
+                break;
+            }
+        }
+        parse_backup_from_pkginfo(&pkginfo)
+    };
+
+    // Second pass: extract everything
     let file = std::fs::File::open(pkg_path)?;
     let decompressor = decompress(file, &pkg_name)?;
     let mut archive = Archive::new(decompressor);
@@ -36,7 +68,6 @@ pub fn extract_package(
     let mut mtree = Vec::new();
     let mut install = None;
     let mut files: Vec<String> = Vec::new();
-    let mut backup_entries: Vec<String> = Vec::new();
 
     for entry_result in archive.entries().map_err(|e| ExecError::Extraction {
         pkg: pkg_name.clone(),
@@ -67,7 +98,6 @@ pub fn extract_package(
                             message: format!(".PKGINFO: {e}"),
                         }
                     })?;
-                    backup_entries = parse_backup_from_pkginfo(&pkginfo);
                 }
                 ".MTREE" => {
                     entry.read_to_end(&mut mtree).map_err(|e| {
@@ -97,18 +127,30 @@ pub fn extract_package(
         let dest = root_dir.join(path_str);
 
         if backup_entries.contains(&path_str.to_string()) {
-            if let Some(existing_md5) = existing_backup_md5.get(path_str) {
-                if dest.exists() {
-                    let current_md5 = compute_md5(&dest)?;
-                    if current_md5 != *existing_md5 {
-                        let pacnew = PathBuf::from(format!("{}.pacnew", dest.display()));
-                        entry.unpack(&pacnew).map_err(|e| ExecError::Extraction {
-                            pkg: pkg_name.clone(),
-                            message: format!("{}: {e}", pacnew.display()),
-                        })?;
-                        continue;
+            if dest.exists() {
+                let current_md5 = compute_md5(&dest)?;
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).map_err(|e| ExecError::Extraction {
+                    pkg: pkg_name.clone(),
+                    message: format!("{path_str}: {e}"),
+                })?;
+                let new_md5 = format!("{:x}", md5::compute(&buf));
+                let should_pacnew = match existing_backup_md5.get(path_str) {
+                    Some(old_md5) => current_md5 != *old_md5,
+                    None => current_md5 != new_md5,
+                };
+                if let Some(parent) = dest.parent() {
+                    if !parent.exists() {
+                        std::fs::create_dir_all(parent)?;
                     }
                 }
+                if should_pacnew {
+                    let pacnew = PathBuf::from(format!("{}.pacnew", dest.display()));
+                    std::fs::write(&pacnew, &buf)?;
+                } else {
+                    std::fs::write(&dest, &buf)?;
+                }
+                continue;
             }
         }
 
@@ -146,6 +188,15 @@ pub fn extract_package(
                 ),
             })?;
         } else {
+            if entry_type == tar::EntryType::Symlink {
+                if dest.symlink_metadata().is_ok() {
+                    if dest.is_dir() && !dest.is_symlink() {
+                        let _ = std::fs::remove_dir_all(&dest);
+                    } else {
+                        let _ = std::fs::remove_file(&dest);
+                    }
+                }
+            }
             entry.unpack(&dest).map_err(|e| ExecError::Extraction {
                 pkg: pkg_name.clone(),
                 message: format!("{}: {e}", dest.display()),

@@ -4,7 +4,7 @@ use owo_colors::OwoColorize;
 
 use pax_core::package::{LocalPackage, SyncPackage};
 use pax_core::version::Version;
-use pax_resolver::Transaction;
+use pax_resolver::{RemovalReason, Transaction};
 
 pub fn print_local_package_short(pkg: &LocalPackage) {
     println!("{} {}", pkg.info.name.bold(), pkg.info.version.green());
@@ -317,11 +317,17 @@ pub fn print_transaction(tx: &Transaction, sync_sizes: &HashMap<String, (u64, u6
     if !tx.removals.is_empty() {
         println!("\n{}", "Packages to remove:".bold());
         for rem in &tx.removals {
+            let reason_str = match &rem.reason {
+                RemovalReason::Replaced => "replaced".to_string(),
+                RemovalReason::Conflict { with } => {
+                    format!("conflicts with {with}")
+                }
+            };
             println!(
                 "  {} {} ({})",
                 rem.name.bold(),
                 rem.version.red(),
-                rem.reason
+                reason_str
             );
         }
     }

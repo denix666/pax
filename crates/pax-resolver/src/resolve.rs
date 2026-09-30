@@ -5,6 +5,7 @@ use pax_core::version::Version;
 
 use crate::error::{ResolveError, Result};
 use crate::pool::{PackageCandidate, PackageId, PackagePool, PackageSource};
+use crate::transaction::RemovalReason;
 
 pub struct ResolveOptions {
     pub reinstall: bool,
@@ -27,7 +28,7 @@ pub struct ResolvedPackage {
 
 pub struct ResolvedSet {
     pub to_install: Vec<ResolvedPackage>,
-    pub to_remove: Vec<String>,
+    pub to_remove: Vec<(String, RemovalReason)>,
 }
 
 struct Resolver<'a, P: PackagePool> {
@@ -38,7 +39,7 @@ struct Resolver<'a, P: PackagePool> {
     dep_chains: HashMap<String, Vec<String>>,
     in_progress: HashSet<String>,
     conflicts: Vec<(String, Dependency)>,
-    replaces: Vec<(String, String)>,
+    replaces: Vec<(String, String, RemovalReason)>,
     targets: HashSet<String>,
 }
 
@@ -121,7 +122,7 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
         for replace in &pkg_replaces {
             if self.pool.installed_version(&replace.name).is_some() {
                 self.replaces
-                    .push((pkg_name.clone(), replace.name.clone()));
+                    .push((pkg_name.clone(), replace.name.clone(), RemovalReason::Replaced));
             }
         }
 
@@ -260,8 +261,34 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
         }
     }
 
-    fn check_conflicts(&self) -> Result<()> {
-        for (pkg_name, conflict) in &self.conflicts {
+    fn is_safe_to_remove(&self, name: &str) -> Option<String> {
+        if self.targets.contains(name) {
+            return Some("explicit target".to_string());
+        }
+        let will_remove: HashSet<&str> = self
+            .replaces
+            .iter()
+            .map(|(_, old, _)| old.as_str())
+            .collect();
+        for pkg in self.pool.all_installed() {
+            if self.selected.contains_key(&pkg.info.name) {
+                continue;
+            }
+            if will_remove.contains(pkg.info.name.as_str()) {
+                continue;
+            }
+            for dep in &pkg.info.depends {
+                if dep.name == name {
+                    return Some(pkg.info.name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn check_conflicts(&mut self) -> Result<()> {
+        let conflicts: Vec<(String, Dependency)> = self.conflicts.clone();
+        for (pkg_name, conflict) in &conflicts {
             let conflict_present = self.selected.get(&conflict.name)
                 .and_then(|&id| self.pool.get(id))
                 .map(|c| conflict.satisfies(&c.info.version))
@@ -271,22 +298,36 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
                     .unwrap_or(false);
 
             if conflict_present && conflict.name != *pkg_name {
-                let chain_a = self
-                    .dep_chains
-                    .get(pkg_name)
-                    .cloned()
-                    .unwrap_or_default();
-                let chain_b = self
-                    .dep_chains
-                    .get(&conflict.name)
-                    .cloned()
-                    .unwrap_or_default();
-                return Err(ResolveError::PackageConflict {
-                    pkg_a: pkg_name.clone(),
-                    pkg_b: conflict.name.clone(),
-                    chain_a,
-                    chain_b,
-                });
+                if let Some(blocked_by) = self.is_safe_to_remove(&conflict.name) {
+                    let chain_a = self
+                        .dep_chains
+                        .get(pkg_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let chain_b = self
+                        .dep_chains
+                        .get(&conflict.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    return Err(ResolveError::PackageConflict {
+                        pkg_a: pkg_name.clone(),
+                        pkg_b: conflict.name.clone(),
+                        chain_a,
+                        chain_b,
+                        blocked_by,
+                    });
+                }
+                let already_removing = self
+                    .replaces
+                    .iter()
+                    .any(|(_, old, _)| old == &conflict.name);
+                if !already_removing {
+                    self.replaces.push((
+                        pkg_name.clone(),
+                        conflict.name.clone(),
+                        RemovalReason::Conflict { with: pkg_name.clone() },
+                    ));
+                }
             }
         }
         Ok(())
@@ -319,7 +360,11 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
 
         to_install.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let to_remove: Vec<String> = self.replaces.into_iter().map(|(_, old)| old).collect();
+        let to_remove: Vec<(String, RemovalReason)> = self
+            .replaces
+            .into_iter()
+            .map(|(_, old, reason)| (old, reason))
+            .collect();
 
         ResolvedSet {
             to_install,
@@ -445,17 +490,36 @@ mod tests {
         let mut a = make_pkg("a", "1.0-1", &[]);
         a.conflicts = vec![Dependency::parse("b").unwrap()];
         pool.add_sync(a, 0);
-        pool.add_sync(make_pkg("b", "1.0-1", &[]), 0);
+        pool.add_local(make_pkg("b", "1.0-1", &[]));
+        pool.add_local(make_pkg("c", "1.0-1", &["b"]));
 
         let err = resolve(
             &pool,
-            &["a".to_string(), "b".to_string()],
+            &["a".to_string()],
             &ResolveOptions::default(),
         );
         assert!(matches!(
             err,
             Err(ResolveError::PackageConflict { .. })
         ));
+    }
+
+    #[test]
+    fn conflict_auto_resolved() {
+        let mut pool = ConcretePool::new(HashSet::new());
+        let mut a = make_pkg("a", "1.0-1", &[]);
+        a.conflicts = vec![Dependency::parse("b").unwrap()];
+        pool.add_sync(a, 0);
+        pool.add_local(make_pkg("b", "1.0-1", &[]));
+
+        let resolved = resolve(
+            &pool,
+            &["a".to_string()],
+            &ResolveOptions::default(),
+        ).unwrap();
+        assert!(resolved.to_remove.iter().any(|(name, reason)| {
+            name == "b" && matches!(reason, crate::transaction::RemovalReason::Conflict { .. })
+        }));
     }
 
     #[test]
@@ -472,7 +536,7 @@ mod tests {
             &ResolveOptions::default(),
         )
         .unwrap();
-        assert!(resolved.to_remove.contains(&"old-pkg".to_string()));
+        assert!(resolved.to_remove.iter().any(|(name, _)| name == "old-pkg"));
     }
 
     #[test]

@@ -23,11 +23,17 @@ pub struct UpgradeAction {
     pub installed_size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalReason {
+    Replaced,
+    Conflict { with: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct RemovalAction {
     pub name: String,
     pub version: Version,
-    pub reason: String,
+    pub reason: RemovalReason,
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +104,7 @@ pub fn build_transaction<P: PackagePool>(
     }
 
     let mut removals = Vec::new();
-    for name in &resolved.to_remove {
+    for (name, reason) in &resolved.to_remove {
         let version = pool
             .installed_version(name)
             .cloned()
@@ -106,7 +112,7 @@ pub fn build_transaction<P: PackagePool>(
         removals.push(RemovalAction {
             name: name.clone(),
             version,
-            reason: "replaced".to_string(),
+            reason: reason.clone(),
         });
     }
 

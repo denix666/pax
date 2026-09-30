@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use pax_core::package::{InstallReason, Validation};
-use pax_resolver::Transaction;
+use pax_resolver::{RemovalReason, Transaction};
 
 use crate::download::DownloadedPackage;
 use crate::error::{ExecError, Result};
@@ -10,7 +10,6 @@ use crate::extract::{extract_package, read_archive_file_list, read_install_scrip
 use crate::hooks::{load_hooks, run_hooks, HookWhen, TransactionPackages};
 use crate::register::{register_package, remove_db_entry};
 use crate::scriptlet::{run_scriptlet, ScriptletOp};
-
 pub struct InstallContext<'a> {
     pub root_dir: &'a Path,
     pub db_path: &'a Path,
@@ -41,7 +40,6 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
     let mut upgraded_files: Vec<String> = Vec::new();
     let mut removed_files: Vec<String> = Vec::new();
 
-    // Collect what will change for hook matching
     for install in &tx.installs {
         installed_pkgs.push(install.name.clone());
     }
@@ -68,7 +66,13 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
         .map(|d| (d.name.as_str(), d))
         .collect();
 
-    for upgrade in &tx.upgrades {
+    let mut upgrades_ordered: Vec<&_> = tx.upgrades.iter().collect();
+    upgrades_ordered.sort_by_key(|u| if is_keyring(&u.name) { 0usize } else { 1 });
+
+    let mut installs_ordered: Vec<&_> = tx.installs.iter().collect();
+    installs_ordered.sort_by_key(|i| if is_keyring(&i.name) { 0usize } else { 1 });
+
+    for upgrade in &upgrades_ordered {
         let Some(downloaded) = pkg_map.get(upgrade.name.as_str()) else {
             continue;
         };
@@ -117,7 +121,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
         }
     }
 
-    for install in &tx.installs {
+    for install in &installs_ordered {
         let Some(downloaded) = pkg_map.get(install.name.as_str()) else {
             continue;
         };
@@ -160,9 +164,46 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
     }
 
     for removal in &tx.removals {
-        let old_files = read_file_list(ctx.db_path, &removal.name, &removal.version.to_string());
+        if let RemovalReason::Conflict { with } = &removal.reason {
+            eprintln!(
+                "warning: removing {} (conflicts with {})",
+                removal.name, with
+            );
+        }
+
+        let version_str = removal.version.to_string();
+        let install_path = ctx.db_path
+            .join("local")
+            .join(format!("{}-{}", removal.name, version_str))
+            .join("install");
+
+        if let Ok(script) = std::fs::read_to_string(&install_path) {
+            run_scriptlet(
+                &script,
+                ScriptletOp::PreRemove,
+                &version_str,
+                None,
+                ctx.root_dir,
+                &removal.name,
+            )?;
+        }
+
+        let old_files = read_file_list(ctx.db_path, &removal.name, &version_str);
         remove_all_files(ctx.root_dir, &old_files);
-        remove_db_entry(ctx.db_path, &removal.name, &removal.version.to_string())?;
+        remove_db_entry(ctx.db_path, &removal.name, &version_str)?;
+        removed_files.extend(old_files.iter().cloned());
+
+        if let Ok(script) = std::fs::read_to_string(&install_path) {
+            run_scriptlet(
+                &script,
+                ScriptletOp::PostRemove,
+                &version_str,
+                None,
+                ctx.root_dir,
+                &removal.name,
+            )?;
+        }
+
         removed_files.extend(old_files);
     }
 
@@ -418,4 +459,8 @@ fn get_existing_reason(db_path: &Path, name: &str, version: &str) -> InstallReas
         }
     }
     InstallReason::Explicit
+}
+
+fn is_keyring(name: &str) -> bool {
+    name.ends_with("-keyring")
 }

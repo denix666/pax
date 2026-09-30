@@ -20,12 +20,13 @@ pub enum ResolveError {
         chain: Vec<String>,
     },
 
-    #[error("conflict: {pkg_a} and {pkg_b} conflict with each other\n  {pkg_a} required by: {}\n  {pkg_b} required by: {}", format_chain(chain_a), format_chain(chain_b))]
+    #[error("conflict: {pkg_a} and {pkg_b} conflict with each other\n  {pkg_a} required by: {}\n  {pkg_b} required by: {}\n  cannot remove {pkg_b} automatically: required by {blocked_by}", format_chain(chain_a), format_chain(chain_b))]
     PackageConflict {
         pkg_a: String,
         pkg_b: String,
         chain_a: Vec<String>,
         chain_b: Vec<String>,
+        blocked_by: String,
     },
 
     #[error(transparent)]
