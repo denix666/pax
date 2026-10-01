@@ -91,7 +91,7 @@ impl Default for PacmanConfig {
             root_dir: PathBuf::from("/"),
             db_path: PathBuf::from("/var/lib/pacman/"),
             cache_dirs: vec![PathBuf::from("/var/cache/pacman/pkg/")],
-            log_file: PathBuf::from("/var/log/pacman.log"),
+            log_file: PathBuf::from("/var/log/pax.log"),
             gpg_dir: PathBuf::from("/etc/pacman.d/gnupg/"),
             hook_dirs: vec![],
             hold_pkgs: vec![],

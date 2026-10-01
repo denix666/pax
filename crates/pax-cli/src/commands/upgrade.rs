@@ -181,7 +181,9 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
     let old_install_scripts = collect_old_install_scripts(&db.config.db_path, &tx);
     let old_backup_md5 = collect_old_backup_md5(&db.config.db_path, &tx);
 
-    let ctx = InstallContext {
+    let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
+
+    let mut ctx = InstallContext {
         root_dir: &db.config.root_dir,
         db_path: &db.config.db_path,
         downloaded: &downloaded,
@@ -189,9 +191,10 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
         old_backup_md5: &old_backup_md5,
         hook_dirs: &db.config.hook_dirs,
         check_space: db.config.check_space,
+        logger: &mut logger,
     };
 
-    execute_transaction(&tx, &ctx).map_err(|e| anyhow::anyhow!("{e}"))?;
+    execute_transaction(&tx, &mut ctx).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let total = tx.installs.len() + tx.upgrades.len();
     println!(

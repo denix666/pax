@@ -8,6 +8,7 @@ use crate::download::DownloadedPackage;
 use crate::error::{ExecError, Result};
 use crate::extract::{extract_package, read_archive_file_list, read_install_script};
 use crate::hooks::{load_hooks, run_hooks, HookWhen, TransactionPackages};
+use crate::log::PaxLogger;
 use crate::register::{register_package, remove_db_entry};
 use crate::scriptlet::{run_scriptlet, ScriptletOp};
 pub struct InstallContext<'a> {
@@ -18,9 +19,10 @@ pub struct InstallContext<'a> {
     pub old_backup_md5: &'a HashMap<String, HashMap<String, String>>,
     pub hook_dirs: &'a [PathBuf],
     pub check_space: bool,
+    pub logger: &'a mut PaxLogger,
 }
 
-pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()> {
+pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(ExecError::NotRoot);
     }
@@ -32,6 +34,8 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
     }
 
     let hooks = load_hooks(ctx.hook_dirs);
+
+    ctx.logger.log_transaction_start();
 
     let mut installed_pkgs = Vec::new();
     let mut upgraded_pkgs = Vec::new();
@@ -106,6 +110,12 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
         remove_db_entry(ctx.db_path, &upgrade.name, &upgrade.old_version.to_string())?;
         register_package(ctx.db_path, &metadata, reason, &validation, ctx.root_dir)?;
 
+        ctx.logger.log_upgraded(
+            &upgrade.name,
+            &upgrade.old_version.to_string(),
+            &upgrade.new_version.to_string(),
+        );
+
         upgraded_files.extend(metadata.files.iter().cloned());
         removed_files.extend(old_files);
 
@@ -149,6 +159,8 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
 
         register_package(ctx.db_path, &metadata, reason, &validation, ctx.root_dir)?;
 
+        ctx.logger.log_installed(&install.name, &install.version.to_string());
+
         installed_files.extend(metadata.files.iter().cloned());
 
         if let Some(ref script) = metadata.install {
@@ -177,9 +189,11 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
             .join(format!("{}-{}", removal.name, version_str))
             .join("install");
 
-        if let Ok(script) = std::fs::read_to_string(&install_path) {
+        let install_script = std::fs::read_to_string(&install_path).ok();
+
+        if let Some(ref script) = install_script {
             run_scriptlet(
-                &script,
+                script,
                 ScriptletOp::PreRemove,
                 &version_str,
                 None,
@@ -191,11 +205,12 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
         let old_files = read_file_list(ctx.db_path, &removal.name, &version_str);
         remove_all_files(ctx.root_dir, &old_files);
         remove_db_entry(ctx.db_path, &removal.name, &version_str)?;
-        removed_files.extend(old_files.iter().cloned());
 
-        if let Ok(script) = std::fs::read_to_string(&install_path) {
+        ctx.logger.log_removed(&removal.name, &version_str);
+
+        if let Some(ref script) = install_script {
             run_scriptlet(
-                &script,
+                script,
                 ScriptletOp::PostRemove,
                 &version_str,
                 None,
@@ -206,6 +221,8 @@ pub fn execute_transaction(tx: &Transaction, ctx: &InstallContext) -> Result<()>
 
         removed_files.extend(old_files);
     }
+
+    ctx.logger.log_transaction_completed();
 
     let post_tx = TransactionPackages {
         installed: installed_pkgs,
@@ -259,10 +276,12 @@ fn remove_stale_files(root_dir: &Path, old_files: &[String], new_files: &[String
     stale.reverse();
     for file in &stale {
         let path = root_dir.join(file);
-        if path.is_file() || path.is_symlink() {
-            let _ = std::fs::remove_file(&path);
-        } else if path.is_dir() {
-            let _ = std::fs::remove_dir(&path);
+        if let Ok(meta) = path.symlink_metadata() {
+            if meta.is_symlink() || meta.is_file() {
+                let _ = std::fs::remove_file(&path);
+            } else if meta.is_dir() {
+                let _ = std::fs::remove_dir(&path);
+            }
         }
     }
 }
@@ -273,10 +292,12 @@ fn remove_all_files(root_dir: &Path, files: &[String]) {
     sorted.reverse();
     for file in &sorted {
         let path = root_dir.join(file);
-        if path.is_file() || path.is_symlink() {
-            let _ = std::fs::remove_file(&path);
-        } else if path.is_dir() {
-            let _ = std::fs::remove_dir(&path);
+        if let Ok(meta) = path.symlink_metadata() {
+            if meta.is_symlink() || meta.is_file() {
+                let _ = std::fs::remove_file(&path);
+            } else if meta.is_dir() {
+                let _ = std::fs::remove_dir(&path);
+            }
         }
     }
 }

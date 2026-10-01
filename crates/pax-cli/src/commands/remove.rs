@@ -100,12 +100,17 @@ pub fn run(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut all_removed_files = Vec::new();
+    let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
+    logger.log_transaction_start();
 
     for target in &targets {
         let removed_files = remove_package(target, &db.config.root_dir, &db.config.db_path)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        logger.log_removed(&target.name, &target.version);
         all_removed_files.extend(removed_files);
     }
+
+    logger.log_transaction_completed();
 
     let post_tx = TransactionPackages {
         installed: vec![],

@@ -82,9 +82,6 @@ impl LocalDb {
             for dep in &pkg.info.depends {
                 required.insert(&dep.name);
             }
-            for optdep in &pkg.info.optdepends {
-                required.insert(&optdep.dep.name);
-            }
         }
 
         self.packages

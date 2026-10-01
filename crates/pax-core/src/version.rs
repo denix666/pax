@@ -100,8 +100,8 @@ fn vercmp_segment(a: &str, b: &str) -> Ordering {
     let mut ptr2;
 
     while one < a.len() && two < b.len() {
-        let prev_one = one;
-        let prev_two = two;
+        let _prev_one = one;
+        let _prev_two = two;
 
         while one < a.len() && !a[one].is_ascii_alphanumeric() {
             one += 1;
@@ -112,17 +112,6 @@ fn vercmp_segment(a: &str, b: &str) -> Ordering {
 
         if one >= a.len() || two >= b.len() {
             break;
-        }
-
-        // If separator lengths differ, the one with fewer separators is newer
-        let sep_len_a = one - prev_one;
-        let sep_len_b = two - prev_two;
-        if sep_len_a != sep_len_b {
-            return if sep_len_a < sep_len_b {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            };
         }
 
         ptr1 = one;
@@ -203,6 +192,9 @@ fn vercmp_segment(a: &str, b: &str) -> Ordering {
 }
 
 fn trim_leading_zeros(s: &[u8]) -> &[u8] {
+    if s.is_empty() {
+        return s;
+    }
     let mut i = 0;
     while i < s.len() - 1 && s[i] == b'0' {
         i += 1;

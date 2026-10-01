@@ -305,20 +305,8 @@ fn match_hook(hook: &Hook, tx_pkgs: &TransactionPackages) -> Vec<String> {
 }
 
 fn run_hook_action(action: &HookAction, targets: &[String], hook_name: &str) -> Result<()> {
-    let parts: Vec<&str> = action.exec.splitn(2, ' ').collect();
-    let (cmd, args_str) = if parts.len() > 1 {
-        (parts[0], Some(parts[1]))
-    } else {
-        (parts[0], None)
-    };
-
-    let mut command = if let Some(args) = args_str {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(format!("{} {}", cmd, args));
-        c
-    } else {
-        Command::new(cmd)
-    };
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(&action.exec);
 
     if action.needs_targets {
         command.stdin(Stdio::piped());

@@ -261,7 +261,7 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
         }
     }
 
-    fn is_safe_to_remove(&self, name: &str) -> Option<String> {
+    fn removal_blocker(&self, name: &str) -> Option<String> {
         if self.targets.contains(name) {
             return Some("explicit target".to_string());
         }
@@ -298,7 +298,7 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
                     .unwrap_or(false);
 
             if conflict_present && conflict.name != *pkg_name {
-                if let Some(blocked_by) = self.is_safe_to_remove(&conflict.name) {
+                if let Some(blocked_by) = self.removal_blocker(&conflict.name) {
                     let chain_a = self
                         .dep_chains
                         .get(pkg_name)

@@ -16,7 +16,9 @@ impl DbLock {
         loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(_) => {
-                    eprintln!(":: Lock acquired.");
+                    if notified {
+                        eprintln!(":: Lock acquired.");
+                    }
                     return Ok(Self { path, acquired: true });
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {

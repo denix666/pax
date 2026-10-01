@@ -25,7 +25,7 @@ pub fn extract_package(
         .to_string_lossy()
         .to_string();
 
-    // First pass: read .PKGINFO to get backup_entries before processing files
+    // First pass: read .PKGINFO to get backup entries before processing regular files
     let backup_entries: Vec<String> = {
         let file = std::fs::File::open(pkg_path)?;
         let decompressor = decompress(file, &pkg_name)?;
@@ -144,11 +144,21 @@ pub fn extract_package(
                         std::fs::create_dir_all(parent)?;
                     }
                 }
+                let mode = entry.header().mode().unwrap_or(0o644);
                 if should_pacnew {
                     let pacnew = PathBuf::from(format!("{}.pacnew", dest.display()));
                     std::fs::write(&pacnew, &buf)?;
+                    let _ = std::fs::set_permissions(
+                        &pacnew,
+                        std::os::unix::fs::PermissionsExt::from_mode(mode),
+                    );
+                    eprintln!("warning: {path_str}: installing as {path_str}.pacnew");
                 } else {
                     std::fs::write(&dest, &buf)?;
+                    let _ = std::fs::set_permissions(
+                        &dest,
+                        std::os::unix::fs::PermissionsExt::from_mode(mode),
+                    );
                 }
                 continue;
             }
