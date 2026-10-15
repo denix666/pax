@@ -64,6 +64,22 @@ impl PaxLogger {
     pub fn log_warning(&mut self, message: &str) {
         self.write_entry("PAX", &format!("warning: {message}"));
     }
+
+    pub fn log_scriptlet_output(&mut self, pkg_name: &str, output: &str) {
+        for line in output.lines() {
+            if !line.is_empty() {
+                self.write_entry("PAX-SCRIPTLET", &format!("[{pkg_name}] {line}"));
+            }
+        }
+    }
+
+    pub fn log_hook_output(&mut self, hook_name: &str, output: &str) {
+        for line in output.lines() {
+            if !line.is_empty() {
+                self.write_entry("PAX-SCRIPTLET", &format!("[{hook_name}] {line}"));
+            }
+        }
+    }
 }
 
 fn format_local_timestamp() -> String {

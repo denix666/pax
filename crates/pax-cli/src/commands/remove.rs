@@ -86,6 +86,7 @@ pub fn run(
     }
 
     let hooks = load_hooks(&db.config.hook_dirs);
+    let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
 
     let removed_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
     let pre_tx = TransactionPackages {
@@ -96,15 +97,14 @@ pub fn run(
         upgraded_files: vec![],
         removed_files: vec![],
     };
-    run_hooks(&hooks, &HookWhen::PreTransaction, &pre_tx)
+    run_hooks(&hooks, &HookWhen::PreTransaction, &pre_tx, &mut logger)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut all_removed_files = Vec::new();
-    let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
     logger.log_transaction_start();
 
     for target in &targets {
-        let removed_files = remove_package(target, &db.config.root_dir, &db.config.db_path)
+        let removed_files = remove_package(target, &db.config.root_dir, &db.config.db_path, &mut logger)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         logger.log_removed(&target.name, &target.version);
         all_removed_files.extend(removed_files);
@@ -120,7 +120,7 @@ pub fn run(
         upgraded_files: vec![],
         removed_files: all_removed_files,
     };
-    run_hooks(&hooks, &HookWhen::PostTransaction, &post_tx)
+    run_hooks(&hooks, &HookWhen::PostTransaction, &post_tx, &mut logger)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("{} package(s) removed.", targets.len());

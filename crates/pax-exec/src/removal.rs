@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::Result;
+use crate::log::PaxLogger;
 use crate::register::remove_db_entry;
 use crate::scriptlet::{run_scriptlet, ScriptletOp};
 
@@ -14,6 +15,7 @@ pub fn remove_package(
     target: &RemovalTarget,
     root_dir: &Path,
     db_path: &Path,
+    logger: &mut PaxLogger,
 ) -> Result<Vec<String>> {
     let pkg_dir = db_path
         .join("local")
@@ -28,6 +30,7 @@ pub fn remove_package(
             None,
             root_dir,
             &target.name,
+            logger,
         )?;
     }
 
@@ -41,6 +44,7 @@ pub fn remove_package(
             None,
             root_dir,
             &target.name,
+            logger,
         )?;
     }
 

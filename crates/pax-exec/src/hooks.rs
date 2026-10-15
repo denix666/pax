@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{ExecError, Result};
+use crate::log::PaxLogger;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerType {
@@ -238,6 +239,7 @@ pub fn run_hooks(
     hooks: &[Hook],
     when: &HookWhen,
     tx_pkgs: &TransactionPackages,
+    logger: &mut PaxLogger,
 ) -> Result<()> {
     for hook in hooks {
         if hook.action.when != *when {
@@ -253,7 +255,8 @@ pub fn run_hooks(
             eprintln!(":: {desc}");
         }
 
-        run_hook_action(&hook.action, &matched, &hook.name)?;
+        logger.log_hook(&hook.name);
+        run_hook_action(&hook.action, &matched, &hook.name, logger)?;
     }
 
     Ok(())
@@ -304,7 +307,7 @@ fn match_hook(hook: &Hook, tx_pkgs: &TransactionPackages) -> Vec<String> {
     matched
 }
 
-fn run_hook_action(action: &HookAction, targets: &[String], hook_name: &str) -> Result<()> {
+fn run_hook_action(action: &HookAction, targets: &[String], hook_name: &str, logger: &mut PaxLogger) -> Result<()> {
     let mut command = Command::new("sh");
     command.arg("-c").arg(&action.exec);
 
@@ -314,7 +317,7 @@ fn run_hook_action(action: &HookAction, targets: &[String], hook_name: &str) -> 
         command.stdin(Stdio::null());
     }
 
-    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = command.spawn().map_err(|e| ExecError::Hook {
         name: hook_name.to_string(),
@@ -334,17 +337,31 @@ fn run_hook_action(action: &HookAction, targets: &[String], hook_name: &str) -> 
         drop(child.stdin.take());
     }
 
-    let status = child.wait().map_err(|e| ExecError::Hook {
+    let output = child.wait_with_output().map_err(|e| ExecError::Hook {
         name: hook_name.to_string(),
         message: e.to_string(),
     })?;
 
-    if !status.success() {
-        eprintln!(
-            "warning: hook failed: {}: exit code {}",
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+    if !stdout_str.is_empty() {
+        eprint!("{stdout_str}");
+        logger.log_hook_output(hook_name, &stdout_str);
+    }
+    if !stderr_str.is_empty() {
+        eprint!("{stderr_str}");
+        logger.log_hook_output(hook_name, &stderr_str);
+    }
+
+    if !output.status.success() {
+        let msg = format!(
+            "hook failed: {}: exit code {}",
             hook_name,
-            status.code().unwrap_or(-1)
+            output.status.code().unwrap_or(-1)
         );
+        eprintln!("warning: {msg}");
+        logger.log_warning(&msg);
     }
 
     Ok(())

@@ -7,6 +7,9 @@ use pax_exec::SyncTarget;
 pub fn run(db: &mut DatabaseHandle) -> Result<()> {
     super::ensure_root();
 
+    let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
+    logger.log_sync();
+
     let sync_dir = db.config.db_path.join("sync");
 
     let targets: Vec<SyncTarget> = db

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::error::Result;
+use crate::log::PaxLogger;
 
 pub enum ScriptletOp {
     PreInstall,
@@ -32,6 +33,7 @@ pub fn run_scriptlet(
     old_version: Option<&str>,
     root_dir: &Path,
     pkg_name: &str,
+    logger: &mut PaxLogger,
 ) -> Result<()> {
     let func = op.function_name();
 
@@ -51,29 +53,47 @@ pub fn run_scriptlet(
         .arg(&script)
         .current_dir(root_dir)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
                 stdin.write_all(install_script.as_bytes())?;
             }
-            child.wait()
+            drop(child.stdin.take());
+            child.wait_with_output()
         });
 
     match output {
-        Ok(status) if !status.success() => {
-            eprintln!(
-                "warning: scriptlet failed for {}: exit code {}",
-                pkg_name,
-                status.code().unwrap_or(-1)
-            );
+        Ok(ref out) => {
+            let stdout_str = String::from_utf8_lossy(&out.stdout);
+            let stderr_str = String::from_utf8_lossy(&out.stderr);
+
+            if !stdout_str.is_empty() {
+                eprint!("{stdout_str}");
+                logger.log_scriptlet_output(pkg_name, &stdout_str);
+            }
+            if !stderr_str.is_empty() {
+                eprint!("{stderr_str}");
+                logger.log_scriptlet_output(pkg_name, &stderr_str);
+            }
+
+            if !out.status.success() {
+                let msg = format!(
+                    "scriptlet failed for {}: exit code {}",
+                    pkg_name,
+                    out.status.code().unwrap_or(-1)
+                );
+                eprintln!("warning: {msg}");
+                logger.log_warning(&msg);
+            }
         }
         Err(e) => {
-            eprintln!("warning: scriptlet failed for {}: {e}", pkg_name);
+            let msg = format!("scriptlet failed for {}: {e}", pkg_name);
+            eprintln!("warning: {msg}");
+            logger.log_warning(&msg);
         }
-        Ok(_) => {}
     }
 
     Ok(())

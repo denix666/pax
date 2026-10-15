@@ -46,6 +46,12 @@ fn main() -> Result<()> {
 
     let mut db = DatabaseHandle::new(config);
 
+    {
+        let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        logger.log_command(&args);
+    }
+
     match command {
         Command::Search { query } => commands::search::run(&mut db, query),
         Command::Info { package, local } => commands::info::run(&mut db, package, *local),

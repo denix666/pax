@@ -62,7 +62,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
         upgraded_files: vec![],
         removed_files: vec![],
     };
-    run_hooks(&hooks, &HookWhen::PreTransaction, &pre_tx)?;
+    run_hooks(&hooks, &HookWhen::PreTransaction, &pre_tx, ctx.logger)?;
 
     let pkg_map: HashMap<&str, &DownloadedPackage> = ctx
         .downloaded
@@ -89,6 +89,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
                 Some(&upgrade.old_version.to_string()),
                 ctx.root_dir,
                 &upgrade.name,
+                ctx.logger,
             )?;
         }
 
@@ -101,6 +102,10 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
             .unwrap_or_default();
 
         let metadata = extract_package(&downloaded.path, ctx.root_dir, &backup_md5)?;
+
+        for w in &metadata.warnings {
+            ctx.logger.log_warning(w);
+        }
 
         remove_stale_files(ctx.root_dir, &old_files, &metadata.files);
 
@@ -127,6 +132,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
                 Some(&upgrade.old_version.to_string()),
                 ctx.root_dir,
                 &upgrade.name,
+                ctx.logger,
             )?;
         }
     }
@@ -145,10 +151,15 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
                 None,
                 ctx.root_dir,
                 &install.name,
+                ctx.logger,
             )?;
         }
 
         let metadata = extract_package(&downloaded.path, ctx.root_dir, &HashMap::new())?;
+
+        for w in &metadata.warnings {
+            ctx.logger.log_warning(w);
+        }
 
         let reason = if install.explicit {
             InstallReason::Explicit
@@ -171,6 +182,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
                 None,
                 ctx.root_dir,
                 &install.name,
+                ctx.logger,
             )?;
         }
     }
@@ -199,6 +211,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
                 None,
                 ctx.root_dir,
                 &removal.name,
+                ctx.logger,
             )?;
         }
 
@@ -216,6 +229,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
                 None,
                 ctx.root_dir,
                 &removal.name,
+                ctx.logger,
             )?;
         }
 
@@ -232,7 +246,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
         upgraded_files,
         removed_files,
     };
-    run_hooks(&hooks, &HookWhen::PostTransaction, &post_tx)?;
+    run_hooks(&hooks, &HookWhen::PostTransaction, &post_tx, ctx.logger)?;
 
     Ok(())
 }

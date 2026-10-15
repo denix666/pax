@@ -12,6 +12,7 @@ pub struct PackageMetadata {
     pub install: Option<String>,
     pub files: Vec<String>,
     pub backup: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 pub fn extract_package(
@@ -68,6 +69,7 @@ pub fn extract_package(
     let mut mtree = Vec::new();
     let mut install = None;
     let mut files: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     for entry_result in archive.entries().map_err(|e| ExecError::Extraction {
         pkg: pkg_name.clone(),
@@ -153,6 +155,7 @@ pub fn extract_package(
                         std::os::unix::fs::PermissionsExt::from_mode(mode),
                     );
                     eprintln!("warning: {path_str}: installing as {path_str}.pacnew");
+                    warnings.push(format!("{path_str} installed as {path_str}.pacnew"));
                 } else {
                     std::fs::write(&dest, &buf)?;
                     let _ = std::fs::set_permissions(
@@ -220,6 +223,7 @@ pub fn extract_package(
         install,
         files,
         backup: backup_entries,
+        warnings,
     })
 }
 
