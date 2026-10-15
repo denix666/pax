@@ -54,7 +54,7 @@ pub(crate) fn install_repo_deps(db: &mut DatabaseHandle, packages: &[String]) ->
         let pax_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pax"));
         let status = std::process::Command::new(&tool)
             .arg(&pax_bin)
-            .args(["install", "--noconfirm"])
+            .args(["install", "--noconfirm", "--asdeps"])
             .args(packages)
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -255,7 +255,8 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
         .map(|(k, v)| (k.clone(), (v.compressed_size, v.installed_size, v.repository.clone())))
         .collect();
 
-    let tx = build_transaction(&pool, &resolved, packages, &|name| {
+    let empty_targets: &[String] = &[];
+    let tx = build_transaction(&pool, &resolved, empty_targets, &|name| {
         sync_sizes.get(name).map(|(c, i, _)| (*c, *i)).unwrap_or((0, 0))
     }, false);
 

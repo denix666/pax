@@ -78,7 +78,8 @@ fn main() -> Result<()> {
             noconfirm,
             needed,
             reinstall,
-        } => commands::install::run(&mut db, packages, *dry_run, *download_only, *noconfirm, *needed, *reinstall),
+            asdeps,
+        } => commands::install::run(&mut db, packages, *dry_run, *download_only, *noconfirm, *needed, *reinstall, *asdeps),
         Command::AurInstall {
             packages,
             skip_review,

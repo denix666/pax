@@ -10,7 +10,7 @@ use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, R
 use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, SyncInfo};
 use crate::output::print_transaction;
 
-pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, needed: bool, reinstall: bool) -> Result<()> {
+pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, needed: bool, reinstall: bool, asdeps: bool) -> Result<()> {
     if !dry_run {
         super::ensure_root();
     }
@@ -53,13 +53,13 @@ pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download
             println!("there is nothing to do");
             return Ok(());
         }
-        return run_inner(db, &filtered, dry_run, download_only, noconfirm, reinstall);
+        return run_inner(db, &filtered, dry_run, download_only, noconfirm, reinstall, asdeps);
     }
 
-    run_inner(db, packages, dry_run, download_only, noconfirm, reinstall)
+    run_inner(db, packages, dry_run, download_only, noconfirm, reinstall, asdeps)
 }
 
-fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, reinstall: bool) -> Result<()> {
+fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, reinstall: bool, asdeps: bool) -> Result<()> {
 
     let mut ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
     let ignore_groups: HashSet<String> = db.config.ignore_groups.iter().cloned().collect();
@@ -134,7 +134,8 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         .map(|(k, v)| (k.clone(), (v.compressed_size, v.installed_size, v.repository.clone())))
         .collect();
 
-    let tx = build_transaction(&pool, &resolved, packages, &|name| {
+    let explicit_targets: &[String] = if asdeps { &[] } else { packages };
+    let tx = build_transaction(&pool, &resolved, explicit_targets, &|name| {
         sync_sizes
             .get(name)
             .map(|(c, i, _)| (*c, *i))

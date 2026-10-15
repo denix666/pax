@@ -114,6 +114,10 @@ pub enum Command {
         /// Reinstall already installed packages
         #[arg(long)]
         reinstall: bool,
+
+        /// Install packages as dependencies (non-explicit)
+        #[arg(long)]
+        asdeps: bool,
     },
 
     /// Remove packages
