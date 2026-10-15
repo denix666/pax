@@ -221,4 +221,7 @@ pub enum Command {
         #[arg(long)]
         noconfirm: bool,
     },
+
+    /// Remove a stale database lock file
+    RemoveLock,
 }

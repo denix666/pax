@@ -17,9 +17,6 @@ pub fn run(
 ) -> Result<()> {
     super::ensure_root();
 
-    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
-        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
-
     if packages.is_empty() {
         anyhow::bail!("no targets specified");
     }
@@ -84,6 +81,9 @@ pub fn run(
         println!("Removal cancelled.");
         return Ok(());
     }
+
+    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
+        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
 
     let hooks = load_hooks(&db.config.hook_dirs);
     let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);

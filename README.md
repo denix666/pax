@@ -64,6 +64,7 @@ Most commands that modify the system (install, remove, upgrade, sync) will autom
 | `aur-install` | — | Install packages from AUR |
 | `aur-upgrade` | — | Upgrade installed AUR packages |
 | `aur-search` | — | Search AUR for packages |
+| `remove-lock` | — | Remove a stale database lock file |
 
 ### Examples
 
@@ -145,6 +146,9 @@ pax check-files
 
 # Check files for specific packages
 pax check-files bash glibc
+
+# Remove a stale lock file (if pax or pacman was interrupted)
+pax remove-lock
 ```
 
 ### Global Options
@@ -165,6 +169,7 @@ pax check-files bash glibc
 | `--noconfirm` | Skip confirmation prompt |
 | `--needed` | Skip already installed up-to-date packages (install only) |
 | `--reinstall` | Reinstall already installed packages (install only) |
+| `--asdeps` | Install packages as dependencies (install only) |
 
 ### Remove Flags
 
@@ -205,6 +210,21 @@ pax reads and respects the following pacman.conf directives:
 | `SigLevel` | PGP signature verification level (global and per-repo) |
 | `ParallelDownloads` | Number of concurrent downloads |
 | `CacheDir` | Package cache directory |
+
+## Logging
+
+pax logs all operations to `/var/log/pax.log` with timestamps:
+
+```
+[2026-10-01T12:00:00+0300] [PAX] Running 'pax upgrade'
+[2026-10-01T12:00:01+0300] [PAX] transaction started
+[2026-10-01T12:00:02+0300] [PAX] upgraded linux618 (6.18.18-1 -> 6.18.49-1)
+[2026-10-01T12:01:00+0300] [PAX] transaction completed
+[2026-10-01T12:01:00+0300] [PAX] running '60-depmod.hook'...
+[2026-10-01T12:01:01+0300] [PAX-SCRIPTLET] [systemd] Creating group 'systemd-imds'...
+```
+
+The log file location can be changed via `LogFile` in pacman.conf (default: `/var/log/pax.log`).
 
 ## Shell Completions
 

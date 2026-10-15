@@ -15,15 +15,6 @@ pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download
         super::ensure_root();
     }
 
-    let _lock = if !dry_run {
-        Some(
-            pax_alpm::DbLock::acquire(&db.config.db_path)
-                .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?,
-        )
-    } else {
-        None
-    };
-
     if packages.is_empty() {
         anyhow::bail!("no targets specified");
     }
@@ -161,6 +152,9 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         println!("Installation cancelled.");
         return Ok(());
     }
+
+    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
+        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
 
     let repo_servers: HashMap<String, Vec<String>> = db
         .config

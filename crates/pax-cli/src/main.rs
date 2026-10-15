@@ -103,5 +103,23 @@ fn main() -> Result<()> {
         Command::Upgrade { dry_run, download_only, noconfirm } => {
             commands::upgrade::run(&mut db, *dry_run, *download_only, *noconfirm)
         }
+        Command::RemoveLock => {
+            commands::ensure_root();
+            let lock_path = db.config.db_path.join("db.lck");
+            if !lock_path.exists() {
+                println!("No lock file found.");
+                return Ok(());
+            }
+            eprintln!("warning: removing {}", lock_path.display());
+            eprintln!("  This is dangerous if another package manager is currently running.");
+            eprintln!("  Only proceed if you are sure no other instance is active.");
+            if commands::confirm_default_no("  Remove lock file? [y/N]")? {
+                std::fs::remove_file(&lock_path)?;
+                println!("Lock file removed.");
+            } else {
+                println!("Cancelled.");
+            }
+            Ok(())
+        }
     }
 }
