@@ -4,13 +4,24 @@ use anyhow::Result;
 use indicatif::MultiProgress;
 use pax_alpm::db::DatabaseHandle;
 use pax_core::config::SigLevel;
-use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
-use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveError, ResolveOptions};
+use pax_exec::{DownloadTarget, InstallContext, execute_transaction};
+use pax_resolver::{
+    ConcretePool, ResolveError, ResolveOptions, build_transaction, resolve, topological_sort,
+};
 
-use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, SyncInfo};
+use super::{SyncInfo, collect_old_backup_md5, collect_old_install_scripts, confirm};
 use crate::output::print_transaction;
 
-pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, needed: bool, reinstall: bool, asdeps: bool) -> Result<()> {
+pub fn run(
+    db: &mut DatabaseHandle,
+    packages: &[String],
+    dry_run: bool,
+    download_only: bool,
+    noconfirm: bool,
+    needed: bool,
+    reinstall: bool,
+    asdeps: bool,
+) -> Result<()> {
     if !dry_run {
         super::ensure_root();
     }
@@ -19,6 +30,15 @@ pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download
         anyhow::bail!("no targets specified");
     }
 
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(
+            pax_alpm::DbLock::acquire(&db.config.db_path)
+                .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?,
+        )
+    };
+    db.invalidate();
     db.ensure_both()?;
 
     if needed {
@@ -44,14 +64,37 @@ pub fn run(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download
             println!("there is nothing to do");
             return Ok(());
         }
-        return run_inner(db, &filtered, dry_run, download_only, noconfirm, reinstall, asdeps);
+        return run_inner(
+            db,
+            &filtered,
+            dry_run,
+            download_only,
+            noconfirm,
+            reinstall,
+            asdeps,
+        );
     }
 
-    run_inner(db, packages, dry_run, download_only, noconfirm, reinstall, asdeps)
+    run_inner(
+        db,
+        packages,
+        dry_run,
+        download_only,
+        noconfirm,
+        reinstall,
+        asdeps,
+    )
 }
 
-fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, download_only: bool, noconfirm: bool, reinstall: bool, asdeps: bool) -> Result<()> {
-
+fn run_inner(
+    db: &mut DatabaseHandle,
+    packages: &[String],
+    dry_run: bool,
+    download_only: bool,
+    noconfirm: bool,
+    reinstall: bool,
+    asdeps: bool,
+) -> Result<()> {
     let mut ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
     let ignore_groups: HashSet<String> = db.config.ignore_groups.iter().cloned().collect();
     let capacity = db.sync()?.package_count() + db.local()?.len();
@@ -103,40 +146,56 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         pool.add_sync(pkg.info.clone(), *idx);
     }
 
-    let options = ResolveOptions::default();
-    let mut resolved = resolve(&pool, packages, &options)
-        .map_err(|e| {
-            if let ResolveError::TargetNotFound { ref name } = e {
-                if let Ok(results) = pax_aur::rpc::info(&[name.as_str()]) {
-                    if !results.is_empty() {
-                        return anyhow::anyhow!(
-                            "{e}\n  hint: found in AUR — install with: pax aur-install {name}"
-                        );
-                    }
+    let options = ResolveOptions {
+        reinstall,
+        ..ResolveOptions::default()
+    };
+    let mut resolved = resolve(&pool, packages, &options).map_err(|e| {
+        if let ResolveError::TargetNotFound { ref name } = e {
+            if let Ok(results) = pax_aur::rpc::info(&[name.as_str()]) {
+                if !results.is_empty() {
+                    return anyhow::anyhow!(
+                        "{e}\n  hint: found in AUR — install with: pax aur-install {name}"
+                    );
                 }
             }
-            anyhow::anyhow!("{e}")
-        })?;
+        }
+        anyhow::anyhow!("{e}")
+    })?;
 
     topological_sort(&pool, &mut resolved);
 
     let sync_sizes: HashMap<String, (u64, u64, String)> = sync_map
         .iter()
-        .map(|(k, v)| (k.clone(), (v.compressed_size, v.installed_size, v.repository.clone())))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                (v.compressed_size, v.installed_size, v.repository.clone()),
+            )
+        })
         .collect();
 
     let explicit_targets: &[String] = if asdeps { &[] } else { packages };
-    let tx = build_transaction(&pool, &resolved, explicit_targets, &|name| {
-        sync_sizes
-            .get(name)
-            .map(|(c, i, _)| (*c, *i))
-            .unwrap_or((0, 0))
-    }, reinstall);
+    let tx = build_transaction(
+        &pool,
+        &resolved,
+        explicit_targets,
+        &|name| {
+            sync_sizes
+                .get(name)
+                .map(|(c, i, _)| (*c, *i))
+                .unwrap_or((0, 0))
+        },
+        reinstall,
+    );
 
     if tx.is_empty() {
         for name in packages {
             if let Ok(Some(pkg)) = db.local_info(name) {
-                eprintln!("{name} {} is already installed (use --reinstall to reinstall)", pkg.info.version);
+                eprintln!(
+                    "{name} {} is already installed (use --reinstall to reinstall)",
+                    pkg.info.version
+                );
             }
         }
         return Ok(());
@@ -152,9 +211,6 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         println!("Installation cancelled.");
         return Ok(());
     }
-
-    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
-        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
 
     let repo_servers: HashMap<String, Vec<String>> = db
         .config
@@ -177,7 +233,10 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
             continue;
         };
 
-        let servers = repo_servers.get(&info.repository).cloned().unwrap_or_default();
+        let servers = repo_servers
+            .get(&info.repository)
+            .cloned()
+            .unwrap_or_default();
 
         targets.push(DownloadTarget {
             name: name.clone(),
@@ -186,6 +245,14 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
             compressed_size: info.compressed_size,
             mirrors: servers,
             sig_level: info.sig_level,
+            sig_trust: db
+                .config
+                .repos
+                .iter()
+                .find(|repo| repo.name == info.repository)
+                .and_then(|repo| repo.sig_level)
+                .unwrap_or(db.config.sig_level)
+                .package_trust,
         });
     }
 
@@ -229,7 +296,9 @@ fn run_inner(db: &mut DatabaseHandle, packages: &[String], dry_run: bool, downlo
         logger: &mut logger,
     };
 
-    execute_transaction(&tx, &mut ctx).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = execute_transaction(&tx, &mut ctx);
+    db.invalidate();
+    result.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let total = tx.installs.len() + tx.upgrades.len();
     println!("{total} package(s) installed successfully.");

@@ -1,42 +1,76 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
+use clap::Parser;
 use indicatif::MultiProgress;
 use owo_colors::OwoColorize;
 use pax_alpm::db::DatabaseHandle;
 use pax_aur::{clone_and_build, resolve_aur_targets};
 use pax_core::config::SigLevel;
-use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
-use pax_resolver::{build_transaction, resolve, topological_sort, ConcretePool, ResolveOptions};
+use pax_exec::{DownloadTarget, InstallContext, execute_transaction};
+use pax_resolver::{ConcretePool, ResolveOptions, build_transaction, resolve, topological_sort};
 
-use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, dirs_build_base, SyncInfo};
+use super::{
+    SyncInfo, collect_old_backup_md5, collect_old_install_scripts, confirm, dirs_build_base,
+};
 use crate::output::print_transaction;
 
 fn is_root() -> bool {
     (unsafe { libc::geteuid() }) == 0
 }
 
+fn privileged_pax_command(db: &DatabaseHandle) -> Result<std::process::Command> {
+    let tool = escalate_tool()?;
+    let pax_bin = std::env::current_exe()?;
+    let cli = crate::cli::Cli::try_parse_from(std::env::args_os())?;
+    install_command(&tool, &pax_bin, &cli.config, &db.config)
+}
+
+fn install_command(
+    tool: &str,
+    pax_bin: &Path,
+    config_path: &Path,
+    config: &pax_core::config::PacmanConfig,
+) -> Result<std::process::Command> {
+    let cwd = std::env::current_dir()?;
+    let mut command = std::process::Command::new(tool);
+    // Pass effective target paths even when they came from pacman.conf.
+    command
+        .arg(pax_bin)
+        .arg("--config")
+        .arg(cwd.join(config_path))
+        .arg("--root")
+        .arg(cwd.join(&config.root_dir))
+        .arg("--dbpath")
+        .arg(cwd.join(&config.db_path));
+    Ok(command)
+}
+
 fn escalate_tool() -> Result<String> {
     super::privilege_escalation_tool().ok_or_else(|| {
-        anyhow::anyhow!("no privilege escalation tool found (install sudo or doas, or set PAX_SUDO)")
+        anyhow::anyhow!(
+            "no privilege escalation tool found (install sudo or doas, or set PAX_SUDO)"
+        )
     })
 }
 
-pub(crate) fn install_as_root(db: &mut DatabaseHandle, pkg_path: &Path, pkg_name: &str) -> Result<()> {
+pub(crate) fn install_as_root(
+    db: &mut DatabaseHandle,
+    pkg_path: &Path,
+    pkg_name: &str,
+) -> Result<()> {
     if is_root() {
         super::localinstall::install_pkg_files(db, &[pkg_path.to_path_buf()])?;
     } else {
-        let tool = escalate_tool()?;
-        let pax_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pax"));
-        let status = std::process::Command::new(&tool)
-            .arg(&pax_bin)
-            .args(["local-install", "--noconfirm"])
-            .arg(pkg_path)
+        let status = privileged_pax_command(db)?
+            .args(["local-install", "--noconfirm", "--"])
+            .arg(pkg_path.canonicalize()?)
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()?;
 
+        db.invalidate();
         if !status.success() {
             return Err(anyhow::anyhow!(
                 "failed to install {pkg_name}: exited with {status}"
@@ -50,16 +84,14 @@ pub(crate) fn install_repo_deps(db: &mut DatabaseHandle, packages: &[String]) ->
     if is_root() {
         install_repo_packages(db, packages)
     } else {
-        let tool = escalate_tool()?;
-        let pax_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pax"));
-        let status = std::process::Command::new(&tool)
-            .arg(&pax_bin)
-            .args(["install", "--noconfirm", "--asdeps"])
+        let status = privileged_pax_command(db)?
+            .args(["install", "--noconfirm", "--asdeps", "--"])
             .args(packages)
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()?;
 
+        db.invalidate();
         if !status.success() {
             return Err(anyhow::anyhow!(
                 "failed to install repo dependencies: exited with {status}"
@@ -120,9 +152,8 @@ pub fn run(
     let pkg_refs: Vec<&str> = to_install.iter().map(|s| s.as_str()).collect();
 
     println!(":: Resolving AUR dependencies...");
-    let aur_targets =
-        resolve_aur_targets(&pkg_refs, &installed, &sync_available)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let aur_targets = resolve_aur_targets(&pkg_refs, &installed, &sync_available)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if aur_targets.is_empty() {
         println!("there is nothing to do");
@@ -177,8 +208,14 @@ pub fn run(
             target.package.version.green()
         );
 
-        let result = clone_and_build(&target.package, &build_base, skip_review, allow_root, noconfirm)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let result = clone_and_build(
+            &target.package,
+            &build_base,
+            skip_review,
+            allow_root,
+            noconfirm,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         println!(":: Installing {}...", target.package.name.bold());
 
@@ -194,6 +231,11 @@ pub fn run(
 }
 
 fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result<()> {
+    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
+        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
+    db.invalidate();
+    db.ensure_both()?;
+
     let mut ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
     let ignore_groups: HashSet<String> = db.config.ignore_groups.iter().cloned().collect();
 
@@ -245,20 +287,33 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
     }
 
     let options = ResolveOptions::default();
-    let mut resolved = resolve(&pool, packages, &options)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut resolved = resolve(&pool, packages, &options).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     topological_sort(&pool, &mut resolved);
 
     let sync_sizes: HashMap<String, (u64, u64, String)> = sync_map
         .iter()
-        .map(|(k, v)| (k.clone(), (v.compressed_size, v.installed_size, v.repository.clone())))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                (v.compressed_size, v.installed_size, v.repository.clone()),
+            )
+        })
         .collect();
 
     let empty_targets: &[String] = &[];
-    let tx = build_transaction(&pool, &resolved, empty_targets, &|name| {
-        sync_sizes.get(name).map(|(c, i, _)| (*c, *i)).unwrap_or((0, 0))
-    }, false);
+    let tx = build_transaction(
+        &pool,
+        &resolved,
+        empty_targets,
+        &|name| {
+            sync_sizes
+                .get(name)
+                .map(|(c, i, _)| (*c, *i))
+                .unwrap_or((0, 0))
+        },
+        false,
+    );
 
     if tx.is_empty() {
         return Ok(());
@@ -282,8 +337,13 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
         .collect();
 
     for name in &pkg_names {
-        let Some(info) = sync_map.get(name) else { continue };
-        let servers = repo_servers.get(&info.repository).cloned().unwrap_or_default();
+        let Some(info) = sync_map.get(name) else {
+            continue;
+        };
+        let servers = repo_servers
+            .get(&info.repository)
+            .cloned()
+            .unwrap_or_default();
         targets.push(DownloadTarget {
             name: name.clone(),
             filename: info.filename.clone(),
@@ -291,6 +351,14 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
             compressed_size: info.compressed_size,
             mirrors: servers,
             sig_level: info.sig_level,
+            sig_trust: db
+                .config
+                .repos
+                .iter()
+                .find(|repo| repo.name == info.repository)
+                .and_then(|repo| repo.sig_level)
+                .unwrap_or(db.config.sig_level)
+                .package_trust,
         });
     }
 
@@ -298,8 +366,14 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
     std::fs::create_dir_all(cache_dir)?;
 
     let multi = MultiProgress::new();
-    let downloaded = pax_exec::download_packages(&targets, cache_dir, db.config.parallel_downloads, &multi, &db.config.gpg_dir)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let downloaded = pax_exec::download_packages(
+        &targets,
+        cache_dir,
+        db.config.parallel_downloads,
+        &multi,
+        &db.config.gpg_dir,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let old_install_scripts = collect_old_install_scripts(&db.config.db_path, &tx);
     let old_backup_md5 = collect_old_backup_md5(&db.config.db_path, &tx);
@@ -317,9 +391,76 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
         logger: &mut logger,
     };
 
-    execute_transaction(&tx, &mut ctx).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = execute_transaction(&tx, &mut ctx);
+    db.invalidate();
+    result.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn privileged_installs_preserve_config_and_effective_target() {
+        for config_arg in [
+            vec!["--config", "config with spaces.conf"],
+            vec!["--config=config with spaces.conf"],
+        ] {
+            let mut args = vec!["pax"];
+            args.extend(config_arg);
+            args.extend([
+                "--root",
+                "/target",
+                "--dbpath",
+                "/target/db",
+                "aur-install",
+                "foo",
+            ]);
+            let cli = crate::cli::Cli::try_parse_from(args).unwrap();
+            let mut config = pax_core::config::PacmanConfig::default();
+            config.root_dir = cli.root.unwrap();
+            config.db_path = cli.dbpath.unwrap();
+            for action in ["install", "local-install"] {
+                let mut command =
+                    install_command("sudo", Path::new("/bin/pax"), &cli.config, &config).unwrap();
+                command.arg(action);
+                let expected: Vec<OsString> = vec![
+                    OsString::from("/bin/pax"),
+                    OsString::from("--config"),
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("config with spaces.conf")
+                        .into_os_string(),
+                    OsString::from("--root"),
+                    OsString::from("/target"),
+                    OsString::from("--dbpath"),
+                    OsString::from("/target/db"),
+                    OsString::from(action),
+                ];
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    expected.iter().map(|s| s.as_os_str()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn privileged_installs_forward_config_derived_paths_and_default_config() {
+        let cli = crate::cli::Cli::try_parse_from(["pax", "aur-upgrade"]).unwrap();
+        let mut config = pax_core::config::PacmanConfig::default();
+        config.root_dir = "relative target".into();
+        config.db_path = "relative db".into();
+        let command = install_command("doas", Path::new("/bin/pax"), &cli.config, &config).unwrap();
+        let args = command.get_args().collect::<Vec<_>>();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(args[2], Path::new("/etc/pacman.conf").as_os_str());
+        assert_eq!(args[4], cwd.join("relative target").as_os_str());
+        assert_eq!(args[6], cwd.join("relative db").as_os_str());
+    }
 }
 
 pub(crate) fn check_root(allow_root: bool) {
@@ -337,4 +478,3 @@ pub(crate) fn check_root(allow_root: bool) {
         }
     }
 }
-

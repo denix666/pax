@@ -20,6 +20,12 @@ impl DatabaseHandle {
         }
     }
 
+    /// Discard snapshots before planning under the database lock or after mutation.
+    pub fn invalidate(&mut self) {
+        self.local = None;
+        self.sync = None;
+    }
+
     pub fn local(&mut self) -> Result<&LocalDb> {
         if self.local.is_none() {
             self.local = Some(LocalDb::open(&self.config.db_path)?);
@@ -103,5 +109,36 @@ impl DatabaseHandle {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn invalidation_reloads_installed_state() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "pax-db-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(directory.join("local")).unwrap();
+        let mut config = PacmanConfig::default();
+        config.db_path = directory.clone();
+        let mut db = DatabaseHandle::new(config);
+        assert!(db.installed_packages().unwrap().is_empty());
+        let package = directory.join("local/app-1-1");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("desc"), "%NAME%\napp\n\n%VERSION%\n1-1\n").unwrap();
+        assert!(db.installed_packages().unwrap().is_empty());
+        db.invalidate();
+        assert_eq!(db.installed_packages().unwrap()[0].info.name, "app");
+        std::fs::remove_dir_all(&package).unwrap();
+        db.invalidate();
+        assert!(db.installed_packages().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

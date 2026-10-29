@@ -5,19 +5,33 @@ use indicatif::MultiProgress;
 use owo_colors::OwoColorize;
 use pax_alpm::db::DatabaseHandle;
 use pax_core::config::SigLevel;
-use pax_exec::{execute_transaction, DownloadTarget, InstallContext};
+use pax_exec::{DownloadTarget, InstallContext, execute_transaction};
 use pax_resolver::{
-    build_transaction, compute_upgrades, resolve, topological_sort, ConcretePool, ResolveOptions,
+    ConcretePool, ResolveOptions, build_transaction, compute_upgrades, resolve, topological_sort,
 };
 
-use super::{collect_old_backup_md5, collect_old_install_scripts, confirm, SyncInfo};
+use super::{SyncInfo, collect_old_backup_md5, collect_old_install_scripts, confirm};
 use crate::output::print_transaction;
 
-pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfirm: bool) -> Result<()> {
+pub fn run(
+    db: &mut DatabaseHandle,
+    dry_run: bool,
+    download_only: bool,
+    noconfirm: bool,
+) -> Result<()> {
     if !dry_run {
         super::ensure_root();
     }
 
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(
+            pax_alpm::DbLock::acquire(&db.config.db_path)
+                .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?,
+        )
+    };
+    db.invalidate();
     db.ensure_both()?;
 
     let mut ignored: HashSet<String> = db.config.ignore_pkgs.iter().cloned().collect();
@@ -81,22 +95,33 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
     let upgrade_names: Vec<String> = upgrades.iter().map(|u| u.name.clone()).collect();
 
     let options = ResolveOptions::default();
-    let mut resolved = resolve(&pool, &upgrade_names, &options)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut resolved =
+        resolve(&pool, &upgrade_names, &options).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     topological_sort(&pool, &mut resolved);
 
     let sync_sizes: HashMap<String, (u64, u64, String)> = sync_map
         .iter()
-        .map(|(k, v)| (k.clone(), (v.compressed_size, v.installed_size, v.repository.clone())))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                (v.compressed_size, v.installed_size, v.repository.clone()),
+            )
+        })
         .collect();
 
-    let tx = build_transaction(&pool, &resolved, &upgrade_names, &|name| {
-        sync_sizes
-            .get(name)
-            .map(|(c, i, _)| (*c, *i))
-            .unwrap_or((0, 0))
-    }, false);
+    let tx = build_transaction(
+        &pool,
+        &resolved,
+        &upgrade_names,
+        &|name| {
+            sync_sizes
+                .get(name)
+                .map(|(c, i, _)| (*c, *i))
+                .unwrap_or((0, 0))
+        },
+        false,
+    );
 
     if tx.is_empty() {
         println!("there is nothing to do");
@@ -113,9 +138,6 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
         println!("Upgrade cancelled.");
         return Ok(());
     }
-
-    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)
-        .map_err(|e| anyhow::anyhow!("failed to acquire db lock: {e}"))?;
 
     let repo_servers: HashMap<String, Vec<String>> = db
         .config
@@ -137,7 +159,10 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
         let Some(info) = sync_map.get(name) else {
             continue;
         };
-        let servers = repo_servers.get(&info.repository).cloned().unwrap_or_default();
+        let servers = repo_servers
+            .get(&info.repository)
+            .cloned()
+            .unwrap_or_default();
         targets.push(DownloadTarget {
             name: name.clone(),
             filename: info.filename.clone(),
@@ -145,6 +170,14 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
             compressed_size: info.compressed_size,
             mirrors: servers,
             sig_level: info.sig_level,
+            sig_trust: db
+                .config
+                .repos
+                .iter()
+                .find(|repo| repo.name == info.repository)
+                .and_then(|repo| repo.sig_level)
+                .unwrap_or(db.config.sig_level)
+                .package_trust,
         });
     }
 
@@ -188,7 +221,9 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
         logger: &mut logger,
     };
 
-    execute_transaction(&tx, &mut ctx).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = execute_transaction(&tx, &mut ctx);
+    db.invalidate();
+    result.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let total = tx.installs.len() + tx.upgrades.len();
     println!(
@@ -198,4 +233,3 @@ pub fn run(db: &mut DatabaseHandle, dry_run: bool, download_only: bool, noconfir
 
     Ok(())
 }
-

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use pax_core::package::PackageInfo;
+use pax_core::package::{Dependency, PackageInfo};
 use pax_core::version::Version;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,6 +21,9 @@ pub struct PackageCandidate<'a> {
 pub trait PackagePool {
     fn candidates(&self, name: &str) -> Vec<PackageCandidate<'_>>;
     fn providers(&self, name: &str) -> Vec<PackageCandidate<'_>>;
+    fn replacements(&self, _name: &str) -> Vec<PackageCandidate<'_>> {
+        Vec::new()
+    }
     fn get(&self, id: PackageId) -> Option<PackageCandidate<'_>>;
     fn installed_version(&self, name: &str) -> Option<&Version>;
     fn all_installed(&self) -> Vec<PackageCandidate<'_>>;
@@ -36,6 +39,7 @@ pub struct ConcretePool {
     packages: Vec<StoredPackage>,
     name_index: HashMap<String, Vec<PackageId>>,
     provides_index: HashMap<String, Vec<PackageId>>,
+    replaces_index: HashMap<String, Vec<PackageId>>,
     installed_versions: HashMap<String, Version>,
     ignored: HashSet<String>,
 }
@@ -50,6 +54,7 @@ impl ConcretePool {
             packages: Vec::with_capacity(capacity),
             name_index: HashMap::with_capacity(capacity),
             provides_index: HashMap::new(),
+            replaces_index: HashMap::new(),
             installed_versions: HashMap::new(),
             ignored,
         }
@@ -82,6 +87,13 @@ impl ConcretePool {
             .entry(info.name.clone())
             .or_default()
             .push(id);
+
+        for replacement in &info.replaces {
+            self.replaces_index
+                .entry(replacement.name.clone())
+                .or_default()
+                .push(id);
+        }
 
         for prov in &info.provides {
             self.provides_index
@@ -126,6 +138,22 @@ impl PackagePool for ConcretePool {
         result
     }
 
+    fn replacements(&self, name: &str) -> Vec<PackageCandidate<'_>> {
+        let mut result: Vec<_> = self
+            .replaces_index
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&id| self.make_candidate(id))
+            .filter(|candidate| matches!(candidate.source, PackageSource::Sync { .. }))
+            .collect();
+        result.sort_by_key(|candidate| match candidate.source {
+            PackageSource::Sync { repo_index } => repo_index,
+            PackageSource::Local => u16::MAX,
+        });
+        result
+    }
+
     fn get(&self, id: PackageId) -> Option<PackageCandidate<'_>> {
         if (id.0 as usize) < self.packages.len() {
             Some(self.make_candidate(id))
@@ -150,6 +178,38 @@ impl PackagePool for ConcretePool {
     fn is_ignored(&self, name: &str) -> bool {
         self.ignored.contains(name)
     }
+}
+
+pub fn package_satisfies_dependency(info: &PackageInfo, dep: &Dependency) -> bool {
+    package_satisfies(info, dep)
+}
+
+/// Match real package versions and explicitly versioned virtual provisions alike.
+pub(crate) fn package_satisfies(info: &PackageInfo, dep: &Dependency) -> bool {
+    (info.name == dep.name && dep.satisfies(&info.version))
+        || info.provides.iter().any(|provided| {
+            provided.name == dep.name
+                && match (&dep.constraint, &provided.constraint) {
+                    (None, _) => true,
+                    (Some(_), Some((_, version))) => dep.satisfies(version),
+                    (Some(_), None) => false,
+                }
+        })
+}
+
+/// A package name belongs to its first configured repository, even if a later
+/// repository advertises a newer version or different provisions.
+pub(crate) fn preferred_sync<'a, P: PackagePool>(
+    pool: &'a P,
+    name: &str,
+) -> Option<PackageCandidate<'a>> {
+    pool.candidates(name)
+        .into_iter()
+        .filter(|candidate| matches!(candidate.source, PackageSource::Sync { .. }))
+        .min_by_key(|candidate| match candidate.source {
+            PackageSource::Sync { repo_index } => repo_index,
+            PackageSource::Local => u16::MAX,
+        })
 }
 
 #[cfg(test)]
@@ -239,9 +299,6 @@ mod tests {
 
         let cands = pool.candidates("gcc");
         assert_eq!(cands.len(), 2);
-        assert_eq!(
-            cands[0].source,
-            PackageSource::Sync { repo_index: 0 }
-        );
+        assert_eq!(cands[0].source, PackageSource::Sync { repo_index: 0 });
     }
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use crate::error::{AurError, Result};
@@ -7,6 +9,9 @@ const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc/v5";
 fn aur_agent() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_body(Some(Duration::from_secs(30)))
         .tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls)
@@ -68,7 +73,10 @@ struct RpcResponse {
 }
 
 pub fn suggest(prefix: &str) -> Result<Vec<String>> {
-    let url = format!("https://aur.archlinux.org/rpc/v5/suggest/{}", urlenc(prefix));
+    let url = format!(
+        "https://aur.archlinux.org/rpc/v5/suggest/{}",
+        urlenc(prefix)
+    );
     let body = aur_agent()
         .get(&url)
         .call()
@@ -91,7 +99,10 @@ pub fn info(names: &[&str]) -> Result<Vec<AurPackage>> {
         return Ok(Vec::new());
     }
 
-    let args: String = names.iter().map(|n| format!("&arg[]={}", urlenc(n))).collect();
+    let args: String = names
+        .iter()
+        .map(|n| format!("&arg[]={}", urlenc(n)))
+        .collect();
     let url = format!("{AUR_RPC_URL}/info?{}", &args[1..]);
     let resp = do_request(&url)?;
     Ok(resp.results)
@@ -134,6 +145,15 @@ fn urlenc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aur_requests_have_finite_timeouts() {
+        let agent = aur_agent();
+        let timeouts = agent.config().timeouts();
+        assert_eq!(timeouts.global, Some(Duration::from_secs(60)));
+        assert_eq!(timeouts.connect, Some(Duration::from_secs(10)));
+        assert_eq!(timeouts.recv_body, Some(Duration::from_secs(30)));
+    }
 
     #[test]
     fn test_urlenc() {

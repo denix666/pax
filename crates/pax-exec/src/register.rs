@@ -4,14 +4,14 @@ use pax_alpm::desc::{generate_files_content, generate_local_desc_from_pkginfo};
 use pax_core::package::{InstallReason, Validation};
 
 use crate::error::{ExecError, Result};
-use crate::extract::PackageMetadata;
+use crate::extract::{PackageMetadata, validate_identity};
 
 pub fn register_package(
     db_path: &Path,
     metadata: &PackageMetadata,
     reason: InstallReason,
     validation: &[Validation],
-    root_dir: &Path,
+    _root_dir: &Path,
 ) -> Result<()> {
     let (name, version) = parse_name_version(&metadata.pkginfo)?;
 
@@ -45,11 +45,16 @@ pub fn register_package(
         .backup
         .iter()
         .map(|path| {
-            let md5 = compute_file_md5(root_dir.join(path))
-                .unwrap_or_default();
-            (path.clone(), md5)
+            let md5 = metadata
+                .backup_md5
+                .get(path)
+                .ok_or_else(|| ExecError::Extraction {
+                    pkg: name.clone(),
+                    message: format!("missing archive MD5 for backup {path}"),
+                })?;
+            Ok((path.clone(), md5.clone()))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let files_content = generate_files_content(&metadata.files, &backup_with_md5);
     std::fs::write(tmp_dir.join("files"), &files_content)?;
@@ -71,11 +76,65 @@ pub fn register_package(
 }
 
 pub fn remove_db_entry(db_path: &Path, name: &str, version: &str) -> Result<()> {
+    validate_identity(name, version)?;
     let pkg_dir = db_path.join("local").join(format!("{name}-{version}"));
     if pkg_dir.exists() {
         std::fs::remove_dir_all(&pkg_dir)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn registration_uses_archive_hash_even_with_local_modifications() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = temp.path().join("db");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/config"), "local changes").unwrap();
+        let hash = format!("{:x}", md5::compute("incoming defaults"));
+        let metadata = PackageMetadata {
+            pkginfo: "pkgname = test\npkgver = 1-1\n".into(),
+            mtree: Vec::new(),
+            install: None,
+            files: vec!["etc/config".into()],
+            backup: vec!["etc/config".into()],
+            backup_md5: HashMap::from([("etc/config".into(), hash.clone())]),
+            warnings: Vec::new(),
+        };
+        register_package(&db, &metadata, InstallReason::Explicit, &[], &root).unwrap();
+        let files = std::fs::read_to_string(db.join("local/test-1-1/files")).unwrap();
+        assert!(files.contains(&format!("etc/config\t{hash}")));
+    }
+
+    #[test]
+    fn registration_requires_backup_archive_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = PackageMetadata {
+            pkginfo: "pkgname = test\npkgver = 1-1\n".into(),
+            mtree: Vec::new(),
+            install: None,
+            files: vec!["config".into()],
+            backup: vec!["config".into()],
+            backup_md5: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        assert!(
+            register_package(
+                temp.path(),
+                &metadata,
+                InstallReason::Explicit,
+                &[],
+                temp.path()
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("local/test-1-1").exists());
+    }
 }
 
 fn parse_name_version(pkginfo: &str) -> Result<(String, String)> {
@@ -94,7 +153,10 @@ fn parse_name_version(pkginfo: &str) -> Result<(String, String)> {
     }
 
     match (name, version) {
-        (Some(n), Some(v)) => Ok((n, v)),
+        (Some(n), Some(v)) => {
+            validate_identity(&n, &v)?;
+            Ok((n, v))
+        }
         _ => Err(ExecError::Extraction {
             pkg: String::new(),
             message: "missing pkgname or pkgver in .PKGINFO".to_string(),
@@ -108,9 +170,4 @@ fn parse_pkginfo_field<'a>(pkginfo: &'a str, field: &str) -> Option<&'a str> {
         .lines()
         .find(|line| line.starts_with(&prefix))
         .map(|line| &line[prefix.len()..])
-}
-
-fn compute_file_md5(path: impl AsRef<Path>) -> Result<String> {
-    let data = std::fs::read(path)?;
-    Ok(format!("{:x}", md5::compute(&data)))
 }

@@ -6,13 +6,16 @@ pub enum ResolveError {
     #[error("target not found: {name} is not available in any repository")]
     TargetNotFound { name: String },
 
-    #[error("unresolvable dependency: {dep}\n  required by: {}", format_chain(chain))]
-    DependencyNotFound {
-        dep: Dependency,
-        chain: Vec<String>,
-    },
+    #[error(
+        "unresolvable dependency: {dep}\n  required by: {}",
+        format_chain(chain)
+    )]
+    DependencyNotFound { dep: Dependency, chain: Vec<String> },
 
-    #[error("version conflict: {pkg} {installed} is installed, but {dep} is required\n  required by: {}", format_chain(chain))]
+    #[error(
+        "version conflict: installed {pkg} {installed} cannot satisfy {dep} in the planned final state\n  required by: {}",
+        format_chain(chain)
+    )]
     VersionConflict {
         pkg: String,
         installed: Version,
@@ -20,7 +23,11 @@ pub enum ResolveError {
         chain: Vec<String>,
     },
 
-    #[error("conflict: {pkg_a} and {pkg_b} conflict with each other\n  {pkg_a} required by: {}\n  {pkg_b} required by: {}\n  cannot remove {pkg_b} automatically: required by {blocked_by}", format_chain(chain_a), format_chain(chain_b))]
+    #[error(
+        "conflict: {pkg_a} and {pkg_b} conflict with each other\n  {pkg_a} required by: {}\n  {pkg_b} required by: {}\n  cannot remove {pkg_b} automatically: blocked by {blocked_by}",
+        format_chain(chain_a),
+        format_chain(chain_b)
+    )]
     PackageConflict {
         pkg_a: String,
         pkg_b: String,

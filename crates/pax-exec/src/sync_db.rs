@@ -1,6 +1,9 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::verify;
+use pax_core::config::{SigLevel, SigTrust};
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -15,6 +18,9 @@ const REPOSITORY_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct SyncTarget {
     pub repo_name: String,
     pub mirrors: Vec<String>,
+    pub sig_level: SigLevel,
+    pub sig_trust: SigTrust,
+    pub gpg_dir: PathBuf,
 }
 
 pub fn sync_databases(
@@ -109,10 +115,18 @@ fn sync_one(
             &pb,
             agent,
             remaining.min(MIRROR_TIMEOUT),
+            target,
         ) {
             Ok(()) => {
                 pb.finish_with_message(format!("{} ok", target.repo_name));
                 return Ok(());
+            }
+            Err(e @ ExecError::SignatureFailure { .. }) => {
+                pb.finish_with_message(format!("{} SIG FAIL", target.repo_name));
+                return Err(format!(
+                    "repository '{}' unavailable: {url}: {e}",
+                    target.repo_name
+                ));
             }
             Err(e) => {
                 last_error = format!("{url}: {e}");
@@ -138,7 +152,9 @@ fn try_download_db(
     pb: &ProgressBar,
     agent: &ureq::Agent,
     timeout: Duration,
+    target: &SyncTarget,
 ) -> Result<()> {
+    let started = Instant::now();
     let response = agent
         .get(url)
         .config()
@@ -177,6 +193,30 @@ fn try_download_db(
 
     tmp.flush()?;
 
+    let mut signature = None;
+    if target.sig_level != SigLevel::Never {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(ExecError::Download {
+                pkg: filename.to_string(),
+                message: "signature download timeout".into(),
+            });
+        }
+        if let Some(body) = verify::fetch_signature(agent, &format!("{url}.sig"), remaining)? {
+            let mut file = NamedTempFile::new_in(sync_dir)?;
+            file.write_all(&body)?;
+            file.flush()?;
+            signature = Some(file);
+        }
+    }
+    verify::verify_signature(
+        tmp.path(),
+        signature.as_ref().map(|file| file.path()),
+        &target.gpg_dir,
+        target.sig_level,
+        target.sig_trust,
+    )?;
+
     let dest = sync_dir.join(filename);
     tmp.persist(&dest).map_err(|e| ExecError::Download {
         pkg: filename.to_string(),
@@ -203,11 +243,16 @@ mod tests {
 
     impl TestServer {
         fn new(response: &'static [u8], stall: bool) -> Self {
+            Self::responses(vec![response], stall)
+        }
+
+        fn responses(responses: Vec<&'static [u8]>, stall: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             listener.set_nonblocking(true).unwrap();
             let (stop, stopped) = mpsc::channel();
             let thread = thread::spawn(move || {
+                let mut responses = responses.into_iter();
                 loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
@@ -216,11 +261,14 @@ mod tests {
                                 .unwrap();
                             let mut request = [0; 4096];
                             stream.read(&mut request).unwrap();
+                            let response = responses.next().unwrap();
                             stream.write_all(response).unwrap();
-                            if stall {
+                            if stall && responses.len() == 0 {
                                 let _ = stopped.recv_timeout(Duration::from_secs(5));
                             }
-                            break;
+                            if responses.len() == 0 {
+                                break;
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             if stopped.recv_timeout(Duration::from_millis(10)).is_ok() {
@@ -258,7 +306,99 @@ mod tests {
         SyncTarget {
             repo_name: name.to_string(),
             mirrors,
+            sig_level: SigLevel::Never,
+            sig_trust: SigTrust::TrustedOnly,
+            gpg_dir: PathBuf::new(),
         }
+    }
+
+    #[test]
+    fn signature_policy_checks_temporary_database_before_replacement() {
+        for (level, signature_response, succeeds) in [
+            (
+                SigLevel::Optional,
+                &b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"[..],
+                true,
+            ),
+            (
+                SigLevel::Required,
+                &b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"[..],
+                false,
+            ),
+            (
+                SigLevel::Optional,
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ninvalid"[..],
+                false,
+            ),
+            (
+                SigLevel::Required,
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ninvalid"[..],
+                false,
+            ),
+            (
+                SigLevel::Optional,
+                &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..],
+                false,
+            ),
+        ] {
+            let server = TestServer::responses(
+                vec![
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndatabase",
+                    signature_response,
+                ],
+                false,
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let gpg = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("core.db");
+            std::fs::write(&dest, b"old database").unwrap();
+            let mut target = target("core", vec![server.url.clone()]);
+            target.sig_level = level;
+            target.gpg_dir = gpg.path().to_path_buf();
+            let result = sync_databases_with_agent(
+                &[target],
+                dir.path(),
+                1,
+                &MultiProgress::new(),
+                &agent(),
+                Duration::from_secs(2),
+            );
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            assert_eq!(
+                std::fs::read(&dest).unwrap(),
+                if succeeds {
+                    &b"database"[..]
+                } else {
+                    &b"old database"[..]
+                }
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn signature_timeout_preserves_database_and_repository_budget() {
+        let server = TestServer::responses(
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndatabase", b""],
+            true,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("core.db");
+        std::fs::write(&dest, b"old database").unwrap();
+        let mut target = target("core", vec![server.url.clone()]);
+        target.sig_level = SigLevel::Required;
+        let started = Instant::now();
+        let result = sync_databases_with_agent(
+            &[target],
+            dir.path(),
+            1,
+            &MultiProgress::new(),
+            &agent(),
+            Duration::from_millis(200),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old database");
     }
 
     #[test]

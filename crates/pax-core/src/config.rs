@@ -14,10 +14,19 @@ impl Default for SigLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SigTrust {
+    #[default]
+    TrustedOnly,
+    TrustAll,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SigConfig {
     pub package: SigLevel,
     pub database: SigLevel,
+    pub package_trust: SigTrust,
+    pub database_trust: SigTrust,
 }
 
 impl Default for SigConfig {
@@ -25,12 +34,17 @@ impl Default for SigConfig {
         SigConfig {
             package: SigLevel::Optional,
             database: SigLevel::Optional,
+            package_trust: SigTrust::TrustedOnly,
+            database_trust: SigTrust::TrustedOnly,
         }
     }
 }
 
 pub fn parse_sig_level(value: &str) -> SigConfig {
-    let mut cfg = SigConfig::default();
+    parse_sig_level_with_base(value, SigConfig::default())
+}
+
+pub fn parse_sig_level_with_base(value: &str, mut cfg: SigConfig) -> SigConfig {
     for token in value.split_whitespace() {
         match token {
             "Required" => {
@@ -51,7 +65,18 @@ pub fn parse_sig_level(value: &str) -> SigConfig {
             "DatabaseRequired" => cfg.database = SigLevel::Required,
             "DatabaseOptional" => cfg.database = SigLevel::Optional,
             "DatabaseNever" => cfg.database = SigLevel::Never,
-            "TrustAll" | "TrustedOnly" => {}
+            "TrustAll" => {
+                cfg.package_trust = SigTrust::TrustAll;
+                cfg.database_trust = SigTrust::TrustAll;
+            }
+            "TrustedOnly" => {
+                cfg.package_trust = SigTrust::TrustedOnly;
+                cfg.database_trust = SigTrust::TrustedOnly;
+            }
+            "PackageTrustAll" => cfg.package_trust = SigTrust::TrustAll,
+            "PackageTrustedOnly" => cfg.package_trust = SigTrust::TrustedOnly,
+            "DatabaseTrustAll" => cfg.database_trust = SigTrust::TrustAll,
+            "DatabaseTrustedOnly" => cfg.database_trust = SigTrust::TrustedOnly,
             _ => {}
         }
     }
@@ -74,6 +99,7 @@ pub struct PacmanConfig {
     pub check_space: bool,
     pub parallel_downloads: u32,
     pub sig_level: SigConfig,
+    pub local_file_sig_level: SigConfig,
     pub repos: Vec<Repository>,
     cache_dirs_overridden: bool,
 }
@@ -102,6 +128,7 @@ impl Default for PacmanConfig {
             check_space: false,
             parallel_downloads: 1,
             sig_level: SigConfig::default(),
+            local_file_sig_level: SigConfig::default(),
             repos: vec![],
             cache_dirs_overridden: false,
         }
@@ -119,6 +146,8 @@ impl PacmanConfig {
         let mut current_repo: Option<String> = None;
         let mut current_servers: Vec<String> = Vec::new();
         let mut current_sig_level: Option<SigConfig> = None;
+        let mut repo_sig_overrides: Vec<String> = Vec::new();
+        let mut local_sig_override = String::new();
 
         if config.architecture.is_empty() {
             config.architecture = detect_arch();
@@ -172,7 +201,9 @@ impl PacmanConfig {
                         "GPGDir" => config.gpg_dir = PathBuf::from(value),
                         "HookDir" => config.hook_dirs.push(PathBuf::from(value)),
                         "HoldPkg" => {
-                            config.hold_pkgs.extend(value.split_whitespace().map(String::from));
+                            config
+                                .hold_pkgs
+                                .extend(value.split_whitespace().map(String::from));
                         }
                         "IgnorePkg" => {
                             config
@@ -195,14 +226,22 @@ impl PacmanConfig {
                             config.parallel_downloads = value.parse().unwrap_or(1);
                         }
                         "SigLevel" => {
-                            config.sig_level = parse_sig_level(value);
+                            config.sig_level = parse_sig_level_with_base(value, config.sig_level);
+                        }
+                        "LocalFileSigLevel" => {
+                            local_sig_override.push_str(value);
+                            local_sig_override.push(' ');
                         }
                         _ => {}
                     }
                 } else {
                     match key {
                         "SigLevel" => {
-                            current_sig_level = Some(parse_sig_level(value));
+                            let index = config.repos.len();
+                            repo_sig_overrides.resize(index + 1, String::new());
+                            repo_sig_overrides[index].push_str(value);
+                            repo_sig_overrides[index].push(' ');
+                            current_sig_level = Some(SigConfig::default());
                         }
                         "Server" => {
                             let url = value
@@ -216,7 +255,9 @@ impl PacmanConfig {
                             } else {
                                 config_dir.join(value)
                             };
-                            if let Ok(mirrors) = parse_mirrorlist(&include_path, section, &config.architecture) {
+                            if let Ok(mirrors) =
+                                parse_mirrorlist(&include_path, section, &config.architecture)
+                            {
                                 current_servers.extend(mirrors);
                             }
                         }
@@ -243,6 +284,16 @@ impl PacmanConfig {
             }
         }
 
+        for (index, repo) in config.repos.iter_mut().enumerate() {
+            if repo.sig_level.is_some() {
+                repo.sig_level = Some(parse_sig_level_with_base(
+                    &repo_sig_overrides[index],
+                    config.sig_level,
+                ));
+            }
+        }
+        config.local_file_sig_level =
+            parse_sig_level_with_base(&local_sig_override, config.sig_level);
         Ok(config)
     }
 }
@@ -255,10 +306,7 @@ fn parse_mirrorlist(path: &Path, repo: &str, arch: &str) -> Result<Vec<String>> 
         let line = line.split('#').next().unwrap_or("").trim();
         if let Some((key, value)) = line.split_once('=') {
             if key.trim() == "Server" {
-                let url = value
-                    .trim()
-                    .replace("$repo", repo)
-                    .replace("$arch", arch);
+                let url = value.trim().replace("$repo", repo).replace("$arch", arch);
                 servers.push(url);
             }
         }
@@ -278,6 +326,73 @@ fn detect_arch() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_repository_and_local_policies_inherit_global_fields() {
+        let config = PacmanConfig::parse(
+            r#"
+[options]
+SigLevel = Required TrustedOnly
+LocalFileSigLevel = PackageOptional
+[core]
+SigLevel = DatabaseOptional
+[extra]
+SigLevel = PackageTrustAll
+[options]
+SigLevel = DatabaseTrustAll
+"#,
+            Path::new("/etc/pacman.conf"),
+        )
+        .unwrap();
+        let core = config.repos[0].sig_level.unwrap();
+        assert_eq!(core.package, SigLevel::Required);
+        assert_eq!(core.database, SigLevel::Optional);
+        assert_eq!(core.package_trust, SigTrust::TrustedOnly);
+        assert_eq!(core.database_trust, SigTrust::TrustAll);
+        let extra = config.repos[1].sig_level.unwrap();
+        assert_eq!(extra.package, SigLevel::Required);
+        assert_eq!(extra.database, SigLevel::Required);
+        assert_eq!(extra.package_trust, SigTrust::TrustAll);
+        assert_eq!(config.local_file_sig_level.package, SigLevel::Optional);
+        assert_eq!(
+            config.local_file_sig_level.package_trust,
+            SigTrust::TrustedOnly
+        );
+        assert_eq!(
+            config.local_file_sig_level.database_trust,
+            SigTrust::TrustAll
+        );
+    }
+
+    #[test]
+    fn signature_tokens_scope_trust_and_requirement_independently() {
+        let policy = parse_sig_level("Required TrustAll PackageTrustedOnly DatabaseNever");
+        assert_eq!(policy.package, SigLevel::Required);
+        assert_eq!(policy.database, SigLevel::Never);
+        assert_eq!(policy.package_trust, SigTrust::TrustedOnly);
+        assert_eq!(policy.database_trust, SigTrust::TrustAll);
+        let policy = parse_sig_level("Never TrustedOnly PackageOptional DatabaseTrustAll");
+        assert_eq!(policy.package, SigLevel::Optional);
+        assert_eq!(policy.database, SigLevel::Never);
+        assert_eq!(policy.package_trust, SigTrust::TrustedOnly);
+        assert_eq!(policy.database_trust, SigTrust::TrustAll);
+    }
+
+    #[test]
+    fn local_signature_policy_defaults_to_global_and_accumulates_overrides() {
+        let config = PacmanConfig::parse(
+            "[options]\nSigLevel = Required TrustAll\n",
+            Path::new("/etc/pacman.conf"),
+        )
+        .unwrap();
+        assert_eq!(config.local_file_sig_level, config.sig_level);
+        let config = PacmanConfig::parse("[options]\nSigLevel = Required TrustAll\nLocalFileSigLevel = Optional\nLocalFileSigLevel = TrustedOnly\n", Path::new("/etc/pacman.conf")).unwrap();
+        assert_eq!(config.local_file_sig_level.package, SigLevel::Optional);
+        assert_eq!(
+            config.local_file_sig_level.package_trust,
+            SigTrust::TrustedOnly
+        );
+    }
 
     #[test]
     fn test_parse_minimal_config() {

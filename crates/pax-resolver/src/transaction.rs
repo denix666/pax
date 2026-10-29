@@ -41,6 +41,8 @@ pub struct Transaction {
     pub installs: Vec<InstallAction>,
     pub upgrades: Vec<UpgradeAction>,
     pub removals: Vec<RemovalAction>,
+    /// Incoming actions in the resolver's dependency order, interleaving installs and upgrades.
+    pub package_order: Vec<String>,
     pub total_download_size: u64,
     pub total_installed_size: u64,
 }
@@ -58,11 +60,11 @@ pub fn build_transaction<P: PackagePool>(
     sync_sizes: &dyn Fn(&str) -> (u64, u64),
     reinstall: bool,
 ) -> Transaction {
-    let target_set: std::collections::HashSet<&str> =
-        targets.iter().map(|s| s.as_str()).collect();
+    let target_set: std::collections::HashSet<&str> = targets.iter().map(|s| s.as_str()).collect();
 
     let mut installs = Vec::new();
     let mut upgrades = Vec::new();
+    let mut package_order = Vec::new();
     let mut total_download: u64 = 0;
     let mut total_installed: u64 = 0;
 
@@ -75,9 +77,9 @@ pub fn build_transaction<P: PackagePool>(
         let (dl_size, inst_size) = sync_sizes(&pkg.name);
 
         if let Some(installed_ver) = pool.installed_version(&pkg.name) {
-            let dominated = pkg.version > *installed_ver;
-            let same = pkg.version == *installed_ver;
-            if dominated || (same && reinstall && target_set.contains(pkg.name.as_str())) {
+            let different = pkg.version != *installed_ver;
+            if different || (reinstall && target_set.contains(pkg.name.as_str())) {
+                package_order.push(pkg.name.clone());
                 total_download += dl_size;
                 total_installed += inst_size;
                 upgrades.push(UpgradeAction {
@@ -90,6 +92,7 @@ pub fn build_transaction<P: PackagePool>(
                 });
             }
         } else {
+            package_order.push(pkg.name.clone());
             total_download += dl_size;
             total_installed += inst_size;
             installs.push(InstallAction {
@@ -120,6 +123,7 @@ pub fn build_transaction<P: PackagePool>(
         installs,
         upgrades,
         removals,
+        package_order,
         total_download_size: total_download,
         total_installed_size: total_installed,
     }
@@ -129,7 +133,7 @@ pub fn build_transaction<P: PackagePool>(
 mod tests {
     use super::*;
     use crate::pool::ConcretePool;
-    use crate::resolve::{resolve, ResolveOptions};
+    use crate::resolve::{ResolveOptions, resolve};
     use pax_core::package::{Dependency, PackageInfo};
     use pax_core::version::Version;
     use std::collections::HashSet;
@@ -161,9 +165,14 @@ mod tests {
         pool.add_sync(make_pkg("app", "1.0-1", &["lib"]), 0);
         pool.add_sync(make_pkg("lib", "1.0-1", &[]), 0);
 
-        let resolved =
-            resolve(&pool, &["app".to_string()], &ResolveOptions::default()).unwrap();
-        let tx = build_transaction(&pool, &resolved, &["app".to_string()], &|_| (1000, 5000), false);
+        let resolved = resolve(&pool, &["app".to_string()], &ResolveOptions::default()).unwrap();
+        let tx = build_transaction(
+            &pool,
+            &resolved,
+            &["app".to_string()],
+            &|_| (1000, 5000),
+            false,
+        );
 
         assert_eq!(tx.installs.len(), 2);
         assert!(tx.upgrades.is_empty());
@@ -176,14 +185,72 @@ mod tests {
     }
 
     #[test]
+    fn preserves_interleaved_dependency_order_without_keyring_priority() {
+        use crate::resolve::ResolvedPackage;
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_local(make_pkg("middle", "1-1", &[]));
+        let packages = ["dependency", "middle", "app-keyring"];
+        let to_install = packages
+            .iter()
+            .map(|name| {
+                let info = make_pkg(name, "2-1", &[]);
+                let id = pool.add_sync(info.clone(), 0);
+                ResolvedPackage {
+                    id,
+                    name: info.name,
+                    version: info.version,
+                    source: PackageSource::Sync { repo_index: 0 },
+                    reason: pax_core::package::InstallReason::Explicit,
+                }
+            })
+            .collect();
+        let resolved = ResolvedSet {
+            to_install,
+            to_remove: vec![],
+        };
+        let tx = build_transaction(&pool, &resolved, &[], &|_| (1, 2), false);
+        assert_eq!(tx.package_order, packages);
+        assert_eq!(tx.installs.len(), 2);
+        assert_eq!(tx.upgrades[0].name, "middle");
+    }
+
+    #[test]
+    fn selected_downgrade_creates_an_action() {
+        use crate::resolve::ResolvedPackage;
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_local(make_pkg("app", "2-1", &[]));
+        let id = pool.add_sync(make_pkg("app", "1-1", &[]), 0);
+        let resolved = ResolvedSet {
+            to_install: vec![ResolvedPackage {
+                id,
+                name: "app".into(),
+                version: Version::parse("1-1").unwrap(),
+                source: PackageSource::Sync { repo_index: 0 },
+                reason: pax_core::package::InstallReason::Explicit,
+            }],
+            to_remove: vec![],
+        };
+        let tx = build_transaction(&pool, &resolved, &["app".into()], &|_| (10, 20), false);
+        assert_eq!(tx.package_order, ["app"]);
+        assert_eq!(tx.upgrades.len(), 1);
+        assert_eq!(tx.upgrades[0].new_version.to_string(), "1-1");
+        assert_eq!(tx.total_download_size, 10);
+    }
+
+    #[test]
     fn upgrade_transaction() {
         let mut pool = ConcretePool::new(HashSet::new());
         pool.add_local(make_pkg("app", "1.0-1", &[]));
         pool.add_sync(make_pkg("app", "2.0-1", &[]), 0);
 
-        let resolved =
-            resolve(&pool, &["app".to_string()], &ResolveOptions::default()).unwrap();
-        let tx = build_transaction(&pool, &resolved, &["app".to_string()], &|_| (1000, 5000), false);
+        let resolved = resolve(&pool, &["app".to_string()], &ResolveOptions::default()).unwrap();
+        let tx = build_transaction(
+            &pool,
+            &resolved,
+            &["app".to_string()],
+            &|_| (1000, 5000),
+            false,
+        );
 
         assert!(tx.installs.is_empty());
         assert_eq!(tx.upgrades.len(), 1);
