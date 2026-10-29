@@ -274,14 +274,12 @@ pub fn extract_package(
         }
     }
 
-    for backup in &backup_entries {
-        if !backup_md5.contains_key(backup) {
-            return Err(ExecError::Extraction {
-                pkg: pkg_name.clone(),
-                message: format!("backup missing from archive: {backup}"),
-            });
-        }
-    }
+    // Some packages retain obsolete backup declarations in .PKGINFO. Only
+    // archived backup files have a baseline and belong in the installed backup list.
+    let backup_entries = backup_entries
+        .into_iter()
+        .filter(|path| backup_md5.contains_key(path))
+        .collect();
     Ok(PackageMetadata {
         pkginfo,
         mtree,
@@ -302,6 +300,7 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
     let mut overlays: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     let mut pkginfo = None;
     let mut regular_files = std::collections::HashSet::new();
+    let mut payload_paths = std::collections::HashSet::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = safe_relative_path(&entry.path()?)?;
@@ -366,6 +365,7 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
                 pkginfo = Some(text);
             }
         } else {
+            payload_paths.insert(path.clone());
             if kind.is_file() {
                 regular_files.insert(path.clone());
             }
@@ -393,6 +393,12 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
     validate_identity(name, version)?;
     for backup in parse_backup_from_pkginfo(&pkginfo) {
         let path = safe_relative_path(Path::new(&backup))?;
+        if path.as_os_str().is_empty() {
+            return Err(unsafe_path(&path));
+        }
+        if !payload_paths.contains(&path) {
+            continue;
+        }
         if !regular_files.contains(&path) {
             return Err(unsafe_path(&path));
         }
@@ -806,6 +812,70 @@ mod tests {
         }
         builder.finish().unwrap();
         archive
+    }
+
+    #[test]
+    fn missing_backup_declaration_does_not_block_extraction_or_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("mc.pkg.tar");
+        let pkginfo = b"pkgname = mc\npkgver = 1-1\narch = any\nbackup = etc/mc/mc.ext\nbackup = etc/mc/mc.ext.ini\n";
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        for (path, data) in [
+            (".PKGINFO", pkginfo.as_slice()),
+            ("etc/mc/mc.ext.ini", b"new config".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, data).unwrap();
+        }
+        builder.finish().unwrap();
+        drop(builder);
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("etc/mc")).unwrap();
+        std::fs::write(root.join("etc/mc/mc.ext"), b"unowned config").unwrap();
+        let metadata = extract_package(&archive, &root, &HashMap::new()).unwrap();
+        assert_eq!(metadata.backup, ["etc/mc/mc.ext.ini"]);
+        assert!(!metadata.backup_md5.contains_key("etc/mc/mc.ext"));
+        assert_eq!(
+            std::fs::read(root.join("etc/mc/mc.ext")).unwrap(),
+            b"unowned config"
+        );
+        let db = temp.path().join("db");
+        crate::register::register_package(&db, &metadata, InstallReason::Explicit, &[], &root)
+            .unwrap();
+        let files = std::fs::read_to_string(db.join("local/mc-1-1/files")).unwrap();
+        assert!(files.contains(&format!(
+            "etc/mc/mc.ext.ini\t{:x}",
+            md5::compute(b"new config")
+        )));
+        assert!(
+            !files
+                .lines()
+                .any(|line| line == "etc/mc/mc.ext" || line.starts_with("etc/mc/mc.ext\t"))
+        );
+    }
+
+    #[test]
+    fn real_mc_archive_extracts_when_provided() {
+        let Some(path) = std::env::var_os("PAX_TEST_MC_ARCHIVE") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let metadata = extract_package(Path::new(&path), &root, &HashMap::new()).unwrap();
+        assert!(root.join("etc/mc/mc.ext.ini").is_file());
+        assert!(!root.join("etc/mc/mc.ext").exists());
+        assert!(!metadata.backup.iter().any(|path| path == "etc/mc/mc.ext"));
+        crate::register::register_package(
+            &temp.path().join("db"),
+            &metadata,
+            InstallReason::Explicit,
+            &[],
+            &root,
+        )
+        .unwrap();
     }
 
     #[test]
