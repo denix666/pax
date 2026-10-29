@@ -151,6 +151,18 @@ pax check-files bash glibc
 pax remove-lock
 ```
 
+### Repository synchronization
+
+Repository requests limit DNS resolution and connection establishment to 10 seconds each,
+and sending the request and waiting for response headers to 15 seconds each. Each database
+transfer has a 60-second total timeout, including reading the response body. Mirror attempts
+for one repository share a 120-second budget, so a long mirror list cannot block sync indefinitely.
+Failed mirrors are reported and the next mirror is tried while time remains.
+
+If any repository cannot be synchronized, pax reports its name and the failure reason and
+exits with a nonzero status. Other repositories can still finish updating. A failed download
+preserves the previous database, if one exists.
+
 ### Global Options
 
 | Option | Description |

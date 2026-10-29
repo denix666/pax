@@ -11,6 +11,9 @@ pub enum ExecError {
     #[error("all mirrors failed for {pkg}")]
     AllMirrorsFailed { pkg: String },
 
+    #[error("repository synchronization failed:\n{}", .failures.join("\n"))]
+    RepositorySync { failures: Vec<String> },
+
     #[error("checksum mismatch for {pkg}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         pkg: String,

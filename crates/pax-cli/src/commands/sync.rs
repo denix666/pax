@@ -34,8 +34,7 @@ pub fn run(db: &mut DatabaseHandle) -> Result<()> {
     );
 
     let multi = MultiProgress::new();
-    pax_exec::sync_databases(&targets, &sync_dir, db.config.parallel_downloads, &multi)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    pax_exec::sync_databases(&targets, &sync_dir, db.config.parallel_downloads, &multi)?;
 
     println!("\ndatabase synchronization complete.");
 

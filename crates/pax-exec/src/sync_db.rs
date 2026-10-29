@@ -1,12 +1,16 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
 use crate::error::{ExecError, Result};
+
+const MIRROR_TIMEOUT: Duration = Duration::from_secs(60);
+const REPOSITORY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct SyncTarget {
     pub repo_name: String,
@@ -18,6 +22,24 @@ pub fn sync_databases(
     sync_dir: &Path,
     parallel: u32,
     multi_progress: &MultiProgress,
+) -> Result<()> {
+    sync_databases_with_agent(
+        targets,
+        sync_dir,
+        parallel,
+        multi_progress,
+        &crate::http_agent(),
+        REPOSITORY_TIMEOUT,
+    )
+}
+
+fn sync_databases_with_agent(
+    targets: &[SyncTarget],
+    sync_dir: &Path,
+    parallel: u32,
+    multi_progress: &MultiProgress,
+    agent: &ureq::Agent,
+    repository_timeout: Duration,
 ) -> Result<()> {
     std::fs::create_dir_all(sync_dir)?;
 
@@ -32,29 +54,29 @@ pub fn sync_databases(
     let results: Vec<std::result::Result<(), String>> = pool.install(|| {
         targets
             .par_iter()
-            .map(|target| sync_one(target, sync_dir, multi_progress).map_err(|e| e.to_string()))
+            .map(|target| sync_one(target, sync_dir, multi_progress, agent, repository_timeout))
             .collect()
     });
 
-    let mut failed = 0;
-    for result in &results {
-        if let Err(e) = result {
-            eprintln!("warning: {e}");
-            failed += 1;
-        }
-    }
-
-    if failed == targets.len() {
-        return Err(ExecError::Download {
-            pkg: String::new(),
-            message: "all repository syncs failed".to_string(),
-        });
+    let failures: Vec<String> = results
+        .into_iter()
+        .filter_map(|result| result.err())
+        .collect();
+    if !failures.is_empty() {
+        return Err(ExecError::RepositorySync { failures });
     }
 
     Ok(())
 }
 
-fn sync_one(target: &SyncTarget, sync_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
+fn sync_one(
+    target: &SyncTarget,
+    sync_dir: &Path,
+    multi_progress: &MultiProgress,
+    agent: &ureq::Agent,
+    repository_timeout: Duration,
+) -> std::result::Result<(), String> {
+    let started = Instant::now();
     let style = ProgressStyle::with_template(
         " {spinner:.green} {msg:<20} [{bar:25.cyan/dim}] {bytes}/{total_bytes} {bytes_per_sec}",
     )
@@ -66,27 +88,47 @@ fn sync_one(target: &SyncTarget, sync_dir: &Path, multi_progress: &MultiProgress
     pb.set_message(format!("{}.db", target.repo_name));
 
     let filename = format!("{}.db", target.repo_name);
-    let mut last_error = String::new();
+    let mut last_error = "no mirrors configured".to_string();
 
     for mirror_url in &target.mirrors {
-        let url = format!("{mirror_url}/{filename}");
-        match try_download_db(&url, sync_dir, &filename, &pb) {
+        let remaining = repository_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            last_error = format!(
+                "repository timeout after {}s; last error: {last_error}",
+                repository_timeout.as_secs()
+            );
+            break;
+        }
+        let url = format!("{}/{filename}", mirror_url.trim_end_matches('/'));
+        pb.set_position(0);
+        pb.set_length(0);
+        match try_download_db(
+            &url,
+            sync_dir,
+            &filename,
+            &pb,
+            agent,
+            remaining.min(MIRROR_TIMEOUT),
+        ) {
             Ok(()) => {
                 pb.finish_with_message(format!("{} ok", target.repo_name));
                 return Ok(());
             }
             Err(e) => {
-                last_error = e.to_string();
-                pb.set_position(0);
-                continue;
+                last_error = format!("{url}: {e}");
+                let _ = multi_progress.println(format!(
+                    "warning: repository '{}': {last_error}; trying next mirror if available",
+                    target.repo_name
+                ));
             }
         }
     }
 
     pb.finish_with_message(format!("{} FAILED", target.repo_name));
-    Err(ExecError::AllMirrorsFailed {
-        pkg: format!("{}: {}", target.repo_name, last_error),
-    })
+    Err(format!(
+        "repository '{}' unavailable: {last_error}",
+        target.repo_name
+    ))
 }
 
 fn try_download_db(
@@ -94,11 +136,19 @@ fn try_download_db(
     sync_dir: &Path,
     filename: &str,
     pb: &ProgressBar,
+    agent: &ureq::Agent,
+    timeout: Duration,
 ) -> Result<()> {
-    let response = crate::http_agent().get(url).call().map_err(|e| ExecError::Download {
-        pkg: filename.to_string(),
-        message: e.to_string(),
-    })?;
+    let response = agent
+        .get(url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .map_err(|e| ExecError::Download {
+            pkg: filename.to_string(),
+            message: e.to_string(),
+        })?;
 
     if let Some(len) = response
         .headers()
@@ -136,4 +186,245 @@ fn try_download_db(
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    struct TestServer {
+        url: String,
+        stop: mpsc::Sender<()>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn new(response: &'static [u8], stall: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let (stop, stopped) = mpsc::channel();
+            let thread = thread::spawn(move || {
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = [0; 4096];
+                            stream.read(&mut request).unwrap();
+                            stream.write_all(response).unwrap();
+                            if stall {
+                                let _ = stopped.recv_timeout(Duration::from_secs(5));
+                            }
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stopped.recv_timeout(Duration::from_millis(10)).is_ok() {
+                                break;
+                            }
+                        }
+                        Err(e) => panic!("test server accept failed: {e}"),
+                    }
+                }
+            });
+            Self {
+                url,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    fn agent() -> ureq::Agent {
+        // Local fixtures must not use HTTP proxy settings from the environment.
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .build()
+            .new_agent()
+    }
+
+    fn target(name: &str, mirrors: Vec<String>) -> SyncTarget {
+        SyncTarget {
+            repo_name: name.to_string(),
+            mirrors,
+        }
+    }
+
+    #[test]
+    fn stalled_headers_and_body_timeout_preserving_database() {
+        for response in [
+            &b""[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial"[..],
+        ] {
+            let server = TestServer::new(response, true);
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("core.db");
+            std::fs::write(&dest, b"old database").unwrap();
+            let started = Instant::now();
+            let result = sync_databases_with_agent(
+                &[target("core", vec![server.url.clone()])],
+                dir.path(),
+                1,
+                &MultiProgress::new(),
+                &agent(),
+                Duration::from_millis(200),
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("repository 'core' unavailable"), "{error}");
+            assert!(error.to_lowercase().contains("timeout"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(std::fs::read(&dest).unwrap(), b"old database");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_mirror_falls_back_to_working_mirror() {
+        let failed = TestServer::new(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            false,
+        );
+        let working = TestServer::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndatabase",
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        sync_databases_with_agent(
+            &[target(
+                "core",
+                vec![failed.url.clone(), working.url.clone()],
+            )],
+            dir.path(),
+            1,
+            &MultiProgress::new(),
+            &agent(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("core.db")).unwrap(),
+            b"database"
+        );
+    }
+
+    #[test]
+    fn stalled_mirror_falls_back_after_response_timeout() {
+        let stalled = TestServer::new(b"", true);
+        let working = TestServer::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndatabase",
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .timeout_recv_response(Some(Duration::from_millis(100)))
+            .build()
+            .new_agent();
+        sync_databases_with_agent(
+            &[target(
+                "core",
+                vec![stalled.url.clone(), working.url.clone()],
+            )],
+            dir.path(),
+            1,
+            &MultiProgress::new(),
+            &agent,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("core.db")).unwrap(),
+            b"database"
+        );
+    }
+
+    #[test]
+    fn partial_failure_returns_error_and_updates_other_repository() {
+        let stalled = TestServer::new(b"", true);
+        let working = TestServer::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndatabase",
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let error = sync_databases_with_agent(
+            &[
+                target("unavailable", vec![stalled.url.clone()]),
+                target("working", vec![working.url.clone()]),
+            ],
+            dir.path(),
+            2,
+            &MultiProgress::new(),
+            &agent(),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repository 'unavailable' unavailable")
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("working.db")).unwrap(),
+            b"database"
+        );
+        assert!(!dir.path().join("unavailable.db").exists());
+    }
+
+    #[test]
+    fn repository_budget_stops_mirror_iteration() {
+        let stalled = TestServer::new(b"", true);
+        let working = TestServer::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndatabase",
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let error = sync_databases_with_agent(
+            &[target(
+                "core",
+                vec![stalled.url.clone(), working.url.clone()],
+            )],
+            dir.path(),
+            1,
+            &MultiProgress::new(),
+            &agent(),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("repository timeout"), "{error}");
+        assert!(!dir.path().join("core.db").exists());
+    }
+
+    #[test]
+    fn missing_mirrors_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = sync_databases(
+            &[target("core", vec![])],
+            dir.path(),
+            1,
+            &MultiProgress::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repository 'core' unavailable: no mirrors configured")
+        );
+    }
+
+    #[test]
+    fn no_repositories_is_successful() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_databases(&[], dir.path(), 1, &MultiProgress::new()).unwrap();
+    }
 }

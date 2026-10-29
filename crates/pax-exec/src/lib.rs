@@ -24,6 +24,10 @@ pub use sync_db::{sync_databases, SyncTarget};
 pub(crate) fn http_agent() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     ureq::Agent::config_builder()
+        .timeout_resolve(Some(std::time::Duration::from_secs(10)))
+        .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .timeout_send_request(Some(std::time::Duration::from_secs(15)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(15)))
         .tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls)
