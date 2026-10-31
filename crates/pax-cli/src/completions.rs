@@ -131,7 +131,7 @@ _pax() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local subcmds="search info query files owner install remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean remove-lock help"
+    local subcmds="search info query files owner install downgrade remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean remove-lock help"
 
     case "$prev" in
         --completions)
@@ -153,7 +153,7 @@ _pax() {
     local subcmd=""
     for ((i=1; i < COMP_CWORD; i++)); do
         case "${COMP_WORDS[i]}" in
-            search|s|info|i|query|q|files|f|owner|o|install|S|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|check|check-files|sync|y|upgrade|u|clean|c|remove-lock)
+            search|s|info|i|query|q|files|f|owner|o|install|S|downgrade|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|check|check-files|sync|y|upgrade|u|clean|c|remove-lock)
                 subcmd="${COMP_WORDS[i]}"
                 break
                 ;;
@@ -175,6 +175,39 @@ _pax() {
                 COMPREPLY=($(compgen -W "--dry-run --download-only -w --noconfirm --needed --reinstall --asdeps --help" -- "$cur"))
             else
                 _pax_complete_packages sync-desc sync
+            fi
+            ;;
+        downgrade)
+            local value_prefix=""
+            if [[ "$cur" == --*=* ]]; then
+                prev="${cur%%=*}"
+                value_prefix="$prev="
+                cur="${cur#*=}"
+            elif [[ "$cur" == "=" ]]; then
+                cur=""
+            elif [[ "$prev" == "=" && COMP_CWORD -ge 2 ]]; then
+                prev="${COMP_WORDS[COMP_CWORD-2]}"
+            fi
+            case "$prev" in
+                --ignore)
+                    COMPREPLY=($(compgen -P "$value_prefix" -W "prompt always never" -- "$cur"))
+                    return 0
+                    ;;
+                --cache-dir)
+                    compopt -o filenames
+                    COMPREPLY=($(compgen -P "$value_prefix" -d -- "$cur"))
+                    return 0
+                    ;;
+                --ala-url)
+                    return 0
+                    ;;
+            esac
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--cached-only --ala-only --with-ala --prefer-cache --ala-url --cache-dir --list --latest --noconfirm --ignore --help" -- "$cur"))
+            elif [[ "$cur" != *=* && "$value_prefix" == "" &&
+                "${COMP_WORDS[COMP_CWORD]}" != "=" &&
+                "${COMP_WORDS[COMP_CWORD-1]}" != "=" ]]; then
+                COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
             fi
             ;;
         remove|R)
@@ -306,6 +339,7 @@ _pax() {
         'files:List files owned by a package'
         'owner:Find which package owns a file'
         'install:Install packages'
+        'downgrade:Downgrade installed packages'
         'remove:Remove packages'
         'local-install:Install local package files'
         'aur-install:Install packages from AUR'
@@ -345,6 +379,21 @@ _pax() {
                         '--reinstall[Reinstall packages]' \
                         '--asdeps[Install as dependencies]' \
                         '*:package:_pax_sync_packages'
+                    ;;
+                downgrade)
+                    _arguments \
+                        '--cached-only[Use only cached packages]' \
+                        '--ala-only[Use only the Arch Linux Archive]' \
+                        '--with-ala[Include the Arch Linux Archive]' \
+                        '--prefer-cache[Prefer cached packages]' \
+                        '--ala-url=[Arch Linux Archive base URL]:url:_urls' \
+                        '*--cache-dir=[Package cache directory]:directory:_directories' \
+                        '--list[List available versions]' \
+                        '--latest[Select the latest available version]' \
+                        '--noconfirm[Skip confirmation]' \
+                        '--ignore=[Ignore policy]:policy:(prompt always never)' \
+                        '--help[Show help]' \
+                        '*:package or package=version:_pax_installed_packages'
                     ;;
                 remove|R)
                     _arguments \
@@ -419,7 +468,7 @@ _pax "$@"
 "#;
 
 const FISH: &str = r#"
-set -l subcmds search info query files owner install remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean remove-lock
+set -l subcmds search info query files owner install downgrade remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean remove-lock
 
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l help -d "Show help"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l version -d "Show version"
@@ -434,6 +483,7 @@ complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a query -d "Query
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a files -d "List files owned by a package"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a owner -d "Find which package owns a file"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a install -d "Install packages"
+complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a downgrade -d "Downgrade installed packages"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a remove -d "Remove packages"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a aur-install -d "Install packages from AUR"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a aur-search -d "Search AUR for packages"
@@ -453,6 +503,31 @@ complete -c pax -n "__fish_seen_subcommand_from install" -l reinstall -d "Reinst
 complete -c pax -n "__fish_seen_subcommand_from install" -l asdeps -d "Install as dependencies"
 complete -c pax -n "__fish_seen_subcommand_from install" -s w -l download-only -d "Download without installing"
 complete -c pax -n "__fish_seen_subcommand_from install" -a "(pax --pkg-list sync-desc 2>/dev/null | string replace \t '\t')" -d ""
+
+function __pax_downgrade_packages
+    set -l tokens (commandline -opc)
+    if contains -- $tokens[-1] --ala-url --cache-dir --ignore
+        return
+    end
+    if string match -q '*=*' -- (commandline -ct)
+        return
+    end
+    pax --pkg-list local 2>/dev/null
+end
+
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -f
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l cached-only -d "Use only cached packages"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l ala-only -d "Use only the Arch Linux Archive"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l with-ala -d "Include the Arch Linux Archive"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l prefer-cache -d "Prefer cached packages"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l ala-url -x -d "Arch Linux Archive base URL"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l cache-dir -x -a "(__fish_complete_directories)" -d "Package cache directory"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l list -d "List available versions"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l latest -d "Select the latest available version"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l ignore -x -a "prompt always never" -d "Ignore policy"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -l help -d "Show help"
+complete -c pax -n "__fish_seen_subcommand_from downgrade" -a "(__pax_downgrade_packages)" -d "Installed package"
 
 complete -c pax -n "__fish_seen_subcommand_from remove" -l noconfirm -d "Skip confirmation"
 complete -c pax -n "__fish_seen_subcommand_from remove" -s s -l recursive -d "Remove unneeded deps"

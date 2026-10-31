@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 
 use owo_colors::OwoColorize;
 
@@ -155,7 +156,11 @@ pub fn print_sync_info(pkg: &SyncPackage, installed_version: Option<&Version>) {
         format_timestamp(pkg.info.build_date)
     );
     match installed_version {
-        Some(ver) => println!("{:<w$}: {}", "Install Status".bold(), format!("installed ({ver})").green()),
+        Some(ver) => println!(
+            "{:<w$}: {}",
+            "Install Status".bold(),
+            format!("installed ({ver})").green()
+        ),
         None => println!("{:<w$}: {}", "Install Status".bold(), "not installed".red()),
     }
     if let Some(ref md5) = pkg.md5sum {
@@ -249,11 +254,7 @@ pub fn print_local_info(pkg: &LocalPackage) {
         "Install Date".bold(),
         format_timestamp(pkg.install_date)
     );
-    println!(
-        "{:<w$}: {}",
-        "Installed Size".bold(),
-        format_size(pkg.size)
-    );
+    println!("{:<w$}: {}", "Installed Size".bold(), format_size(pkg.size));
     println!("{:<w$}: {}", "Packager".bold(), pkg.info.packager);
     println!(
         "{:<w$}: {}",
@@ -296,23 +297,7 @@ pub fn print_transaction(tx: &Transaction, sync_sizes: &HashMap<String, (u64, u6
         }
     }
 
-    if !tx.upgrades.is_empty() {
-        println!("\n{}", "Packages to upgrade:".bold());
-        for upg in &tx.upgrades {
-            let repo = sync_sizes
-                .get(&upg.name)
-                .map(|(_, _, r)| r.as_str())
-                .unwrap_or("unknown");
-            println!(
-                "  {}/{} {} -> {} {}",
-                repo.purple(),
-                upg.name.bold(),
-                upg.old_version.red(),
-                upg.new_version.green(),
-                format_size(upg.download_size),
-            );
-        }
-    }
+    print!("{}", format_version_changes(tx, sync_sizes));
 
     if !tx.removals.is_empty() {
         println!("\n{}", "Packages to remove:".bold());
@@ -340,6 +325,44 @@ pub fn print_transaction(tx: &Transaction, sync_sizes: &HashMap<String, (u64, u6
         format_size(tx.total_download_size).bold(),
         format_size(tx.total_installed_size).bold()
     );
+}
+
+fn format_version_changes(
+    tx: &Transaction,
+    sync_sizes: &HashMap<String, (u64, u64, String)>,
+) -> String {
+    let mut output = String::new();
+    for (downgrade, heading) in [
+        (false, "Packages to upgrade:"),
+        (true, "Packages to downgrade:"),
+    ] {
+        let mut actions = tx
+            .upgrades
+            .iter()
+            .filter(|action| (action.new_version < action.old_version) == downgrade)
+            .peekable();
+        if actions.peek().is_none() {
+            continue;
+        }
+        writeln!(output, "\n{}", heading.bold()).unwrap();
+        for action in actions {
+            let repo = sync_sizes
+                .get(&action.name)
+                .map(|(_, _, repo)| repo.as_str())
+                .unwrap_or("unknown");
+            writeln!(
+                output,
+                "  {}/{} {} -> {} {}",
+                repo.purple(),
+                action.name.bold(),
+                action.old_version.red(),
+                action.new_version.green(),
+                format_size(action.download_size),
+            )
+            .unwrap();
+        }
+    }
+    output
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -404,4 +427,70 @@ fn format_timestamp(ts: i64) -> String {
 
 fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pax_resolver::UpgradeAction;
+
+    fn transaction(changes: &[(&str, &str, &str)]) -> Transaction {
+        Transaction {
+            installs: Vec::new(),
+            upgrades: changes
+                .iter()
+                .map(|(name, old, new)| UpgradeAction {
+                    name: (*name).into(),
+                    old_version: Version::parse(old).unwrap(),
+                    new_version: Version::parse(new).unwrap(),
+                    repository: "local".into(),
+                    download_size: 0,
+                    installed_size: 0,
+                })
+                .collect(),
+            removals: Vec::new(),
+            package_order: changes.iter().map(|(name, _, _)| (*name).into()).collect(),
+            total_download_size: 0,
+            total_installed_size: 0,
+        }
+    }
+
+    #[test]
+    fn downgrade_only_output_does_not_claim_upgrade() {
+        let tx = transaction(&[("older-app", "2-1", "1-1")]);
+        let output = format_version_changes(&tx, &HashMap::new());
+        assert!(output.contains("Packages to downgrade:"));
+        assert!(!output.contains("Packages to upgrade:"));
+        assert!(output.contains("older-app"));
+        assert_eq!(output.matches(" -> ").count(), 1);
+    }
+
+    #[test]
+    fn mixed_output_groups_downgrades_and_preserves_upgrades_and_reinstalls() {
+        let tx = transaction(&[
+            ("older-app", "2-1", "1-1"),
+            ("newer-app", "1-1", "2-1"),
+            ("same-app", "1-1", "1-1"),
+        ]);
+        let output = format_version_changes(&tx, &HashMap::new());
+        let (upgrades, downgrades) = output.split_once("Packages to downgrade:").unwrap();
+        assert!(upgrades.contains("Packages to upgrade:"));
+        assert!(upgrades.contains("newer-app"));
+        assert!(upgrades.contains("same-app"));
+        assert!(!upgrades.contains("older-app"));
+        assert!(downgrades.contains("older-app"));
+        assert!(!downgrades.contains("newer-app"));
+        assert!(!downgrades.contains("same-app"));
+        assert_eq!(output.matches(" -> ").count(), 3);
+    }
+
+    #[test]
+    fn upgrade_only_and_empty_output_have_no_downgrade_heading() {
+        for changes in [vec![], vec![("app", "1-1", "2-1")]] {
+            let tx = transaction(&changes);
+            let output = format_version_changes(&tx, &HashMap::new());
+            assert!(!output.contains("Packages to downgrade:"));
+            assert_eq!(output.contains("Packages to upgrade:"), !changes.is_empty());
+        }
+    }
 }

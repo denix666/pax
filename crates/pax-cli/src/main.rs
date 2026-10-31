@@ -53,6 +53,7 @@ fn main() -> Result<()> {
     }
 
     match command {
+        Command::Downgrade(args) => commands::downgrade::run(&mut db, &cli.config, args),
         Command::Search { query } => commands::search::run(&mut db, query),
         Command::Info { package, local } => commands::info::run(&mut db, package, *local),
         Command::Query {

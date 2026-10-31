@@ -140,6 +140,8 @@ pub mod aur_search;
 pub mod aur_upgrade;
 pub mod check;
 pub mod clean;
+pub mod downgrade;
+pub mod downgrade_ignore;
 pub mod files;
 pub mod info;
 pub mod install;

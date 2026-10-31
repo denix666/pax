@@ -1,9 +1,57 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum IgnoreMode {
+    Prompt,
+    Always,
+    Never,
+}
+
+#[derive(Args)]
+pub struct DowngradeArgs {
+    /// Installed package names, optionally followed by =VERSION
+    #[arg(required = true)]
+    pub packages: Vec<String>,
+    /// Search only local caches
+    #[arg(long, conflicts_with_all = ["ala_only", "with_ala", "ala_url"])]
+    pub cached_only: bool,
+    /// Search only Arch Linux Archive
+    #[arg(long, conflicts_with_all = ["with_ala", "prefer_cache"])]
+    pub ala_only: bool,
+    /// Include ALA even on Manjaro (whose default is cache only)
+    #[arg(long)]
+    pub with_ala: bool,
+    /// Archive server URL; specifying it also enables archive search
+    #[arg(long)]
+    pub ala_url: Option<String>,
+    /// Query ALA only if the cache has no matching older version
+    #[arg(long)]
+    pub prefer_cache: bool,
+    /// Additional package cache directory (repeatable)
+    #[arg(long = "cache-dir")]
+    pub cache_dirs: Vec<PathBuf>,
+    /// List older versions without installing
+    #[arg(long)]
+    pub list: bool,
+    /// Select the newest matching version older than the installed version
+    #[arg(long)]
+    pub latest: bool,
+    /// Skip transaction confirmation; requires an exact version or --latest
+    #[arg(long)]
+    pub noconfirm: bool,
+    /// Add successfully downgraded packages to IgnorePkg
+    #[arg(long, value_enum, default_value = "prompt")]
+    pub ignore: IgnoreMode,
+}
 
 #[derive(Parser)]
-#[command(name = "pax", version, about = "A modern and fast package manager for Arch-based systems")]
+#[command(
+    name = "pax",
+    version,
+    about = "A modern and fast package manager for Arch-based systems"
+)]
 pub struct Cli {
     /// Path to pacman.conf
     #[arg(long, default_value = "/etc/pacman.conf")]
@@ -31,6 +79,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Downgrade installed packages using the cache or Arch Linux Archive
+    Downgrade(DowngradeArgs),
     /// Search sync databases for packages
     #[command(alias = "s")]
     Search {

@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -33,6 +34,37 @@ pub fn download_packages(
     multi_progress: &MultiProgress,
     gpg_dir: &Path,
 ) -> Result<Vec<DownloadedPackage>> {
+    download_packages_impl(targets, cache_dir, parallel, multi_progress, gpg_dir, None)
+}
+
+/// Download packages with an end-to-end timeout for each archive request,
+/// including reading its response body. Each mirror attempt gets its own timeout.
+pub fn download_packages_with_timeout(
+    targets: &[DownloadTarget],
+    cache_dir: &Path,
+    parallel: u32,
+    multi_progress: &MultiProgress,
+    gpg_dir: &Path,
+    timeout: Duration,
+) -> Result<Vec<DownloadedPackage>> {
+    download_packages_impl(
+        targets,
+        cache_dir,
+        parallel,
+        multi_progress,
+        gpg_dir,
+        Some(timeout),
+    )
+}
+
+fn download_packages_impl(
+    targets: &[DownloadTarget],
+    cache_dir: &Path,
+    parallel: u32,
+    multi_progress: &MultiProgress,
+    gpg_dir: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<DownloadedPackage>> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(parallel.max(1) as usize)
         .build()
@@ -45,7 +77,7 @@ pub fn download_packages(
     let results: Vec<Result<DownloadedPackage>> = pool.install(|| {
         targets
             .par_iter()
-            .map(|target| download_one(target, cache_dir, multi_progress, &gpg_dir))
+            .map(|target| download_one(target, cache_dir, multi_progress, &gpg_dir, timeout))
             .collect()
     });
 
@@ -83,6 +115,7 @@ fn download_one(
     cache_dir: &Path,
     multi_progress: &MultiProgress,
     gpg_dir: &Path,
+    timeout: Option<Duration>,
 ) -> Result<DownloadedPackage> {
     download_one_with_agent(
         target,
@@ -90,6 +123,7 @@ fn download_one(
         multi_progress,
         gpg_dir,
         &crate::http_agent(),
+        timeout,
     )
 }
 
@@ -99,6 +133,7 @@ fn download_one_with_agent(
     multi_progress: &MultiProgress,
     gpg_dir: &Path,
     agent: &ureq::Agent,
+    timeout: Option<Duration>,
 ) -> Result<DownloadedPackage> {
     let cached = cache_dir.join(&target.filename);
     let cached_error = if cached.exists() {
@@ -134,7 +169,7 @@ fn download_one_with_agent(
 
     for mirror_url in &target.mirrors {
         let url = format!("{mirror_url}/{}", target.filename);
-        match try_download(&url, cache_dir, target, &pb, gpg_dir, agent) {
+        match try_download(&url, cache_dir, target, &pb, gpg_dir, agent, timeout) {
             Ok(path) => {
                 pb.finish_with_message(format!("{} done", target.name));
                 return Ok(DownloadedPackage {
@@ -167,8 +202,13 @@ fn try_download(
     pb: &ProgressBar,
     gpg_dir: &Path,
     agent: &ureq::Agent,
+    timeout: Option<Duration>,
 ) -> Result<PathBuf> {
-    let response = agent.get(url).call().map_err(|e| ExecError::Download {
+    let mut request = agent.get(url);
+    if let Some(timeout) = timeout {
+        request = request.config().timeout_global(Some(timeout)).build();
+    }
+    let response = request.call().map_err(|e| ExecError::Download {
         pkg: target.name.clone(),
         message: e.to_string(),
     })?;
@@ -276,6 +316,64 @@ mod tests {
     }
 
     #[test]
+    fn archive_timeout_includes_stalled_body() {
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut target = target(SigLevel::Never);
+        target.mirrors = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let server = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(started.elapsed() < Duration::from_secs(5));
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() <= 4096);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\na")
+                .unwrap();
+            // Keep the incomplete body open until the client times out and disconnects.
+            let _ = stream.read(&mut [0]);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let gpg = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let result = download_packages_with_timeout(
+            &[target],
+            dir.path(),
+            1,
+            &MultiProgress::new(),
+            gpg.path(),
+            Duration::from_millis(100),
+        );
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        let error = result.err().expect("stalled archive body must time out");
+        assert!(matches!(error, ExecError::AllMirrorsFailed { .. }));
+        assert!(error.to_string().contains("timeout"), "{error}");
+        assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn fresh_downloads_verify_before_cache_publication() {
         use std::net::TcpListener;
         use std::time::Duration;
@@ -345,6 +443,7 @@ mod tests {
                 &ProgressBar::hidden(),
                 gpg.path(),
                 &agent,
+                None,
             );
             server.join().unwrap();
             assert_eq!(result.is_ok(), succeeds, "{result:?}");
@@ -493,6 +592,7 @@ mod tests {
                 &MultiProgress::new(),
                 gpg.path(),
                 &agent,
+                None,
             );
             server.join().unwrap();
             let package = result.unwrap_or_else(|error| panic!("{failure}: {error}"));
@@ -511,7 +611,8 @@ mod tests {
                     dir.path(),
                     &MultiProgress::new(),
                     gpg.path(),
-                    &agent
+                    &agent,
+                    None,
                 )
                 .is_ok()
             );

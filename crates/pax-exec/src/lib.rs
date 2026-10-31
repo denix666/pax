@@ -1,4 +1,5 @@
 pub mod download;
+pub mod downgrade;
 pub mod error;
 pub mod execute;
 pub mod extract;
