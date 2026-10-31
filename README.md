@@ -52,6 +52,7 @@ Most commands that modify the system (install, remove, upgrade, sync) will autom
 | `install` | `S` | Install packages (resolves dependencies) |
 | `remove` | `R` | Remove packages |
 | `upgrade` | `u` | Upgrade installed packages |
+| `downgrade` | — | Select and install older versions from local caches or Arch Linux Archive |
 | `search` | `s` | Search sync databases for packages |
 | `info` | `i` | Show detailed package information |
 | `query` | `q` | Query installed packages |
@@ -151,6 +152,62 @@ pax check-files bash glibc
 pax remove-lock
 ```
 
+### Downgrading packages
+
+```bash
+# Choose an older version from a numbered table
+pax downgrade mc
+
+# Show available older versions without changing packages
+pax downgrade mc --list
+
+# Install an exact version or the newest available older version
+pax downgrade 'mc=4.8.32-1'
+pax downgrade mc --latest
+
+# Explicitly include Arch Linux Archive on Manjaro
+pax downgrade mc --with-ala
+pax downgrade mc --ala-only
+
+# Use only local archives, with an optional additional cache directory
+pax downgrade mc --cached-only --cache-dir /path/to/cache
+
+# Downgrade related packages together in one transaction
+pax downgrade 'foo=1.0-1' 'foo-libs=1.0-1'
+
+# Unattended selection and pinning
+pax downgrade 'mc=4.8.32-1' --noconfirm --ignore=always
+```
+
+On Manjaro, the default source is the local cache. `--with-ala`, `--ala-only`, or an explicit
+`--ala-url` enables Arch Linux Archive access. On other distributions both sources are
+searched by default. ALA contains Arch packages, whose compatibility with Manjaro is not
+guaranteed. Packages unavailable in ALA can still be selected from the local cache.
+
+All configured `CacheDir` locations and their immediate subdirectories are searched.
+`--prefer-cache` skips ALA when a matching older version exists locally. Duplicate versions
+are combined and verified local archives are preferred. `--ala-url` accepts the archive
+server root, normally `https://archive.archlinux.org`. Remote metadata is read with bounded
+concurrency and a shared 60-second deadline so epoch values are included in version ordering.
+Each selected ALA package download has a 300-second total timeout.
+
+Only installed packages and strictly older versions are accepted. `--noconfirm` requires
+an exact version or `--latest`; it never guesses an interactive selection. Selected packages
+are checked and installed together, with normal dependency checks, backup handling, hooks
+and scriptlets. Incompatible dependencies stop the transaction; additional dependency
+versions are not selected automatically.
+
+After success, `--ignore=prompt` (the default) asks whether to add each downgraded package
+to `IgnorePkg`. `--ignore=always` adds them without prompting; `--ignore=never` leaves the
+configuration unchanged. With `--noconfirm` or nonterminal input, `prompt` leaves it unchanged
+and prints a reminder. Pins are written atomically into the selected configuration, before
+Includes, preserving existing comments and included files. Normal upgrades can replace a
+downgraded package unless it is pinned.
+
+ALA downloads use the global package signature policy, including when reused from their
+separate `pax-ala` cache. Other local archives use `LocalFileSigLevel`. Downloaded archive
+identity and authoritative metadata versions are checked again under the database lock.
+
 ### Repository synchronization
 
 Repository requests limit DNS resolution and connection establishment to 10 seconds each,
@@ -162,6 +219,32 @@ Failed mirrors are reported and the next mirror is tried while time remains.
 If any repository cannot be synchronized, pax reports its name and the failure reason and
 exits with a nonzero status. Other repositories can still finish updating. A failed download
 preserves the previous database, if one exists.
+
+Database signatures are checked according to `SigLevel` before a downloaded database
+replaces the old one. Missing or unreadable configured databases are reported when loading
+repositories, rather than silently excluding those repositories.
+
+### Transaction behavior
+
+Package changes hold the database lock before reading the installed state and planning the
+transaction. Waiting for an existing lock is limited to 30 seconds. Dependency checks cover
+the resulting installed state, including versioned providers and reverse dependencies.
+Repository order takes precedence over newer versions in later repositories.
+
+Replacement removals happen before installation, and incoming installs and upgrades retain
+dependency order. Incoming archive identities and paths are checked before transaction hooks
+or package changes. Modified backup files retain the incoming package's checksum as their
+baseline, allowing subsequent upgrades to preserve local edits correctly.
+
+Hooks support `AbortOnFail`, `Depends`, `NeedsTargets`, ordered target exclusions and glob
+patterns. Hooks and package scriptlets run inside the configured root, with `/` as their
+working directory. Hook output is captured and displayed when the command finishes.
+
+Package signature policy applies to cached downloads as well as fresh ones. Invalid cache
+entries can be replaced by a verified download. `Optional` allows a missing signature but
+rejects an invalid one. `TrustedOnly` requires a trusted signer; keys are not automatically
+imported from public keyservers. Local archives follow `LocalFileSigLevel`. Configure that
+policy explicitly when installing unsigned local builds.
 
 ### Global Options
 
@@ -219,7 +302,9 @@ pax reads and respects the following pacman.conf directives:
 | `IgnoreGroup` | Package groups to skip during upgrades |
 | `HoldPkg` | Packages that require extra confirmation before removal |
 | `CheckSpace` | Verify sufficient disk space before installing |
-| `SigLevel` | PGP signature verification level (global and per-repo) |
+| `SigLevel` | Package/database PGP signature requirements and trust (global and per-repo) |
+| `LocalFileSigLevel` | Signature policy for local archives, inheriting unspecified global settings |
+| `HookDir` | Additional hook directories; later entries override earlier entries |
 | `ParallelDownloads` | Number of concurrent downloads |
 | `CacheDir` | Package cache directory |
 
@@ -257,6 +342,8 @@ Completions include:
 - Subcommands and flags
 - Dynamic package name suggestions from sync databases, local database, and AUR
 - `[installed]` markers next to already installed packages
+- Installed package names for `downgrade`, with completion for `--ignore` values and cache directories
+- Package suggestions respect `--config`, `--dbpath`, and `--root`
 
 ## Architecture
 
@@ -273,6 +360,7 @@ crates/
 ```
 
 All core logic lives in library crates. The CLI is a thin wrapper, making the architecture suitable for alternative frontends.
+
 
 ## Contributing
 

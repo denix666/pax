@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(ref source) = cli.pkg_list {
-        return completions::list_packages(&cli.config, source);
+        return completions::list_packages(&cli.config, source, cli.dbpath.as_deref(), cli.root.as_deref());
     }
 
     let Some(ref command) = cli.command else {

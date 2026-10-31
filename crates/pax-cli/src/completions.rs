@@ -14,8 +14,19 @@ pub fn generate(shell: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn list_packages(config_path: &Path, source: &str) -> Result<()> {
-    let config = PacmanConfig::load(config_path)?;
+pub fn list_packages(
+    config_path: &Path,
+    source: &str,
+    dbpath: Option<&Path>,
+    root: Option<&Path>,
+) -> Result<()> {
+    let mut config = PacmanConfig::load(config_path)?;
+    if let Some(dbpath) = dbpath {
+        config.db_path = dbpath.to_path_buf();
+    }
+    if let Some(root) = root {
+        config.root_dir = root.to_path_buf();
+    }
     let mut db = DatabaseHandle::new(config);
 
     match source {
@@ -99,18 +110,24 @@ pub fn list_packages(config_path: &Path, source: &str) -> Result<()> {
                 }
             }
         }
-        _ => bail!("unsupported source: {source} (use sync, local, all, sync-desc, all-desc, aur:<prefix>)"),
+        _ => bail!(
+            "unsupported source: {source} (use sync, local, all, sync-desc, all-desc, aur:<prefix>)"
+        ),
     }
     Ok(())
 }
 
 const BASH: &str = r#"
+_pax_pkg_list() {
+    pax "${pax_global_args[@]}" --pkg-list "$1" 2>/dev/null
+}
+
 _pax_complete_packages() {
     local desc_source="$1"
     local plain_source="$2"
     if [[ -n "$_FZF_COMPLETION_SEP" ]]; then
         local sel
-        sel=$(pax --pkg-list "$desc_source" 2>/dev/null | \
+        sel=$(_pax_pkg_list "$desc_source" 2>/dev/null | \
             awk -F'\t' '{
                 if ($2) printf "%s\t\033[32m%s\033[0m\n", $1, $2
                 else print $1
@@ -121,40 +138,67 @@ _pax_complete_packages() {
             cut -f1)
         [[ -n "$sel" ]] && COMPREPLY=("$sel")
     else
-        COMPREPLY=($(compgen -W "$(pax --pkg-list "$plain_source" 2>/dev/null)" -- "$cur"))
+        COMPREPLY=($(compgen -W "$(_pax_pkg_list "$plain_source" 2>/dev/null)" -- "$cur"))
     fi
 }
 
 _pax() {
-    local cur prev
+    local cur prev i cword
+    local -a words=() pax_global_args=()
     COMPREPLY=()
-    cur="${COMP_WORDS[COMP_CWORD]}"
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    # Reassemble words split at '=' by Bash's default COMP_WORDBREAKS.
+    for ((i=0; i <= COMP_CWORD; i++)); do
+        if (( ${#words[@]} > 0 )) &&
+            [[ "${COMP_WORDS[i]}" == "=" || "${words[${#words[@]}-1]}" == *= ]]; then
+            words[${#words[@]}-1]+="${COMP_WORDS[i]}"
+        else
+            words+=("${COMP_WORDS[i]}")
+        fi
+    done
+    cword=$((${#words[@]} - 1))
+    cur="${words[cword]}"
+    prev="${words[cword-1]}"
 
     local subcmds="search info query files owner install downgrade remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean remove-lock help"
 
+    local value_prefix=""
+    if [[ "$cur" == --*=* ]]; then
+        prev="${cur%%=*}"
+        [[ "$COMP_WORDBREAKS" != *=* ]] && value_prefix="$prev="
+        cur="${cur#*=}"
+    fi
     case "$prev" in
         --completions)
-            COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+            COMPREPLY=($(compgen -P "$value_prefix" -W "bash zsh fish" -- "$cur"))
             return 0
             ;;
         --config)
             compopt -o filenames
-            COMPREPLY=($(compgen -f -- "$cur"))
+            COMPREPLY=($(compgen -P "$value_prefix" -f -- "$cur"))
             return 0
             ;;
         --dbpath|--root)
             compopt -o filenames
-            COMPREPLY=($(compgen -d -- "$cur"))
+            COMPREPLY=($(compgen -P "$value_prefix" -d -- "$cur"))
             return 0
             ;;
     esac
 
     local subcmd=""
-    for ((i=1; i < COMP_CWORD; i++)); do
-        case "${COMP_WORDS[i]}" in
+    for ((i=1; i < cword; i++)); do
+        case "${words[i]}" in
+            --config|--dbpath|--root)
+                pax_global_args+=("${words[i]}" "${words[i+1]}")
+                ((i++))
+                ;;
+            --config=*|--dbpath=*|--root=*)
+                pax_global_args+=("${words[i]}")
+                ;;
+            --completions|--pkg-list)
+                ((i++))
+                ;;
             search|s|info|i|query|q|files|f|owner|o|install|S|downgrade|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|check|check-files|sync|y|upgrade|u|clean|c|remove-lock)
-                subcmd="${COMP_WORDS[i]}"
+                subcmd="${words[i]}"
                 break
                 ;;
         esac
@@ -178,16 +222,6 @@ _pax() {
             fi
             ;;
         downgrade)
-            local value_prefix=""
-            if [[ "$cur" == --*=* ]]; then
-                prev="${cur%%=*}"
-                value_prefix="$prev="
-                cur="${cur#*=}"
-            elif [[ "$cur" == "=" ]]; then
-                cur=""
-            elif [[ "$prev" == "=" && COMP_CWORD -ge 2 ]]; then
-                prev="${COMP_WORDS[COMP_CWORD-2]}"
-            fi
             case "$prev" in
                 --ignore)
                     COMPREPLY=($(compgen -P "$value_prefix" -W "prompt always never" -- "$cur"))
@@ -204,17 +238,15 @@ _pax() {
             esac
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=($(compgen -W "--cached-only --ala-only --with-ala --prefer-cache --ala-url --cache-dir --list --latest --noconfirm --ignore --help" -- "$cur"))
-            elif [[ "$cur" != *=* && "$value_prefix" == "" &&
-                "${COMP_WORDS[COMP_CWORD]}" != "=" &&
-                "${COMP_WORDS[COMP_CWORD-1]}" != "=" ]]; then
-                COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
+            elif [[ "${words[cword]}" != *=* ]]; then
+                COMPREPLY=($(compgen -W "$(_pax_pkg_list local 2>/dev/null)" -- "$cur"))
             fi
             ;;
         remove|R)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=($(compgen -W "--noconfirm --recursive -s --help" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
+                COMPREPLY=($(compgen -W "$(_pax_pkg_list local 2>/dev/null)" -- "$cur"))
             fi
             ;;
         search|s)
@@ -235,7 +267,7 @@ _pax() {
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=($(compgen -W "--help" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
+                COMPREPLY=($(compgen -W "$(_pax_pkg_list local 2>/dev/null)" -- "$cur"))
             fi
             ;;
         owner|o)
@@ -244,7 +276,7 @@ _pax() {
             ;;
         aur-install)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "--skip-review --noconfirm --reinstall --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "--skip-review --noconfirm --reinstall --allow-root --help" -- "$cur"))
             elif [[ ${#cur} -ge 2 ]]; then
                 _pax_complete_packages "aur:$cur" "aur:$cur"
             fi
@@ -270,10 +302,10 @@ _pax() {
             fi
             ;;
         check)
-            COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
+            COMPREPLY=($(compgen -W "$(_pax_pkg_list local 2>/dev/null)" -- "$cur"))
             ;;
         check-files)
-            COMPREPLY=($(compgen -W "$(pax --pkg-list local 2>/dev/null)" -- "$cur"))
+            COMPREPLY=($(compgen -W "$(_pax_pkg_list local 2>/dev/null)" -- "$cur"))
             ;;
         upgrade|u)
             if [[ "$cur" == -* ]]; then
@@ -282,11 +314,20 @@ _pax() {
             ;;
     esac
 }
-complete -o bashdefault -F _pax pax
+complete -F _pax pax
 "#;
 
 const ZSH: &str = r#"
 #compdef pax
+
+_pax_pkg_list() {
+    pax "${pax_global_args[@]}" --pkg-list "$1" 2>/dev/null
+}
+
+_pax_downgrade_packages() {
+    [[ "$IPREFIX$PREFIX$SUFFIX$ISUFFIX" == *=* || "${words[CURRENT]}" == *=* ]] && return 0
+    _pax_installed_packages
+}
 
 _pax_sync_packages() {
     local -a pkgs
@@ -298,13 +339,13 @@ _pax_sync_packages() {
         else
             pkgs+=("$name")
         fi
-    done < <(pax --pkg-list sync-desc 2>/dev/null)
+    done < <(_pax_pkg_list sync-desc 2>/dev/null)
     _describe 'package' pkgs
 }
 
 _pax_installed_packages() {
     local -a pkgs
-    pkgs=(${(f)"$(pax --pkg-list local 2>/dev/null)"})
+    pkgs=(${(f)"$(_pax_pkg_list local 2>/dev/null)"})
     compadd -a pkgs
 }
 
@@ -312,7 +353,7 @@ _pax_aur_packages() {
     local -a pkgs
     local cur="${words[CURRENT]}"
     [[ ${#cur} -lt 2 ]] && return
-    pkgs=(${(f)"$(pax --pkg-list "aur:$cur" 2>/dev/null)"})
+    pkgs=(${(f)"$(_pax_pkg_list "aur:$cur" 2>/dev/null)"})
     compadd -a pkgs
 }
 
@@ -326,11 +367,30 @@ _pax_all_packages() {
         else
             pkgs+=("$name")
         fi
-    done < <(pax --pkg-list all-desc 2>/dev/null)
+    done < <(_pax_pkg_list all-desc 2>/dev/null)
     _describe 'package' pkgs
 }
 
 _pax() {
+    local -a pax_global_args
+    local i
+    for ((i=2; i < CURRENT; i++)); do
+        case "${words[i]}" in
+            --config|--dbpath|--root)
+                pax_global_args+=("${words[i]}" "${words[i+1]}")
+                ((i++))
+                ;;
+            --config=*|--dbpath=*|--root=*)
+                pax_global_args+=("${words[i]}")
+                ;;
+            --completions|--pkg-list)
+                ((i++))
+                ;;
+            -*) ;;
+            *) break ;;
+        esac
+    done
+
     local -a subcmds
     subcmds=(
         'search:Search sync databases for packages'
@@ -393,7 +453,7 @@ _pax() {
                         '--noconfirm[Skip confirmation]' \
                         '--ignore=[Ignore policy]:policy:(prompt always never)' \
                         '--help[Show help]' \
-                        '*:package or package=version:_pax_installed_packages'
+                        '*:package or package=version:_pax_downgrade_packages'
                     ;;
                 remove|R)
                     _arguments \
@@ -468,7 +528,32 @@ _pax "$@"
 "#;
 
 const FISH: &str = r#"
-set -l subcmds search info query files owner install downgrade remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean remove-lock
+function __pax_pkg_list
+    set -l tokens (commandline -opc)
+    set -l global_args
+    set -l i 2
+    while test $i -le (count $tokens)
+        switch $tokens[$i]
+            case --config --dbpath --root
+                set -l option $tokens[$i]
+                set i (math $i + 1)
+                if test $i -le (count $tokens)
+                    set -a global_args $option "$tokens[$i]"
+                end
+            case '--config=*' '--dbpath=*' '--root=*'
+                set -a global_args "$tokens[$i]"
+            case --completions --pkg-list
+                set i (math $i + 1)
+            case '-*'
+            case '*'
+                break
+        end
+        set i (math $i + 1)
+    end
+    pax $global_args --pkg-list "$argv[1]" 2>/dev/null
+end
+
+set -l subcmds search s info i query q files f owner o install S downgrade remove R local-install U aur-install aur-search aur-upgrade check check-files sync y upgrade u clean c remove-lock
 
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l help -d "Show help"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l version -d "Show version"
@@ -496,13 +581,13 @@ complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a check-files -d 
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a clean -d "Clean package cache"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a remove-lock -d "Remove stale database lock"
 
-complete -c pax -n "__fish_seen_subcommand_from install" -l dry-run -d "Show what would be installed"
-complete -c pax -n "__fish_seen_subcommand_from install" -l noconfirm -d "Skip confirmation"
-complete -c pax -n "__fish_seen_subcommand_from install" -l needed -d "Skip up-to-date packages"
-complete -c pax -n "__fish_seen_subcommand_from install" -l reinstall -d "Reinstall packages"
-complete -c pax -n "__fish_seen_subcommand_from install" -l asdeps -d "Install as dependencies"
-complete -c pax -n "__fish_seen_subcommand_from install" -s w -l download-only -d "Download without installing"
-complete -c pax -n "__fish_seen_subcommand_from install" -a "(pax --pkg-list sync-desc 2>/dev/null | string replace \t '\t')" -d ""
+complete -c pax -n "__fish_seen_subcommand_from install S" -l dry-run -d "Show what would be installed"
+complete -c pax -n "__fish_seen_subcommand_from install S" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from install S" -l needed -d "Skip up-to-date packages"
+complete -c pax -n "__fish_seen_subcommand_from install S" -l reinstall -d "Reinstall packages"
+complete -c pax -n "__fish_seen_subcommand_from install S" -l asdeps -d "Install as dependencies"
+complete -c pax -n "__fish_seen_subcommand_from install S" -s w -l download-only -d "Download without installing"
+complete -c pax -n "__fish_seen_subcommand_from install S" -a "(__pax_pkg_list sync-desc 2>/dev/null | string replace \t '\t')" -d ""
 
 function __pax_downgrade_packages
     set -l tokens (commandline -opc)
@@ -512,7 +597,7 @@ function __pax_downgrade_packages
     if string match -q '*=*' -- (commandline -ct)
         return
     end
-    pax --pkg-list local 2>/dev/null
+    __pax_pkg_list local 2>/dev/null
 end
 
 complete -c pax -n "__fish_seen_subcommand_from downgrade" -f
@@ -529,40 +614,40 @@ complete -c pax -n "__fish_seen_subcommand_from downgrade" -l ignore -x -a "prom
 complete -c pax -n "__fish_seen_subcommand_from downgrade" -l help -d "Show help"
 complete -c pax -n "__fish_seen_subcommand_from downgrade" -a "(__pax_downgrade_packages)" -d "Installed package"
 
-complete -c pax -n "__fish_seen_subcommand_from remove" -l noconfirm -d "Skip confirmation"
-complete -c pax -n "__fish_seen_subcommand_from remove" -s s -l recursive -d "Remove unneeded deps"
-complete -c pax -n "__fish_seen_subcommand_from remove" -a "(pax --pkg-list local 2>/dev/null)" -d "Installed package"
+complete -c pax -n "__fish_seen_subcommand_from remove R" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from remove R" -s s -l recursive -d "Remove unneeded deps"
+complete -c pax -n "__fish_seen_subcommand_from remove R" -a "(__pax_pkg_list local 2>/dev/null)" -d "Installed package"
 
-complete -c pax -n "__fish_seen_subcommand_from info" -s l -l local -d "Query local database"
-complete -c pax -n "__fish_seen_subcommand_from info" -a "(pax --pkg-list all-desc 2>/dev/null | string replace \t '\t')" -d ""
+complete -c pax -n "__fish_seen_subcommand_from info i" -s l -l local -d "Query local database"
+complete -c pax -n "__fish_seen_subcommand_from info i" -a "(__pax_pkg_list all-desc 2>/dev/null | string replace \t '\t')" -d ""
 
-complete -c pax -n "__fish_seen_subcommand_from query" -s e -l explicit -d "Explicitly installed only"
-complete -c pax -n "__fish_seen_subcommand_from query" -s o -l orphans -d "Orphan packages"
+complete -c pax -n "__fish_seen_subcommand_from query q" -s e -l explicit -d "Explicitly installed only"
+complete -c pax -n "__fish_seen_subcommand_from query q" -s o -l orphans -d "Orphan packages"
 
-complete -c pax -n "__fish_seen_subcommand_from files" -a "(pax --pkg-list local 2>/dev/null)" -d "Installed package"
+complete -c pax -n "__fish_seen_subcommand_from files f" -a "(__pax_pkg_list local 2>/dev/null)" -d "Installed package"
 
-complete -c pax -n "__fish_seen_subcommand_from owner" -F -d "File path"
+complete -c pax -n "__fish_seen_subcommand_from owner o" -F -d "File path"
 
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -l skip-review -d "Skip PKGBUILD review"
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -l noconfirm -d "Skip confirmation"
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -l reinstall -d "Reinstall already installed packages"
 complete -c pax -n "__fish_seen_subcommand_from aur-install" -l allow-root -d "Allow running as root"
-complete -c pax -n "__fish_seen_subcommand_from aur-install" -a "(test (string length -- (commandline -ct)) -ge 2; and pax --pkg-list 'aur:'(commandline -ct) 2>/dev/null)" -d "AUR package"
+complete -c pax -n "__fish_seen_subcommand_from aur-install" -a "(test (string length -- (commandline -ct)) -ge 2; and __pax_pkg_list 'aur:'(commandline -ct) 2>/dev/null)" -d "AUR package"
 
-complete -c pax -n "__fish_seen_subcommand_from local-install" -l noconfirm -d "Skip confirmation"
-complete -c pax -n "__fish_seen_subcommand_from local-install" -F -d "Package file"
+complete -c pax -n "__fish_seen_subcommand_from local-install U" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from local-install U" -F -d "Package file"
 
 complete -c pax -n "__fish_seen_subcommand_from aur-upgrade" -l skip-review -d "Skip PKGBUILD review"
 complete -c pax -n "__fish_seen_subcommand_from aur-upgrade" -l noconfirm -d "Skip confirmation"
 complete -c pax -n "__fish_seen_subcommand_from aur-upgrade" -l allow-root -d "Allow running as root"
 
-complete -c pax -n "__fish_seen_subcommand_from upgrade" -l dry-run -d "Show what would be upgraded"
-complete -c pax -n "__fish_seen_subcommand_from upgrade" -s w -l download-only -d "Download without installing"
-complete -c pax -n "__fish_seen_subcommand_from upgrade" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from upgrade u" -l dry-run -d "Show what would be upgraded"
+complete -c pax -n "__fish_seen_subcommand_from upgrade u" -s w -l download-only -d "Download without installing"
+complete -c pax -n "__fish_seen_subcommand_from upgrade u" -l noconfirm -d "Skip confirmation"
 
-complete -c pax -n "__fish_seen_subcommand_from check" -a "(pax --pkg-list local 2>/dev/null)" -d "Installed package"
-complete -c pax -n "__fish_seen_subcommand_from check-files" -a "(pax --pkg-list local 2>/dev/null)" -d "Installed package"
+complete -c pax -n "__fish_seen_subcommand_from check" -a "(__pax_pkg_list local 2>/dev/null)" -d "Installed package"
+complete -c pax -n "__fish_seen_subcommand_from check-files" -a "(__pax_pkg_list local 2>/dev/null)" -d "Installed package"
 
-complete -c pax -n "__fish_seen_subcommand_from clean" -l all -d "Remove all cached packages"
-complete -c pax -n "__fish_seen_subcommand_from clean" -l noconfirm -d "Skip confirmation"
+complete -c pax -n "__fish_seen_subcommand_from clean c" -l all -d "Remove all cached packages"
+complete -c pax -n "__fish_seen_subcommand_from clean c" -l noconfirm -d "Skip confirmation"
 "#;
