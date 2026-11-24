@@ -302,12 +302,15 @@ pub fn print_transaction(tx: &Transaction, sync_sizes: &HashMap<String, (u64, u6
     if !tx.removals.is_empty() {
         println!("\n{}", "Packages to remove:".bold());
         for rem in &tx.removals {
-            let reason_str = match &rem.reason {
-                RemovalReason::Replaced => "replaced".to_string(),
-                RemovalReason::Conflict { with } => {
-                    format!("conflicts with {with}")
-                }
-            };
+            let reason_str = rem
+                .links
+                .iter()
+                .map(|link| match &link.reason {
+                    RemovalReason::Replaced => format!("replaced by {}", link.incoming),
+                    RemovalReason::Conflict => format!("conflicts with {}", link.incoming),
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             println!(
                 "  {} {} ({})",
                 rem.name.bold(),

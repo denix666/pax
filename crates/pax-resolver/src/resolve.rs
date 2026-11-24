@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pax_core::package::{Dependency, InstallReason};
 use pax_core::version::Version;
 
 use crate::error::{ResolveError, Result};
 use crate::pool::{PackageId, PackagePool, PackageSource, package_satisfies, preferred_sync};
-use crate::transaction::RemovalReason;
+use crate::transaction::{RemovalLink, RemovalReason};
 
 pub struct ResolveOptions {
     pub reinstall: bool,
@@ -34,7 +34,8 @@ pub struct ResolvedPackage {
 
 pub struct ResolvedSet {
     pub to_install: Vec<ResolvedPackage>,
-    pub to_remove: Vec<(String, RemovalReason)>,
+    /// Unique outgoing names with every selected replacement/conflict relationship.
+    pub to_remove: Vec<(String, Vec<RemovalLink>)>,
 }
 
 struct Resolver<'a, P: PackagePool> {
@@ -197,81 +198,85 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
     }
 
     fn plan_removals(&mut self) -> Result<()> {
-        let mut selected: Vec<_> = self.selected.values().copied().collect();
-        selected.sort_by_key(|id| self.pool.get(*id).unwrap().info.name.clone());
-        for id in selected {
-            let candidate = self.pool.get(id).unwrap();
-            if !self.options.apply_replacements || matches!(candidate.source, PackageSource::Local)
-            {
-                continue;
-            }
-            for replacement in &candidate.info.replaces {
-                for installed in self.pool.all_installed() {
-                    if installed.info.name != replacement.name
-                        || !replacement.satisfies(&installed.info.version)
-                        || installed.info.name == candidate.info.name
-                    {
-                        continue;
-                    }
-                    if self.selected.contains_key(&installed.info.name)
-                        || self.targets.contains(&installed.info.name)
-                    {
-                        return Err(self.conflict_error(
-                            &candidate.info.name,
-                            &installed.info.name,
-                            "selected package".to_string(),
-                        ));
-                    }
-                    if !self
-                        .replaces
+        let mut selected: Vec<_> = self
+            .selected
+            .values()
+            .map(|&id| {
+                self.pool
+                    .get(id)
+                    .expect("selected candidate belongs to pool")
+            })
+            .collect();
+        selected.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+        let mut installed = self.pool.all_installed();
+        installed.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+
+        // Collect against a stable snapshot: removing one old package from the
+        // final state must not hide its links to other incoming packages.
+        for candidate in &selected {
+            for other in &selected {
+                if candidate.info.name != other.info.name
+                    && candidate
+                        .info
+                        .conflicts
                         .iter()
-                        .any(|(_, old, _)| old == &installed.info.name)
-                    {
-                        self.replaces.push((
-                            candidate.info.name.clone(),
-                            installed.info.name.clone(),
-                            RemovalReason::Replaced,
-                        ));
-                    }
+                        .any(|dep| package_satisfies(other.info, dep))
+                {
+                    return Err(self.conflict_error(
+                        &candidate.info.name,
+                        &other.info.name,
+                        "selected package".to_string(),
+                    ));
                 }
             }
-        }
-        loop {
-            let packages = self.final_packages();
-            let mut removal = None;
-            'pairs: for a in &packages {
-                for b in &packages {
-                    if a.info.name == b.info.name
-                        || !a
+            for old in &installed {
+                if old.info.name == candidate.info.name {
+                    continue;
+                }
+                let replaced = self.options.apply_replacements
+                    && !matches!(candidate.source, PackageSource::Local)
+                    && candidate.info.replaces.iter().any(|replacement| {
+                        replacement.name == old.info.name
+                            && replacement.satisfies(&old.info.version)
+                    });
+                // A selected name uses its incoming metadata, not the obsolete
+                // conflicts/provides of the currently installed version.
+                let conflict = !self.selected.contains_key(&old.info.name)
+                    && (candidate
+                        .info
+                        .conflicts
+                        .iter()
+                        .any(|dep| package_satisfies(old.info, dep))
+                        || old
                             .info
                             .conflicts
                             .iter()
-                            .any(|dep| package_satisfies(b.info, dep))
-                    {
-                        continue;
-                    }
-                    let a_selected = self.selected.contains_key(&a.info.name);
-                    let b_selected = self.selected.contains_key(&b.info.name);
-                    if !a_selected && !b_selected {
-                        continue;
-                    }
-                    let (keep, remove) = if b_selected { (b, a) } else { (a, b) };
-                    if self.selected.contains_key(&remove.info.name)
-                        || self.targets.contains(&remove.info.name)
-                    {
-                        return Err(self.conflict_error(
-                            &keep.info.name,
-                            &remove.info.name,
-                            "selected package".to_string(),
+                            .any(|dep| package_satisfies(candidate.info, dep)));
+                if !replaced && !conflict {
+                    continue;
+                }
+                if self.selected.contains_key(&old.info.name)
+                    || self.targets.contains(&old.info.name)
+                {
+                    return Err(self.conflict_error(
+                        &candidate.info.name,
+                        &old.info.name,
+                        "selected package".to_string(),
+                    ));
+                }
+                for (matched, reason) in [
+                    (replaced, RemovalReason::Replaced),
+                    (conflict, RemovalReason::Conflict),
+                ] {
+                    if matched {
+                        self.replaces.push((
+                            candidate.info.name.clone(),
+                            old.info.name.clone(),
+                            reason,
                         ));
                     }
-                    removal = Some((keep.info.name.clone(), remove.info.name.clone()));
-                    break 'pairs;
                 }
             }
-            let Some((keep, remove)) = removal else { break };
-            self.replaces
-                .push((keep.clone(), remove, RemovalReason::Conflict { with: keep }));
         }
         Ok(())
     }
@@ -341,11 +346,15 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
 
         to_install.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let to_remove: Vec<(String, RemovalReason)> = self
-            .replaces
-            .into_iter()
-            .map(|(_, old, reason)| (old, reason))
-            .collect();
+        let mut removals: BTreeMap<String, Vec<RemovalLink>> = BTreeMap::new();
+        for (incoming, old, reason) in self.replaces {
+            let link = RemovalLink { incoming, reason };
+            let links = removals.entry(old).or_default();
+            if !links.contains(&link) {
+                links.push(link);
+            }
+        }
+        let to_remove = removals.into_iter().collect();
 
         ResolvedSet {
             to_install,
@@ -480,8 +489,13 @@ mod tests {
         pool.add_local(make_pkg("b", "1.0-1", &[]));
 
         let resolved = resolve(&pool, &["a".to_string()], &ResolveOptions::default()).unwrap();
-        assert!(resolved.to_remove.iter().any(|(name, reason)| {
-            name == "b" && matches!(reason, crate::transaction::RemovalReason::Conflict { .. })
+        assert!(resolved.to_remove.iter().any(|(name, links)| {
+            name == "b"
+                && links
+                    == &[RemovalLink {
+                        incoming: "a".into(),
+                        reason: RemovalReason::Conflict,
+                    }]
         }));
     }
 
@@ -796,6 +810,96 @@ mod tests {
     }
 
     #[test]
+    fn all_replacement_and_bidirectional_conflict_links_survive_removal_discovery() {
+        let mut old = make_pkg("old", "1:2-3", &[]);
+        old.conflicts = vec![Dependency::parse("split-api>=2").unwrap()];
+        old.provides = vec![Dependency::parse("old-api=3").unwrap()];
+        let mut first = make_pkg("a-first", "1", &[]);
+        first.replaces = vec![
+            Dependency::parse("old").unwrap(),
+            Dependency::parse("old<2:0").unwrap(),
+        ];
+        first.conflicts = vec![Dependency::parse("old-api>=3").unwrap()];
+        let mut second = make_pkg("b-second", "1", &[]);
+        second.replaces = vec![Dependency::parse("old>=1:2-3").unwrap()];
+        let mut third = make_pkg("c-third", "1", &[]);
+        third.provides = vec![Dependency::parse("split-api=2").unwrap()];
+        let mut fourth = make_pkg("d-fourth", "1", &[]);
+        fourth.conflicts = vec![Dependency::parse("old-api=3").unwrap()];
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_local(old);
+        for pkg in [first, second, third, fourth] {
+            pool.add_sync(pkg, 0);
+        }
+        let expected: Vec<(String, Vec<RemovalLink>)> = vec![(
+            "old".into(),
+            vec![
+                RemovalLink {
+                    incoming: "a-first".into(),
+                    reason: RemovalReason::Replaced,
+                },
+                RemovalLink {
+                    incoming: "a-first".into(),
+                    reason: RemovalReason::Conflict,
+                },
+                RemovalLink {
+                    incoming: "b-second".into(),
+                    reason: RemovalReason::Replaced,
+                },
+                RemovalLink {
+                    incoming: "c-third".into(),
+                    reason: RemovalReason::Conflict,
+                },
+                RemovalLink {
+                    incoming: "d-fourth".into(),
+                    reason: RemovalReason::Conflict,
+                },
+            ],
+        )];
+        for names in [
+            ["a-first", "b-second", "c-third", "d-fourth"],
+            ["d-fourth", "c-third", "b-second", "a-first"],
+        ] {
+            let targets = names.iter().map(|name| (*name).into()).collect::<Vec<_>>();
+            let resolved = resolve(&pool, &targets, &ResolveOptions::default()).unwrap();
+            assert_eq!(resolved.to_remove, expected);
+        }
+    }
+
+    #[test]
+    fn one_incoming_keeps_links_to_every_outgoing_package() {
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_local(make_pkg("old-lib", "1", &[]));
+        pool.add_local(make_pkg("old-app", "1", &["old-lib"]));
+        let mut new = make_pkg("merged", "1", &[]);
+        new.replaces = ["old-app", "old-lib"]
+            .iter()
+            .map(|dep| Dependency::parse(dep).unwrap())
+            .collect();
+        pool.add_sync(new, 0);
+        let resolved = resolve(&pool, &["merged".into()], &ResolveOptions::default()).unwrap();
+        assert_eq!(
+            resolved.to_remove,
+            vec![
+                (
+                    "old-app".into(),
+                    vec![RemovalLink {
+                        incoming: "merged".into(),
+                        reason: RemovalReason::Replaced
+                    }]
+                ),
+                (
+                    "old-lib".into(),
+                    vec![RemovalLink {
+                        incoming: "merged".into(),
+                        reason: RemovalReason::Replaced
+                    }]
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn local_artifact_replacements_can_be_disabled_without_disabling_conflicts() {
         for conflicts in [false, true] {
             let mut pool = ConcretePool::new(HashSet::new());
@@ -814,10 +918,13 @@ mod tests {
             assert_eq!(resolved.to_remove.len(), usize::from(conflicts));
             if conflicts {
                 assert_eq!(resolved.to_remove[0].0, "old");
-                assert!(matches!(
+                assert_eq!(
                     resolved.to_remove[0].1,
-                    RemovalReason::Conflict { .. }
-                ));
+                    vec![RemovalLink {
+                        incoming: "artifact".into(),
+                        reason: RemovalReason::Conflict,
+                    }]
+                );
             }
         }
     }

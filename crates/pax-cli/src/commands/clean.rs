@@ -9,6 +9,9 @@ use crate::output::format_size;
 
 pub fn run(db: &mut DatabaseHandle, all: bool, noconfirm: bool) -> Result<()> {
     super::ensure_root();
+    // Cached archives may be the only source available for manual recovery.
+    let _lock = pax_alpm::DbLock::acquire(&db.config.db_path)?;
+    db.invalidate();
     let cache_dirs = db.config.cache_dirs.clone();
 
     if all {

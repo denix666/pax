@@ -313,7 +313,7 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
                 .unwrap_or((0, 0))
         },
         false,
-    );
+    )?;
 
     if tx.is_empty() {
         return Ok(());
@@ -383,6 +383,7 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
     let mut ctx = InstallContext {
         root_dir: &db.config.root_dir,
         db_path: &db.config.db_path,
+        architecture: &db.config.architecture,
         downloaded: &downloaded,
         old_install_scripts: &old_install_scripts,
         old_backup_md5: &old_backup_md5,

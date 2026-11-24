@@ -19,3 +19,5 @@ rayon.workspace = true
 flate2.workspace = true
 md5.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true

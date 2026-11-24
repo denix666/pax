@@ -45,6 +45,14 @@ impl PaxLogger {
         self.write_entry("PAX", "transaction completed");
     }
 
+    pub fn log_transaction_failed(&mut self, message: &str) {
+        self.write_entry("PAX", &format!("transaction failed: {message}"));
+    }
+
+    pub fn log_transaction_incomplete(&mut self, message: &str) {
+        self.write_entry("PAX", &format!("transaction incomplete: {message}"));
+    }
+
     pub fn log_installed(&mut self, name: &str, version: &str) {
         self.write_entry("PAX", &format!("installed {name} ({version})"));
     }
@@ -79,6 +87,25 @@ impl PaxLogger {
                 self.write_entry("PAX-SCRIPTLET", &format!("[{hook_name}] {line}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_and_incomplete_transactions_are_not_logged_as_completed() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut logger = PaxLogger::open(log.path());
+        logger.log_transaction_failed("pre-transaction hook failed");
+        logger.log_transaction_incomplete("packages applied, post-transaction hook failed");
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        assert!(content.contains("[PAX] transaction failed: pre-transaction hook failed"));
+        assert!(content.contains(
+            "[PAX] transaction incomplete: packages applied, post-transaction hook failed"
+        ));
+        assert!(!content.contains("transaction completed"));
     }
 }
 

@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use crate::error::Result;
+use crate::error::{ExecError, Result};
 use crate::log::PaxLogger;
 
 pub enum ScriptletOp {
@@ -105,7 +105,7 @@ fn scriptlet_output(
     let mut command = command_in_root("/bin/bash", &root)?;
     command.args([
         "-c",
-        ". \"$1\"; shift; if declare -F -- \"$1\" >/dev/null; then \"$@\"; fi",
+        ". \"$1\" || exit $?; shift; if declare -F -- \"$1\" >/dev/null; then \"$@\"; fi",
         "pax-scriptlet",
     ]);
     command
@@ -118,6 +118,8 @@ fn scriptlet_output(
     command_output(&mut command, None)
 }
 
+/// Logs script output and returns failures with package and operation context.
+/// The caller decides whether to continue the transaction after a failure.
 pub fn run_scriptlet(
     install_script: &str,
     op: ScriptletOp,
@@ -127,7 +129,8 @@ pub fn run_scriptlet(
     pkg_name: &str,
     logger: &mut PaxLogger,
 ) -> Result<()> {
-    match scriptlet_output(install_script, op, new_version, old_version, root_dir) {
+    let operation = op.function_name();
+    let message = match scriptlet_output(install_script, op, new_version, old_version, root_dir) {
         Ok(out) => {
             for bytes in [&out.stdout, &out.stderr] {
                 let text = String::from_utf8_lossy(bytes);
@@ -136,19 +139,29 @@ pub fn run_scriptlet(
                     logger.log_scriptlet_output(pkg_name, &text);
                 }
             }
-            if !out.status.success() {
-                let msg = format!("scriptlet failed for {pkg_name}: {}", out.status);
-                eprintln!("warning: {msg}");
-                logger.log_warning(&msg);
+            if out.status.success() {
+                return Ok(());
             }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let mut message = format!("scriptlet failed: {}", out.status);
+            if !stderr.trim().is_empty() {
+                message.push_str(": ");
+                message.push_str(stderr.trim());
+            }
+            message
         }
-        Err(e) => {
-            let msg = format!("scriptlet failed for {pkg_name}: {e}");
-            eprintln!("warning: {msg}");
-            logger.log_warning(&msg);
-        }
-    }
-    Ok(())
+        Err(error) => format!(
+            "could not execute scriptlet in {}: {error}",
+            root_dir.display()
+        ),
+    };
+    let error = ExecError::Hook {
+        name: format!("{pkg_name}::{operation}"),
+        message,
+    };
+    eprintln!("warning: {error}");
+    logger.log_warning(&error.to_string());
+    Err(error)
 }
 
 #[cfg(test)]
@@ -184,6 +197,113 @@ mod tests {
         .unwrap();
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn successful_scriptlets_and_missing_functions_return_ok() {
+        for script in ["post_install() { return 0; }", "# post_install is absent"] {
+            run_scriptlet(
+                script,
+                ScriptletOp::PostInstall,
+                "1",
+                None,
+                Path::new("/"),
+                "test-package",
+                &mut PaxLogger::none(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_scriptlet_returns_context_and_keeps_output() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let error = run_scriptlet(
+            "post_upgrade() { printf 'stdout marker\\n'; printf 'original failure\\n' >&2; return 42; }",
+            ScriptletOp::PostUpgrade,
+            "2",
+            Some("1"),
+            Path::new("/"),
+            "test-package",
+            &mut PaxLogger::open(log.path()),
+        )
+        .unwrap_err();
+        match &error {
+            ExecError::Hook { name, message } => {
+                assert_eq!(name, "test-package::post_upgrade");
+                assert!(message.contains("exit status: 42"));
+                assert!(message.contains("original failure"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        assert!(content.contains("[PAX-SCRIPTLET] [test-package] stdout marker"));
+        assert!(content.contains("[PAX-SCRIPTLET] [test-package] original failure"));
+        assert!(content.contains(&error.to_string()));
+    }
+
+    #[test]
+    fn source_failure_is_not_masked_by_function_lookup_or_invocation() {
+        for script in [
+            "return 37",
+            "post_install() { printf 'must not run\\n'; return 0; }\nreturn 37",
+        ] {
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let error = run_scriptlet(
+                script,
+                ScriptletOp::PostInstall,
+                "1",
+                None,
+                Path::new("/"),
+                "test-package",
+                &mut PaxLogger::open(log.path()),
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("test-package::post_install"));
+            assert!(message.contains("exit status: 37"));
+            let content = std::fs::read_to_string(log.path()).unwrap();
+            assert!(!content.contains("must not run"));
+        }
+    }
+
+    #[test]
+    fn source_syntax_error_preserves_shell_diagnostic() {
+        let error = run_scriptlet(
+            "post_install() {\n",
+            ScriptletOp::PostInstall,
+            "1",
+            None,
+            Path::new("/"),
+            "test-package",
+            &mut PaxLogger::none(),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("test-package::post_install"));
+        assert!(message.contains("exit status: 2"));
+        assert!(message.contains(".pax-scriptlet-"));
+    }
+
+    #[test]
+    fn io_failure_preserves_package_operation_root_and_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_root = temp.path().join("missing-root");
+        let cause = std::fs::canonicalize(&missing_root).unwrap_err();
+        let error = run_scriptlet(
+            "pre_remove() { return 0; }",
+            ScriptletOp::PreRemove,
+            "1",
+            None,
+            &missing_root,
+            "test-package",
+            &mut PaxLogger::none(),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("test-package::pre_remove"));
+        assert!(message.contains(&missing_root.display().to_string()));
+        assert!(message.contains(&cause.to_string()));
     }
 
     #[test]

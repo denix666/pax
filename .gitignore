@@ -4,3 +4,5 @@ debug/
 **/*.rs.bk
 *.pdb
 /tests
+*.md
+!README.md

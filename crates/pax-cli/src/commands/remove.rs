@@ -4,8 +4,8 @@ use anyhow::Result;
 use owo_colors::OwoColorize;
 use pax_alpm::db::DatabaseHandle;
 use pax_core::package::{InstallReason, PackageInfo};
-use pax_exec::hooks::{HookWhen, TransactionPackages, load_hooks, run_hooks};
-use pax_exec::{RemovalTarget, remove_package};
+use pax_exec::RemovalTarget;
+use pax_exec::removal::execute_removal_transaction;
 use pax_resolver::pool::package_satisfies_dependency;
 
 use super::{confirm, confirm_default_no};
@@ -103,80 +103,16 @@ pub fn run(
         return Ok(());
     }
 
-    let hooks = load_hooks(&db.config.hook_dirs);
     let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
-
-    let removed_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
-    let mut planned_removed_files = Vec::new();
-    for target in &targets {
-        planned_removed_files.extend(db.package_files(&target.name)?);
-    }
-    planned_removed_files.sort();
-    planned_removed_files.dedup();
-    let pre_tx = TransactionPackages {
-        installed: vec![],
-        upgraded: vec![],
-        removed: removed_names.clone(),
-        installed_files: vec![],
-        upgraded_files: vec![],
-        removed_files: planned_removed_files,
-    };
-    let pre_dependencies = |dep: &pax_core::package::Dependency| {
-        installed
-            .iter()
-            .any(|pkg| package_satisfies_dependency(pkg, dep))
-    };
-    run_hooks(
-        &hooks,
-        &HookWhen::PreTransaction,
-        &pre_tx,
+    let result = execute_removal_transaction(
+        &targets,
         &db.config.root_dir,
-        &pre_dependencies,
+        &db.config.db_path,
+        &db.config.hook_dirs,
         &mut logger,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let mut all_removed_files = Vec::new();
-    logger.log_transaction_start();
-
-    for target in &targets {
-        let result = remove_package(target, &db.config.root_dir, &db.config.db_path, &mut logger);
-        db.invalidate();
-        let removed_files = result.map_err(|e| anyhow::anyhow!("{e}"))?;
-        logger.log_removed(&target.name, &target.version);
-        all_removed_files.extend(removed_files);
-    }
-
-    logger.log_transaction_completed();
-
-    let post_tx = TransactionPackages {
-        installed: vec![],
-        upgraded: vec![],
-        removed: removed_names,
-        installed_files: vec![],
-        upgraded_files: vec![],
-        removed_files: all_removed_files,
-    };
+    );
     db.invalidate();
-    let current: Vec<PackageInfo> = db
-        .installed_packages()?
-        .iter()
-        .map(|pkg| pkg.info.clone())
-        .collect();
-    let post_dependencies = |dep: &pax_core::package::Dependency| {
-        current
-            .iter()
-            .any(|pkg| package_satisfies_dependency(pkg, dep))
-    };
-    run_hooks(
-        &hooks,
-        &HookWhen::PostTransaction,
-        &post_tx,
-        &db.config.root_dir,
-        &post_dependencies,
-        &mut logger,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    result?;
 
     println!("{} package(s) removed.", targets.len());
 

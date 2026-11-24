@@ -186,7 +186,7 @@ fn install_files(
                 .unwrap_or((0, 0))
         },
         true,
-    );
+    )?;
     for install in &mut tx.installs {
         install.repository = "local".to_string();
     }
@@ -208,6 +208,7 @@ fn install_files(
     let mut ctx = InstallContext {
         root_dir: &db.config.root_dir,
         db_path: &db.config.db_path,
+        architecture: &db.config.architecture,
         downloaded: &downloaded,
         old_install_scripts: &old_install_scripts,
         old_backup_md5: &old_backup_md5,
@@ -309,7 +310,7 @@ mod tests {
         )
         .unwrap();
         topological_sort(&pool, &mut resolved);
-        let tx = build_transaction(&pool, &resolved, &targets, &|_| (0, 0), true);
+        let tx = build_transaction(&pool, &resolved, &targets, &|_| (0, 0), true).unwrap();
         assert!(tx.installs.is_empty());
         assert!(tx.removals.is_empty());
         assert_eq!(tx.upgrades.len(), 2);

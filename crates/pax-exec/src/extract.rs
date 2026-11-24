@@ -168,110 +168,131 @@ pub fn extract_package(
             path_str.to_string()
         });
 
-        let dest = root_dir.join(&path);
-        ensure_safe_parent(&root_dir, &path)?;
-        let entry_type = entry.header().entry_type();
-        if backup_entries.iter().any(|backup| backup == path_str) {
-            if !entry_type.is_file() {
+        let mut operation = "check destination parent";
+        (|| -> Result<()> {
+            let dest = root_dir.join(&path);
+            ensure_safe_parent(&root_dir, &path)?;
+            let entry_type = entry.header().entry_type();
+            if backup_entries.iter().any(|backup| backup == path_str) {
+                if !entry_type.is_file() {
+                    return Err(unsafe_path(&path));
+                }
+                operation = "read backup payload";
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                let new_md5 = format!("{:x}", md5::compute(&buf));
+                backup_md5.insert(path_str.to_string(), new_md5.clone());
+                operation = "inspect existing backup";
+                let current_md5 = match std::fs::symlink_metadata(&dest) {
+                    Ok(metadata) if metadata.is_file() => Some(compute_md5(&dest)?),
+                    Ok(_) => return Err(unsafe_path(&path)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if let Some(current) = current_md5.as_ref() {
+                    if current == &new_md5 {
+                        return Ok(());
+                    }
+                    if let Some(old) = existing_backup_md5.get(path_str) {
+                        if old == &new_md5 {
+                            return Ok(());
+                        }
+                    }
+                }
+                let should_pacnew = current_md5
+                    .as_ref()
+                    .is_some_and(|current| existing_backup_md5.get(path_str) != Some(current));
+                let output = if should_pacnew {
+                    dest.with_file_name(format!(
+                        "{}.pacnew",
+                        dest.file_name().unwrap().to_string_lossy()
+                    ))
+                } else {
+                    dest.clone()
+                };
+                operation = "write backup payload (or .pacnew)";
+                write_backup(&output, &buf, entry.header().mode()?)?;
+                if should_pacnew {
+                    warnings.push(format!("{path_str} installed as {path_str}.pacnew"));
+                }
+                return Ok(());
+            }
+
+            operation = "validate payload type and hard link target";
+            if entry_type.is_hard_link() {
+                let target = entry.link_name()?.ok_or_else(|| unsafe_path(&path))?;
+                let target = safe_relative_path(&target)?;
+                if target.as_os_str().is_empty() {
+                    return Err(unsafe_path(&path));
+                }
+
+                ensure_safe_parent(&root_dir, &target)?;
+                let source = root_dir.join(&target);
+                match std::fs::symlink_metadata(&source) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink()
+                            && !source.canonicalize()?.starts_with(&root_dir)
+                        {
+                            return Err(unsafe_path(&target));
+                        }
+                        if entry_type.is_hard_link() && !metadata.is_file() {
+                            return Err(unsafe_path(&target));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            } else if !entry_type.is_file() && !entry_type.is_dir() && !entry_type.is_symlink() {
                 return Err(unsafe_path(&path));
             }
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            let new_md5 = format!("{:x}", md5::compute(&buf));
-            backup_md5.insert(path_str.to_string(), new_md5.clone());
-            let current_md5 = match std::fs::symlink_metadata(&dest) {
-                Ok(metadata) if metadata.is_file() => Some(compute_md5(&dest)?),
-                Ok(_) => return Err(unsafe_path(&path)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
-            if let Some(current) = current_md5.as_ref() {
-                if current == &new_md5 {
-                    continue;
-                }
-                if let Some(old) = existing_backup_md5.get(path_str) {
-                    if old == &new_md5 {
-                        continue;
+
+            operation = "inspect destination";
+            if entry_type.is_file() || entry_type.is_hard_link() || entry_type.is_symlink() {
+                // Unlink first: existing files and links must be replaced, not followed.
+                match std::fs::symlink_metadata(&dest) {
+                    Ok(metadata) if !metadata.is_dir() => {
+                        operation = "unlink existing destination";
+                        std::fs::remove_file(&dest)?;
                     }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
                 }
             }
-            let should_pacnew = current_md5
-                .as_ref()
-                .is_some_and(|current| existing_backup_md5.get(path_str) != Some(current));
-            let output = if should_pacnew {
-                dest.with_file_name(format!(
-                    "{}.pacnew",
-                    dest.file_name().unwrap().to_string_lossy()
-                ))
-            } else {
-                dest.clone()
-            };
-            write_backup(&output, &buf, entry.header().mode()?)?;
-            if should_pacnew {
-                warnings.push(format!("{path_str} installed as {path_str}.pacnew"));
-            }
-            continue;
-        }
-
-        if entry_type.is_hard_link() {
-            let target = entry.link_name()?.ok_or_else(|| unsafe_path(&path))?;
-            let target = safe_relative_path(&target)?;
-            if target.as_os_str().is_empty() {
-                return Err(unsafe_path(&path));
-            }
-
-            ensure_safe_parent(&root_dir, &target)?;
-            let source = root_dir.join(&target);
-            match std::fs::symlink_metadata(&source) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink()
-                        && !source.canonicalize()?.starts_with(&root_dir)
-                    {
-                        return Err(unsafe_path(&target));
-                    }
-                    if entry_type.is_hard_link() && !metadata.is_file() {
-                        return Err(unsafe_path(&target));
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        } else if !entry_type.is_file() && !entry_type.is_dir() && !entry_type.is_symlink() {
-            return Err(unsafe_path(&path));
-        }
-
-        if entry_type.is_file() || entry_type.is_hard_link() {
-            // Unlink first: an existing hard link may refer to data outside the root.
+            // Replace only empty directories; never recursively delete user data.
+            operation = "inspect destination";
             match std::fs::symlink_metadata(&dest) {
-                Ok(metadata) if !metadata.is_dir() => std::fs::remove_file(&dest)?,
+                Ok(metadata) if metadata.is_dir() && !entry_type.is_dir() => {
+                    operation = "remove empty destination directory";
+                    std::fs::remove_dir(&dest)?;
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-        }
-        // Replace only empty directories; never recursively delete user data.
-        match std::fs::symlink_metadata(&dest) {
-            Ok(metadata) if metadata.is_dir() && !entry_type.is_dir() => {
-                std::fs::remove_dir(&dest)?;
+            if entry_type.is_symlink() {
+                // Link text is package data. Absolute links refer to the installed root;
+                // only operations traversing a link need containment checks.
+                operation = "read symlink target";
+                let target = entry.link_name()?.ok_or_else(|| unsafe_path(&path))?;
+                operation = "create symlink parent directories";
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                operation = "create symlink";
+                std::os::unix::fs::symlink(target, &dest)?;
+            } else {
+                operation = "unpack payload";
+                if !entry.unpack_in(&root_dir)? {
+                    return Err(unsafe_path(&path));
+                }
             }
-            Ok(metadata) if metadata.file_type().is_symlink() && !entry_type.is_dir() => {
-                std::fs::remove_file(&dest)?;
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        if entry_type.is_symlink() {
-            // Link text is package data. Absolute links refer to the installed root;
-            // only operations traversing a link need containment checks.
-            let target = entry.link_name()?.ok_or_else(|| unsafe_path(&path))?;
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::os::unix::fs::symlink(target, &dest)?;
-        } else if !entry.unpack_in(&root_dir)? {
-            return Err(unsafe_path(&path));
-        }
+            Ok(())
+        })()
+        .map_err(|error| ExecError::Extraction {
+            pkg: pkg_name.clone(),
+            message: format!("{}: {operation}: {error}", path.display()),
+        })?;
     }
 
     // Some packages retain obsolete backup declarations in .PKGINFO. Only
@@ -1036,6 +1057,125 @@ mod tests {
     }
 
     #[test]
+    fn regular_file_replaced_by_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let path = "usr/lib/clang/23/lib/linux/clang_rt.crtbegin-i386.o";
+        let target = "../i386-pc-linux-gnu/clang_rt.crtbegin.o";
+        let dest = root.join(path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"old object").unwrap();
+        let archive = package(
+            temp.path(),
+            b"new",
+            Some((path, target, tar::EntryType::Symlink)),
+        );
+        extract_package(&archive, &root, &HashMap::new()).unwrap();
+        assert_eq!(std::fs::read_link(&dest).unwrap(), Path::new(target));
+    }
+
+    #[test]
+    fn symlink_replaced_by_regular_file_preserves_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("lib/file")).unwrap();
+        let archive = overlay_package(temp.path(), "../lib");
+        extract_package(&archive, &root, &HashMap::new()).unwrap();
+        let dest = root.join("lib/file");
+        assert!(std::fs::symlink_metadata(&dest).unwrap().is_file());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn symlink_replaced_by_symlink_preserves_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let archive = package(
+            temp.path(),
+            b"new",
+            Some(("link", "new-target", tar::EntryType::Symlink)),
+        );
+        extract_package(&archive, &root, &HashMap::new()).unwrap();
+        assert_eq!(
+            std::fs::read_link(root.join("link")).unwrap(),
+            Path::new("new-target")
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn empty_directory_replaced_by_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let archive = package(
+            temp.path(),
+            b"new",
+            Some(("data", "other", tar::EntryType::Symlink)),
+        );
+        extract_package(&archive, &root, &HashMap::new()).unwrap();
+        assert_eq!(
+            std::fs::read_link(root.join("data")).unwrap(),
+            Path::new("other")
+        );
+    }
+
+    #[test]
+    fn real_compiler_rt_upgrade_extracts_when_provided() {
+        let (old, new) = match (
+            std::env::var_os("PAX_TEST_COMPILER_RT_OLD"),
+            std::env::var_os("PAX_TEST_COMPILER_RT_NEW"),
+        ) {
+            (None, None) => return,
+            (Some(old), Some(new)) => (old, new),
+            _ => panic!("set both PAX_TEST_COMPILER_RT_OLD and PAX_TEST_COMPILER_RT_NEW"),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let fresh = temp.path().join("fresh");
+        let path = "usr/lib/clang/23/lib/linux/clang_rt.crtbegin-i386.o";
+        let old_metadata = extract_package(Path::new(&old), &root, &HashMap::new()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(root.join(path))
+                .unwrap()
+                .is_file()
+        );
+        extract_package(Path::new(&new), &root, &old_metadata.backup_md5).unwrap();
+        let metadata = extract_package(Path::new(&new), &fresh, &HashMap::new()).unwrap();
+        assert_eq!(
+            std::fs::read_link(root.join(path)).unwrap(),
+            Path::new("../i386-pc-linux-gnu/clang_rt.crtbegin.o")
+        );
+        assert!(root.join(path).is_file(), "upgraded link must resolve");
+        assert_eq!(
+            std::fs::read(root.join(path)).unwrap(),
+            std::fs::read(fresh.join(path)).unwrap()
+        );
+        for path in &metadata.files {
+            let expected = fresh.join(path);
+            if std::fs::symlink_metadata(&expected)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+            {
+                assert_eq!(
+                    std::fs::read_link(root.join(path)).unwrap(),
+                    std::fs::read_link(&expected).unwrap(),
+                    "upgraded symlink differs from fresh extraction: {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn directory_replaced_by_symlink_preserves_contents() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -1046,7 +1186,23 @@ mod tests {
             b"new",
             Some(("data", "other", tar::EntryType::Symlink)),
         );
-        assert!(extract_package(&archive, &root, &HashMap::new()).is_err());
+        let error = match extract_package(&archive, &root, &HashMap::new()) {
+            Ok(_) => panic!("nonempty directory must not be replaced"),
+            Err(error) => error,
+        };
+        match error {
+            ExecError::Extraction { pkg, message } => {
+                assert_eq!(pkg, "test.pkg.tar");
+                assert!(message.contains("data"), "{message}");
+                assert!(
+                    message.contains("remove empty destination directory"),
+                    "{message}"
+                );
+                let reason = std::fs::remove_dir(root.join("data")).unwrap_err();
+                assert!(message.contains(&reason.to_string()), "{message}");
+            }
+            error => panic!("missing extraction context: {error}"),
+        }
         assert_eq!(
             std::fs::read_to_string(root.join("data/user-file")).unwrap(),
             "keep"

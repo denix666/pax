@@ -33,6 +33,14 @@ pub enum ExecError {
     #[error("hook failed: {name}: {message}")]
     Hook { name: String, message: String },
 
+    #[error("packages were applied, but transaction maintenance is incomplete:\n{}", .failures.join("\n"))]
+    MaintenanceIncomplete { failures: Vec<String> },
+
+    #[error(
+        "transaction did not complete: {cause}\njournal: {journal}; inspect with pax transaction-status using the same configuration and paths; do not retry blindly"
+    )]
+    TransactionIncomplete { cause: String, journal: PathBuf },
+
     #[error("conflicting files:\n{0}")]
     FileConflict(String),
 
@@ -51,6 +59,9 @@ pub enum ExecError {
 
     #[error(transparent)]
     Core(#[from] pax_core::error::PaxError),
+
+    #[error(transparent)]
+    Resolve(#[from] pax_resolver::ResolveError),
 }
 
 pub type Result<T> = std::result::Result<T, ExecError>;

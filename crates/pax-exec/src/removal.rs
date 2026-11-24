@@ -1,11 +1,17 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{ExecError, Result};
+use crate::execute::{
+    finish_transaction, maintenance_result, read_file_list, run_recorded_hooks,
+    run_recorded_scriptlet,
+};
 use crate::extract::{ensure_safe_parent, safe_relative_path, validate_identity};
+use crate::hooks::{HookWhen, TransactionPackages};
+use crate::journal::{Journal, Phase};
 use crate::log::PaxLogger;
 use crate::register::remove_db_entry;
-use crate::scriptlet::{ScriptletOp, run_scriptlet};
+use crate::scriptlet::ScriptletOp;
 
 pub struct RemovalTarget {
     pub name: String,
@@ -17,6 +23,45 @@ pub fn remove_package(
     root_dir: &Path,
     db_path: &Path,
     logger: &mut PaxLogger,
+) -> Result<Vec<String>> {
+    pax_alpm::lock::ensure_no_active_transaction(db_path)?;
+    validate_removal_paths(
+        root_dir,
+        &read_file_list(db_path, &target.name, &target.version)?,
+    )?;
+    let mut journal = Journal::begin(
+        db_path,
+        root_dir,
+        vec![format!("remove {} {}", target.name, target.version)],
+    )?;
+    let mut failures = Vec::new();
+    let result = remove_package_recorded(
+        target,
+        root_dir,
+        db_path,
+        logger,
+        &mut journal,
+        &mut failures,
+        &HashSet::new(),
+    );
+    let mut files = Vec::new();
+    let outcome = result.and_then(|removed| {
+        files = removed;
+        maintenance_result(failures)
+    });
+    finish_transaction(outcome, &mut journal, db_path, logger)?;
+    Ok(files)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_package_recorded(
+    target: &RemovalTarget,
+    root_dir: &Path,
+    db_path: &Path,
+    logger: &mut PaxLogger,
+    journal: &mut Journal,
+    failures: &mut Vec<String>,
+    retained_directories: &HashSet<String>,
 ) -> Result<Vec<String>> {
     validate_identity(&target.name, &target.version)?;
     let pkg_dir = db_path
@@ -30,8 +75,11 @@ pub fn remove_package(
         Err(error) => return Err(error.into()),
     };
     if let Some(script) = &script {
-        run_scriptlet(
-            &script,
+        run_recorded_scriptlet(
+            journal,
+            failures,
+            "pre_remove",
+            script,
             ScriptletOp::PreRemove,
             &target.version,
             None,
@@ -41,11 +89,18 @@ pub fn remove_package(
         )?;
     }
 
-    let removed_files = remove_package_paths(&pkg_dir, root_dir, &HashSet::new())?;
+    let removed_files = journal.step(
+        Phase::Applying,
+        &format!("{}: remove paths from {}", target.name, pkg_dir.display()),
+        || remove_package_paths(&pkg_dir, root_dir, retained_directories),
+    )?;
 
     if let Some(script) = &script {
-        run_scriptlet(
-            &script,
+        run_recorded_scriptlet(
+            journal,
+            failures,
+            "post_remove",
+            script,
             ScriptletOp::PostRemove,
             &target.version,
             None,
@@ -55,9 +110,91 @@ pub fn remove_package(
         )?;
     }
 
-    remove_db_entry(db_path, &target.name, &target.version)?;
+    journal.step(
+        Phase::Applying,
+        &format!("{}: remove database entry {}", target.name, target.version),
+        || remove_db_entry(db_path, &target.name, &target.version),
+    )?;
 
     Ok(removed_files)
+}
+
+/// Execute removals under a caller-held DB lock, with the same journal and
+/// maintenance outcome semantics as installation and upgrade transactions.
+pub fn execute_removal_transaction(
+    targets: &[RemovalTarget],
+    root_dir: &Path,
+    db_path: &Path,
+    hook_dirs: &[PathBuf],
+    logger: &mut PaxLogger,
+) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(ExecError::NotRoot);
+    }
+    pax_alpm::lock::ensure_no_active_transaction(db_path)?;
+    let mut files = Vec::new();
+    for target in targets {
+        let outgoing = read_file_list(db_path, &target.name, &target.version)?;
+        validate_removal_paths(root_dir, &outgoing)?;
+        files.extend(outgoing);
+    }
+    files.sort();
+    files.dedup();
+    let mut packages = TransactionPackages {
+        removed: targets.iter().map(|target| target.name.clone()).collect(),
+        removed_files: files,
+        ..Default::default()
+    };
+    let mut journal = Journal::begin(
+        db_path,
+        root_dir,
+        targets
+            .iter()
+            .map(|target| format!("remove {} {}", target.name, target.version))
+            .collect(),
+    )?;
+    logger.log_transaction_start();
+    let result = (|| {
+        let mut failures = Vec::new();
+        run_recorded_hooks(
+            root_dir,
+            db_path,
+            hook_dirs,
+            &HookWhen::PreTransaction,
+            &packages,
+            logger,
+            &mut journal,
+            &mut failures,
+        )?;
+        packages.removed_files.clear();
+        eprintln!(":: Applying package removals...");
+        for target in targets {
+            let removed = remove_package_recorded(
+                target,
+                root_dir,
+                db_path,
+                logger,
+                &mut journal,
+                &mut failures,
+                &HashSet::new(),
+            )?;
+            packages.removed_files.extend(removed);
+            logger.log_removed(&target.name, &target.version);
+        }
+        eprintln!(":: Running post-transaction maintenance...");
+        run_recorded_hooks(
+            root_dir,
+            db_path,
+            hook_dirs,
+            &HookWhen::PostTransaction,
+            &packages,
+            logger,
+            &mut journal,
+            &mut failures,
+        )?;
+        maintenance_result(failures)
+    })();
+    finish_transaction(result, &mut journal, db_path, logger)
 }
 
 /// Validate outgoing file lists without modifying the filesystem. The final path
@@ -83,11 +220,7 @@ pub fn remove_package_paths(
     root_dir: &Path,
     incoming_files: &HashSet<String>,
 ) -> Result<Vec<String>> {
-    let content = match std::fs::read_to_string(pkg_dir.join("files")) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
+    let content = crate::execute::read_file_metadata(&pkg_dir.join("files"))?;
     let incoming: HashSet<_> = incoming_files
         .iter()
         .map(|path| safe_relative_path(Path::new(path)))
@@ -199,6 +332,29 @@ pub fn remove_package_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_or_damaged_file_metadata_does_not_silently_remove_database_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = temp.path().join("db");
+        let entry = db.join("local/example-1-1");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("desc"), "%NAME%\nexample\n\n%SIZE%\n4\n\n").unwrap();
+        std::fs::write(root.join("file"), "keep").unwrap();
+        assert!(remove_package_paths(&entry, &root, &HashSet::new()).is_err());
+        std::fs::write(entry.join("files"), "damaged").unwrap();
+        assert!(remove_package_paths(&entry, &root, &HashSet::new()).is_err());
+        let target = RemovalTarget {
+            name: "example".into(),
+            version: "1-1".into(),
+        };
+        assert!(remove_package(&target, &root, &db, &mut PaxLogger::none()).is_err());
+        assert!(entry.join("desc").exists());
+        assert_eq!(std::fs::read_to_string(root.join("file")).unwrap(), "keep");
+        assert!(!db.join("pax-transactions").exists());
+    }
 
     #[test]
     fn outgoing_path_preflight_is_read_only_and_does_not_follow_final_links() {

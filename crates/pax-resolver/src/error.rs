@@ -36,6 +36,12 @@ pub enum ResolveError {
         blocked_by: String,
     },
 
+    #[error("invalid execution plan: {message}")]
+    InvalidExecutionPlan { message: String },
+
+    #[error("unsupported linked-removal ordering cycle:\n  {}", constraints.join("\n  "))]
+    ExecutionPlanCycle { constraints: Vec<String> },
+
     #[error(transparent)]
     Core(#[from] pax_core::error::PaxError),
 }

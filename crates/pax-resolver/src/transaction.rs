@@ -1,5 +1,7 @@
 use pax_core::version::Version;
 
+use crate::error::{ResolveError, Result};
+use crate::planning::execution_plan;
 use crate::pool::{PackagePool, PackageSource};
 use crate::resolve::ResolvedSet;
 
@@ -26,14 +28,20 @@ pub struct UpgradeAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemovalReason {
     Replaced,
-    Conflict { with: String },
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalLink {
+    pub incoming: String,
+    pub reason: RemovalReason,
 }
 
 #[derive(Debug, Clone)]
 pub struct RemovalAction {
     pub name: String,
     pub version: Version,
-    pub reason: RemovalReason,
+    pub links: Vec<RemovalLink>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,13 +61,15 @@ impl Transaction {
     }
 }
 
+/// Build actions from the caller-ordered resolved set and validate their execution
+/// plan against pool metadata. No-op actions cannot serve as removal anchors.
 pub fn build_transaction<P: PackagePool>(
     pool: &P,
     resolved: &ResolvedSet,
     targets: &[String],
     sync_sizes: &dyn Fn(&str) -> (u64, u64),
     reinstall: bool,
-) -> Transaction {
+) -> Result<Transaction> {
     let target_set: std::collections::HashSet<&str> = targets.iter().map(|s| s.as_str()).collect();
 
     let mut installs = Vec::new();
@@ -67,8 +77,34 @@ pub fn build_transaction<P: PackagePool>(
     let mut package_order = Vec::new();
     let mut total_download: u64 = 0;
     let mut total_installed: u64 = 0;
+    let mut incoming = Vec::new();
+    let mut selected_names = std::collections::HashSet::new();
 
     for pkg in &resolved.to_install {
+        if !selected_names.insert(pkg.name.as_str()) {
+            return Err(ResolveError::InvalidExecutionPlan {
+                message: format!("duplicate resolved package: {}", pkg.name),
+            });
+        }
+        let candidate = pool
+            .get(pkg.id)
+            .ok_or_else(|| ResolveError::InvalidExecutionPlan {
+                message: format!(
+                    "missing pool metadata for resolved package {} {}",
+                    pkg.name, pkg.version
+                ),
+            })?;
+        if candidate.info.name != pkg.name
+            || candidate.info.version != pkg.version
+            || candidate.source != pkg.source
+        {
+            return Err(ResolveError::InvalidExecutionPlan {
+                message: format!(
+                    "stale pool metadata for resolved package {} {}",
+                    pkg.name, pkg.version
+                ),
+            });
+        }
         let repo_name = match pkg.source {
             PackageSource::Sync { repo_index } => format!("repo:{repo_index}"),
             PackageSource::Local => "local".to_string(),
@@ -79,6 +115,7 @@ pub fn build_transaction<P: PackagePool>(
         if let Some(installed_ver) = pool.installed_version(&pkg.name) {
             let different = pkg.version != *installed_ver;
             if different || (reinstall && target_set.contains(pkg.name.as_str())) {
+                incoming.push(candidate.info.clone());
                 package_order.push(pkg.name.clone());
                 total_download += dl_size;
                 total_installed += inst_size;
@@ -92,6 +129,7 @@ pub fn build_transaction<P: PackagePool>(
                 });
             }
         } else {
+            incoming.push(candidate.info.clone());
             package_order.push(pkg.name.clone());
             total_download += dl_size;
             total_installed += inst_size;
@@ -107,26 +145,34 @@ pub fn build_transaction<P: PackagePool>(
     }
 
     let mut removals = Vec::new();
-    for (name, reason) in &resolved.to_remove {
-        let version = pool
-            .installed_version(name)
-            .cloned()
-            .unwrap_or_else(|| Version::parse("0-0").unwrap());
+    for (name, links) in &resolved.to_remove {
+        let version = pool.installed_version(name).cloned().ok_or_else(|| {
+            ResolveError::InvalidExecutionPlan {
+                message: format!("cannot remove {name}: package is not installed"),
+            }
+        })?;
         removals.push(RemovalAction {
             name: name.clone(),
             version,
-            reason: reason.clone(),
+            links: links.clone(),
         });
     }
 
-    Transaction {
+    let tx = Transaction {
         installs,
         upgrades,
         removals,
         package_order,
         total_download_size: total_download,
         total_installed_size: total_installed,
-    }
+    };
+    let installed: Vec<_> = pool
+        .all_installed()
+        .iter()
+        .map(|pkg| pkg.info.clone())
+        .collect();
+    execution_plan(&tx, &installed, &incoming)?;
+    Ok(tx)
 }
 
 #[cfg(test)]
@@ -172,7 +218,8 @@ mod tests {
             &["app".to_string()],
             &|_| (1000, 5000),
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(tx.installs.len(), 2);
         assert!(tx.upgrades.is_empty());
@@ -208,7 +255,7 @@ mod tests {
             to_install,
             to_remove: vec![],
         };
-        let tx = build_transaction(&pool, &resolved, &[], &|_| (1, 2), false);
+        let tx = build_transaction(&pool, &resolved, &[], &|_| (1, 2), false).unwrap();
         assert_eq!(tx.package_order, packages);
         assert_eq!(tx.installs.len(), 2);
         assert_eq!(tx.upgrades[0].name, "middle");
@@ -230,11 +277,91 @@ mod tests {
             }],
             to_remove: vec![],
         };
-        let tx = build_transaction(&pool, &resolved, &["app".into()], &|_| (10, 20), false);
+        let tx =
+            build_transaction(&pool, &resolved, &["app".into()], &|_| (10, 20), false).unwrap();
         assert_eq!(tx.package_order, ["app"]);
         assert_eq!(tx.upgrades.len(), 1);
         assert_eq!(tx.upgrades[0].new_version.to_string(), "1-1");
         assert_eq!(tx.total_download_size, 10);
+    }
+
+    #[test]
+    fn removal_link_to_filtered_equal_version_action_is_not_discarded() {
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_local(make_pkg("old", "1", &[]));
+        pool.add_local(make_pkg("new", "1", &[]));
+        let mut new = make_pkg("new", "1", &[]);
+        new.replaces = vec![Dependency::parse("old").unwrap()];
+        pool.add_sync(new, 0);
+        let targets = ["new".into()];
+        let resolved = resolve(&pool, &targets, &ResolveOptions::default()).unwrap();
+        let error = build_transaction(&pool, &resolved, &targets, &|_| (0, 0), false).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("old"));
+        assert!(message.contains("missing incoming action new"));
+        // Explicit reinstall creates a real anchor instead of a removal-only transaction.
+        let tx = build_transaction(&pool, &resolved, &targets, &|_| (0, 0), true).unwrap();
+        assert_eq!(tx.package_order, ["new"]);
+        assert_eq!(tx.removals.len(), 1);
+    }
+
+    #[test]
+    fn missing_outgoing_package_never_gets_a_synthetic_version() {
+        let pool = ConcretePool::new(HashSet::new());
+        let resolved = ResolvedSet {
+            to_install: vec![],
+            to_remove: vec![(
+                "absent".into(),
+                vec![RemovalLink {
+                    incoming: "new".into(),
+                    reason: RemovalReason::Replaced,
+                }],
+            )],
+        };
+        let error = build_transaction(&pool, &resolved, &[], &|_| (0, 0), false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot remove absent: package is not installed")
+        );
+    }
+
+    #[test]
+    fn builder_rejects_impossible_removal_order_after_successful_resolution() {
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_local(make_pkg("old-lib", "1", &[]));
+        pool.add_local(make_pkg("old-app", "1", &["old-lib"]));
+        let mut lib = make_pkg("new-lib", "1", &[]);
+        lib.replaces = vec![Dependency::parse("old-lib").unwrap()];
+        let mut app = make_pkg("new-app", "1", &["new-lib"]);
+        app.replaces = vec![Dependency::parse("old-app").unwrap()];
+        pool.add_sync(lib, 0);
+        pool.add_sync(app, 0);
+        let targets = ["new-lib".into(), "new-app".into()];
+        let mut resolved = resolve(&pool, &targets, &ResolveOptions::default()).unwrap();
+        crate::topo::topological_sort(&pool, &mut resolved);
+        assert!(matches!(
+            build_transaction(&pool, &resolved, &targets, &|_| (0, 0), false),
+            Err(ResolveError::ExecutionPlanCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn builder_uses_selected_metadata_and_rejects_stale_or_duplicate_selections() {
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_sync(make_pkg("app", "1", &[]), 0);
+        pool.add_sync(make_pkg("app", "9", &["not-selected"]), 1);
+        let mut resolved = resolve(&pool, &["app".into()], &ResolveOptions::default()).unwrap();
+        assert!(build_transaction(&pool, &resolved, &[], &|_| (0, 0), false).is_ok());
+        let original = resolved.to_install[0].clone();
+        resolved.to_install.push(original.clone());
+        assert!(build_transaction(&pool, &resolved, &[], &|_| (0, 0), false).is_err());
+        resolved.to_install.pop();
+        resolved.to_install[0].version = Version::parse("9").unwrap();
+        assert!(build_transaction(&pool, &resolved, &[], &|_| (0, 0), false).is_err());
+        resolved.to_install[0] = original;
+        resolved.to_install[0].id = crate::pool::PackageId(u32::MAX);
+        assert!(build_transaction(&pool, &resolved, &[], &|_| (0, 0), false).is_err());
     }
 
     #[test]
@@ -250,7 +377,8 @@ mod tests {
             &["app".to_string()],
             &|_| (1000, 5000),
             false,
-        );
+        )
+        .unwrap();
 
         assert!(tx.installs.is_empty());
         assert_eq!(tx.upgrades.len(), 1);

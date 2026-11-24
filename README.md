@@ -2,7 +2,7 @@
 
 A modern and fast package manager for Arch-based systems, written in Rust.
 
-Drop-in replacement for pacman with AUR support, dependency resolution, parallel downloads, and shell completions.
+Package manager using pacman's configuration and database formats, with AUR support, dependency resolution, parallel downloads, and shell completions.
 
 ## Disclaimer
 
@@ -10,12 +10,15 @@ This program comes with no warranty. You must use this program at your own risk.
 
 ## Features
 
-- **Full pacman compatibility** — reads pacman.conf, uses the same database format and mirrors
+- **Pacman database compatibility** — reads pacman.conf, uses the same database format and mirrors
 - **Dependency resolution** — automatic dependency resolution with topological sorting
+- **Linked replacements** — removes each replaced package just before its related incoming action, instead of removing all replacements in advance
 - **Parallel downloads** — concurrent package downloads with multi-mirror fallback
 - **AUR support** — search, install, and build AUR packages via makepkg
 - **Shell completions** — dynamic completions for bash, zsh, and fish with `[installed]` markers
-- **Transaction hooks** — supports alpm hooks (PreTransaction / PostTransaction)
+- **Transaction hooks** — supports alpm hooks (PreTransaction / PostTransaction); reports incomplete maintenance instead of full success
+- **Transaction diagnostics** — persistent operation journal and `transaction-status`; unfinished transactions block further changes
+- **Archive preflight** — checks complete archive streams, metadata, architecture, links, and incompatible destination types before hooks
 - **Scriptlets** — runs pre/post install/upgrade/remove scriptlets
 - **Backup file handling** — preserves user-modified config files (`.pacnew` / `.pacsave`)
 - **PGP signature verification** — verifies package signatures respecting SigLevel settings (global and per-repo)
@@ -65,7 +68,8 @@ Most commands that modify the system (install, remove, upgrade, sync) will autom
 | `aur-install` | — | Install packages from AUR |
 | `aur-upgrade` | — | Upgrade installed AUR packages |
 | `aur-search` | — | Search AUR for packages |
-| `remove-lock` | — | Remove a stale database lock file |
+| `transaction-status` | — | Inspect the active transaction journal without changing it |
+| `remove-lock` | — | Remove a stale database lock file when no unfinished transaction journal exists |
 
 ### Examples
 
@@ -151,6 +155,27 @@ pax check-files bash glibc
 # Remove a stale lock file (if pax or pacman was interrupted)
 pax remove-lock
 ```
+
+### Transaction diagnostics and limits
+
+Before applying packages, pax checks all incoming archives. During application it records the current hook, scriptlet, extraction, cleanup, or database operation in `DBPath/pax-transactions/active.json`. Successful transactions are archived under `DBPath/pax-transactions/history/`.
+
+```bash
+pax transaction-status
+
+# Use the same configuration, database and root as the interrupted operation
+pax --config /path/to/pacman.conf --dbpath /path/to/db --root /path/to/root transaction-status
+```
+
+The command only displays diagnostic state; it does not repair packages or remove locks. An active journal blocks further pax modifications, including cache cleaning and `remove-lock`. Investigate the running processes, journal, package files and database before attempting manual recovery. Pacman itself does not honor this additional pax journal.
+
+Nonfatal hook and scriptlet failures do not suppress later maintenance, but the command returns an error and keeps the journal active. A failing `PreTransaction` hook with `AbortOnFail` stops application. Post-transaction hooks are not run against the complete planned target set after a partial application failure.
+
+**Transactions are not atomic, and automatic recovery and boot-set protection are not implemented.** The journal is diagnostic: it does not contain old file contents or database backups, and its durability does not imply that package contents are durable. Arbitrary hook effects cannot be rolled back. Kernel changes still require an independently recoverable boot environment.
+
+Replacement and conflict removals are linked to their incoming packages while preserving the install/upgrade dependency order. An early failure does not start later unrelated removals. Unsupported ordering constraints and file transfers that would be deleted by later cleanup are rejected before hooks. This is not atomic replacement: the current replacement can still be partially applied.
+
+Archive checks are deliberately conservative: hardlinks must reference an earlier regular member in the same archive; nonempty directory replacement and incompatible file-to-directory transitions are rejected before hooks. Additional gzip/xz streams and ambiguous metadata are also rejected. Transfers from an upgraded owner through a different alias spelling, or incoming paths traversing a parent symlink owned by a changing package, are currently rejected rather than risking later deletion of the new file or its access path. This is not a promise of identical behavior for every archive accepted by pacman.
 
 ### Downgrading packages
 

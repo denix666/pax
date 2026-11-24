@@ -46,7 +46,13 @@ fn main() -> Result<()> {
 
     let mut db = DatabaseHandle::new(config);
 
-    {
+    // The journal gate must precede logging and even the missing-lock fast path.
+    if matches!(command, Command::RemoveLock) {
+        commands::ensure_root();
+        pax_alpm::lock::ensure_no_active_transaction(&db.config.db_path)?;
+    }
+
+    if !matches!(command, Command::TransactionStatus) {
         let mut logger = pax_exec::PaxLogger::open(&db.config.log_file);
         let args: Vec<String> = std::env::args().skip(1).collect();
         logger.log_command(&args);
@@ -104,8 +110,47 @@ fn main() -> Result<()> {
         Command::Upgrade { dry_run, download_only, noconfirm } => {
             commands::upgrade::run(&mut db, *dry_run, *download_only, *noconfirm)
         }
-        Command::RemoveLock => {
+        Command::TransactionStatus => {
             commands::ensure_root();
+            let record = pax_exec::journal::inspect(&db.config.db_path)?;
+            println!("Diagnostic only; no automatic recovery is performed.");
+            if let Some(record) = record {
+                println!("Transaction ID: {}", record.id);
+                println!("Root: {}", record.root.display());
+                println!("Database: {}", record.db_path.display());
+                println!("State: {:?}", record.state);
+                println!(
+                    "Current operation: {}",
+                    record.current_operation.as_deref().unwrap_or("none recorded")
+                );
+                println!("Planned operations ({}):", record.planned_operations.len());
+                if record.planned_operations.is_empty() {
+                    println!("  none recorded");
+                }
+                for operation in &record.planned_operations {
+                    println!("  - {operation}");
+                }
+                println!("Completed operations ({}):", record.completed_operations.len());
+                if record.completed_operations.is_empty() {
+                    println!("  none recorded");
+                }
+                for operation in &record.completed_operations {
+                    println!("  - {operation}");
+                }
+                println!("Failure:");
+                for line in record.failure.as_deref().unwrap_or("none recorded").lines() {
+                    println!("  {line}");
+                }
+            } else {
+                println!(
+                    "No unfinished journal found for {} (no active journal).",
+                    db.config.db_path.display()
+                );
+            }
+            println!("Journal status does not guarantee package, database, or system health.");
+            Ok(())
+        }
+        Command::RemoveLock => {
             let lock_path = db.config.db_path.join("db.lck");
             if !lock_path.exists() {
                 println!("No lock file found.");

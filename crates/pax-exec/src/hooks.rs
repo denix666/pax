@@ -225,6 +225,9 @@ pub struct TransactionPackages {
 /// `dependency_satisfied` must check the installed database at this hook phase,
 /// including version constraints and versioned/unversioned package provides.
 /// It must not assume that packages scheduled for installation already exist.
+/// Returns nonfatal failures in execution order, continuing with subsequent hooks.
+/// Only a failing PreTransaction hook with AbortOnFail returns Err immediately;
+/// any preceding failures remain in the log.
 pub fn run_hooks(
     hooks: &[Hook],
     when: &HookWhen,
@@ -232,7 +235,8 @@ pub fn run_hooks(
     root_dir: &Path,
     dependency_satisfied: &dyn Fn(&Dependency) -> bool,
     logger: &mut PaxLogger,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut failures = Vec::new();
     for hook in hooks {
         if hook.action.when != *when {
             continue;
@@ -258,17 +262,19 @@ pub fn run_hooks(
             run_hook_action(&hook.action, &matched, &hook.name, root_dir, logger)
         })();
         if let Err(error) = result {
-            eprintln!("warning: {error}");
-            logger.log_warning(&error.to_string());
+            let message = error.to_string();
+            eprintln!("warning: {message}");
+            logger.log_warning(&message);
             if *when == HookWhen::PreTransaction && hook.action.abort_on_fail {
                 return Err(error);
             }
+            failures.push(message);
         }
     }
-    Ok(())
+    Ok(failures)
 }
 
-fn match_hook(hook: &Hook, tx_pkgs: &TransactionPackages) -> Vec<String> {
+pub(crate) fn match_hook(hook: &Hook, tx_pkgs: &TransactionPackages) -> Vec<String> {
     let mut matched = Vec::new();
     for trigger in &hook.triggers {
         for op in &trigger.operations {
@@ -507,6 +513,7 @@ mod tests {
         for (when, flag, aborts) in [
             (HookWhen::PreTransaction, "", false),
             (HookWhen::PreTransaction, "AbortOnFail", true),
+            (HookWhen::PostTransaction, "", false),
             (HookWhen::PostTransaction, "AbortOnFail", false),
         ] {
             let when_name = if when == HookWhen::PreTransaction {
@@ -514,19 +521,31 @@ mod tests {
             } else {
                 "PostTransaction"
             };
-            let hook = hook("/bin/false", flag, when_name);
-            assert_eq!(
-                run_hooks(
-                    &[hook],
-                    &when,
-                    &tx,
-                    Path::new("/"),
-                    &|_| true,
-                    &mut PaxLogger::none()
-                )
-                .is_err(),
-                aborts
+            let hooks = [
+                hook("/bin/false", flag, when_name),
+                hook("/bin/true", "Depends = checked", when_name),
+            ];
+            let checked = std::cell::Cell::new(false);
+            let result = run_hooks(
+                &hooks,
+                &when,
+                &tx,
+                Path::new("/"),
+                &|_| {
+                    checked.set(true);
+                    true
+                },
+                &mut PaxLogger::none(),
             );
+            assert_eq!(checked.get(), !aborts);
+            if aborts {
+                assert!(matches!(result.unwrap_err(), ExecError::Hook { .. }));
+            } else {
+                let failures = result.unwrap();
+                assert_eq!(failures.len(), 1);
+                assert!(failures[0].contains("test.hook"));
+                assert!(failures[0].contains("exit status: 1"));
+            }
         }
     }
 
@@ -557,29 +576,90 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_failure_does_not_skip_later_hooks() {
-        let hooks = [
-            hook("/bin/false", "", "PreTransaction"),
-            hook("/bin/true", "Depends = checked", "PreTransaction"),
-        ];
-        let checked = std::cell::Cell::new(false);
+    fn nonfatal_failures_are_collected_without_skipping_later_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_exec = format!("\"{}\"", temp.path().join("missing-executable").display());
         let tx = TransactionPackages {
             installed: vec!["test".into()],
             ..Default::default()
         };
-        run_hooks(
+        for (when, when_name, flags) in [
+            (HookWhen::PreTransaction, "PreTransaction", ""),
+            (HookWhen::PostTransaction, "PostTransaction", "AbortOnFail"),
+        ] {
+            let mut hooks = [
+                hook("/bin/false", flags, when_name),
+                hook(&missing_exec, flags, when_name),
+                hook(
+                    &missing_exec,
+                    &format!("{flags}\nDepends = missing>=2"),
+                    when_name,
+                ),
+                hook("/bin/true", "Depends = checked", when_name),
+            ];
+            for (hook, name) in
+                hooks
+                    .iter_mut()
+                    .zip(["exit.hook", "spawn.hook", "dependency.hook", "last.hook"])
+            {
+                hook.name = name.into();
+            }
+            let checked = std::cell::Cell::new(false);
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let failures = run_hooks(
+                &hooks,
+                &when,
+                &tx,
+                Path::new("/"),
+                &|dependency| {
+                    if dependency.name == "checked" {
+                        checked.set(true);
+                        true
+                    } else {
+                        false
+                    }
+                },
+                &mut PaxLogger::open(log.path()),
+            )
+            .unwrap();
+            assert!(checked.get());
+            assert_eq!(failures.len(), 3);
+            assert!(failures[0].contains("exit.hook"));
+            assert!(failures[0].contains("exit status: 1"));
+            assert!(failures[1].contains("spawn.hook"));
+            assert!(failures[2].contains("dependency.hook"));
+            assert!(failures[2].contains("unsatisfied dependency: missing>=2"));
+            let content = std::fs::read_to_string(log.path()).unwrap();
+            for failure in &failures {
+                assert!(content.contains(failure));
+            }
+            assert!(content.contains("running 'last.hook'"));
+        }
+    }
+
+    #[test]
+    fn successful_and_skipped_hooks_return_no_failures() {
+        let mut unmatched = hook("/bin/false", "", "PostTransaction");
+        unmatched.triggers[0].targets = vec!["other".into()];
+        let hooks = [
+            hook("/bin/true", "", "PostTransaction"),
+            hook("/bin/false", "AbortOnFail", "PreTransaction"),
+            unmatched,
+        ];
+        let tx = TransactionPackages {
+            installed: vec!["test".into()],
+            ..Default::default()
+        };
+        let failures = run_hooks(
             &hooks,
-            &HookWhen::PreTransaction,
+            &HookWhen::PostTransaction,
             &tx,
             Path::new("/"),
-            &|_| {
-                checked.set(true);
-                true
-            },
+            &|_| true,
             &mut PaxLogger::none(),
         )
         .unwrap();
-        assert!(checked.get());
+        assert!(failures.is_empty());
     }
 
     #[test]
