@@ -101,6 +101,8 @@ pub struct PacmanConfig {
     pub sig_level: SigConfig,
     pub local_file_sig_level: SigConfig,
     pub repos: Vec<Repository>,
+    db_path_overridden: bool,
+    log_file_overridden: bool,
     cache_dirs_overridden: bool,
 }
 
@@ -130,6 +132,8 @@ impl Default for PacmanConfig {
             sig_level: SigConfig::default(),
             local_file_sig_level: SigConfig::default(),
             repos: vec![],
+            db_path_overridden: false,
+            log_file_overridden: false,
             cache_dirs_overridden: false,
         }
     }
@@ -139,6 +143,29 @@ impl PacmanConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).map_err(PaxError::Io)?;
         Self::parse(&content, path)
+    }
+
+    /// Apply CLI paths, resolving only implicit DBPath and LogFile under the root.
+    pub fn apply_path_overrides(&mut self, root: Option<&Path>, db_path: Option<&Path>) {
+        // Preserve direct public-field edits when distinguishable from defaults.
+        self.db_path_overridden |= self.db_path != Path::new("/var/lib/pacman/")
+            && self.db_path != self.root_dir.join("var/lib/pacman/");
+        self.log_file_overridden |= self.log_file != Path::new("/var/log/pax.log")
+            && self.log_file != self.root_dir.join("var/log/pax.log");
+
+        if let Some(root) = root {
+            self.root_dir = root.to_path_buf();
+        }
+        if let Some(db_path) = db_path {
+            self.db_path = db_path.to_path_buf();
+            self.db_path_overridden = true;
+        }
+        if !self.db_path_overridden {
+            self.db_path = self.root_dir.join("var/lib/pacman/");
+        }
+        if !self.log_file_overridden {
+            self.log_file = self.root_dir.join("var/log/pax.log");
+        }
     }
 
     fn parse(content: &str, config_path: &Path) -> Result<Self> {
@@ -192,7 +219,10 @@ impl PacmanConfig {
                 if section == "options" {
                     match key {
                         "RootDir" => config.root_dir = PathBuf::from(value),
-                        "DBPath" => config.db_path = PathBuf::from(value),
+                        "DBPath" => {
+                            config.db_path = PathBuf::from(value);
+                            config.db_path_overridden = true;
+                        }
                         "CacheDir" => {
                             if !config.cache_dirs_overridden {
                                 config.cache_dirs.clear();
@@ -200,7 +230,10 @@ impl PacmanConfig {
                             }
                             config.cache_dirs.push(PathBuf::from(value));
                         }
-                        "LogFile" => config.log_file = PathBuf::from(value),
+                        "LogFile" => {
+                            config.log_file = PathBuf::from(value);
+                            config.log_file_overridden = true;
+                        }
                         "GPGDir" => config.gpg_dir = PathBuf::from(value),
                         "HookDir" => config.hook_dirs.push(PathBuf::from(value)),
                         "HoldPkg" => {
@@ -286,6 +319,7 @@ impl PacmanConfig {
         }
         config.local_file_sig_level =
             parse_sig_level_with_base(&local_sig_override, config.sig_level);
+        config.apply_path_overrides(None, None);
         Ok(config)
     }
 }
@@ -463,6 +497,216 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn default_paths_remain_unchanged() {
+        for mut config in [
+            PacmanConfig::default(),
+            PacmanConfig::parse("[options]\n", Path::new("/etc/pacman.conf")).unwrap(),
+        ] {
+            for _ in 0..2 {
+                assert_eq!(config.root_dir, Path::new("/"));
+                assert_eq!(config.db_path, Path::new("/var/lib/pacman/"));
+                assert_eq!(config.log_file, Path::new("/var/log/pax.log"));
+                assert_eq!(config.cache_dirs, [Path::new("/var/cache/pacman/pkg/")]);
+                assert_eq!(config.gpg_dir, Path::new("/etc/pacman.d/gnupg/"));
+                assert!(config.hook_dirs.is_empty());
+                assert!(!config.cache_dirs_overridden);
+                config.apply_path_overrides(None, None);
+            }
+        }
+    }
+
+    #[test]
+    fn cli_root_resolves_implicit_db_and_log_paths() {
+        for mut config in [
+            PacmanConfig::default(),
+            PacmanConfig::parse("[options]\n", Path::new("/etc/pacman.conf")).unwrap(),
+        ] {
+            for root in [Path::new("/target root"), Path::new("relative-root")] {
+                config.apply_path_overrides(Some(root), None);
+                assert_eq!(config.root_dir, root);
+                assert_eq!(config.db_path, root.join("var/lib/pacman/"));
+                assert_eq!(config.log_file, root.join("var/log/pax.log"));
+                assert_eq!(config.cache_dirs, [Path::new("/var/cache/pacman/pkg/")]);
+                assert_eq!(config.gpg_dir, Path::new("/etc/pacman.d/gnupg/"));
+            }
+        }
+    }
+
+    #[test]
+    fn config_root_resolves_defaults_and_cli_root_replaces_it() {
+        let mut config = PacmanConfig::parse(
+            "[options]\nRootDir = /config-root\n",
+            Path::new("/etc/pacman.conf"),
+        )
+        .unwrap();
+        assert_eq!(config.root_dir, Path::new("/config-root"));
+        assert_eq!(config.db_path, Path::new("/config-root/var/lib/pacman/"));
+        assert_eq!(config.log_file, Path::new("/config-root/var/log/pax.log"));
+
+        for root in [Path::new("/cli-root"), Path::new("/")] {
+            config.apply_path_overrides(Some(root), None);
+            config.apply_path_overrides(None, None);
+            assert_eq!(config.root_dir, root);
+            assert_eq!(config.db_path, root.join("var/lib/pacman/"));
+            assert_eq!(config.log_file, root.join("var/log/pax.log"));
+        }
+    }
+
+    #[test]
+    fn explicit_config_paths_are_preserved_even_when_equal_to_defaults() {
+        for (db_path, log_file) in [
+            ("/var/lib/pacman/", "/var/log/pax.log"),
+            ("/config-root/var/lib/pacman/", "/config-root/var/log/pax.log"),
+            ("/custom-db", "/custom-log"),
+            ("relative-db", "relative-log"),
+        ] {
+            let mut config = PacmanConfig::parse(
+                &format!(
+                    "[options]\nDBPath = {db_path}\nLogFile = {log_file}\nRootDir = /config-root\n"
+                ),
+                Path::new("/etc/pacman.conf"),
+            )
+            .unwrap();
+            assert_eq!(config.db_path, Path::new(db_path));
+            assert_eq!(config.log_file, Path::new(log_file));
+            config.apply_path_overrides(Some(Path::new("/cli-root")), None);
+            assert_eq!(config.root_dir, Path::new("/cli-root"));
+            assert_eq!(config.db_path, Path::new(db_path));
+            assert_eq!(config.log_file, Path::new(log_file));
+        }
+    }
+
+    #[test]
+    fn db_and_log_explicitness_is_independent() {
+        for (option, expected_db, expected_log) in [
+            (
+                "DBPath = /var/lib/pacman/",
+                "/var/lib/pacman/",
+                "/cli-root/var/log/pax.log",
+            ),
+            (
+                "LogFile = /var/log/pax.log",
+                "/cli-root/var/lib/pacman/",
+                "/var/log/pax.log",
+            ),
+        ] {
+            let mut config = PacmanConfig::parse(
+                &format!("[options]\nRootDir = /config-root\n{option}\n"),
+                Path::new("/etc/pacman.conf"),
+            )
+            .unwrap();
+            config.apply_path_overrides(Some(Path::new("/cli-root")), None);
+            assert_eq!(config.db_path, Path::new(expected_db));
+            assert_eq!(config.log_file, Path::new(expected_log));
+        }
+    }
+
+    #[test]
+    fn included_paths_retain_explicitness_across_cli_root_overrides() {
+        let files = ConfigFixture::new();
+        files.write("pacman.conf", "[options]\nInclude = conf/options\n");
+        files.write("conf/options", "RootDir = /config-root\nInclude = paths\n");
+        for (options, db_path, log_file) in [
+            ("", None, None),
+            (
+                "DBPath = /var/lib/pacman/\nLogFile = /var/log/pax.log\n",
+                Some("/var/lib/pacman/"),
+                Some("/var/log/pax.log"),
+            ),
+            (
+                "DBPath = relative-db\nLogFile = relative-log\n",
+                Some("relative-db"),
+                Some("relative-log"),
+            ),
+        ] {
+            files.write("conf/paths", options);
+            let mut config = files.load().unwrap();
+            for root in [Path::new("/config-root"), Path::new("/cli-root")] {
+                assert_eq!(config.root_dir, root);
+                assert_eq!(
+                    config.db_path,
+                    db_path.map_or_else(|| root.join("var/lib/pacman/"), PathBuf::from)
+                );
+                assert_eq!(
+                    config.log_file,
+                    log_file.map_or_else(|| root.join("var/log/pax.log"), PathBuf::from)
+                );
+                config.apply_path_overrides(Some(Path::new("/cli-root")), None);
+            }
+        }
+    }
+
+    #[test]
+    fn cli_db_path_overrides_config_and_stays_explicit() {
+        for db_path in ["/var/lib/pacman/", "/cli-db", "relative-db"] {
+            let mut config = PacmanConfig::parse(
+                "[options]\nRootDir = /config-root\nDBPath = /config-db\n",
+                Path::new("/etc/pacman.conf"),
+            )
+            .unwrap();
+            config.apply_path_overrides(None, Some(Path::new(db_path)));
+            assert_eq!(config.root_dir, Path::new("/config-root"));
+            assert_eq!(config.db_path, Path::new(db_path));
+            assert_eq!(config.log_file, Path::new("/config-root/var/log/pax.log"));
+            config.apply_path_overrides(Some(Path::new("/cli-root")), Some(Path::new(db_path)));
+            config.apply_path_overrides(Some(Path::new("/next-root")), None);
+            assert_eq!(config.root_dir, Path::new("/next-root"));
+            assert_eq!(config.db_path, Path::new(db_path));
+            assert_eq!(config.log_file, Path::new("/next-root/var/log/pax.log"));
+        }
+    }
+
+    #[test]
+    fn root_does_not_prefix_cache_gpg_or_custom_hook_dirs() {
+        let mut config = PacmanConfig::parse(
+            "[options]\nRootDir = /config-root\nCacheDir = /var/cache/pacman/pkg/\nCacheDir = relative-cache\nGPGDir = /custom-keyring\nHookDir = /custom-hooks\nHookDir = relative-hooks\n",
+            Path::new("/etc/pacman.conf"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                config.cache_dirs,
+                [Path::new("/var/cache/pacman/pkg/"), Path::new("relative-cache")]
+            );
+            assert!(config.cache_dirs_overridden);
+            assert_eq!(config.gpg_dir, Path::new("/custom-keyring"));
+            assert_eq!(
+                config.hook_dirs,
+                [Path::new("/custom-hooks"), Path::new("relative-hooks")]
+            );
+            config.apply_path_overrides(Some(Path::new("/cli-root")), None);
+        }
+    }
+
+    #[test]
+    fn programmatic_nondefault_db_and_log_paths_are_preserved() {
+        for mut config in [
+            PacmanConfig::default(),
+            PacmanConfig::parse(
+                "[options]\nRootDir = /config-root\n",
+                Path::new("/etc/pacman.conf"),
+            )
+            .unwrap(),
+        ] {
+            config.db_path = PathBuf::from("/manual-db");
+            config.log_file = PathBuf::from("manual-log");
+            config.apply_path_overrides(Some(Path::new("/cli-root")), None);
+            config.apply_path_overrides(None, None);
+            assert_eq!(config.db_path, Path::new("/manual-db"));
+            assert_eq!(config.log_file, Path::new("manual-log"));
+        }
+    }
+
+    #[test]
+    fn programmatic_root_resolves_default_paths() {
+        let mut config = PacmanConfig::default();
+        config.root_dir = PathBuf::from("/manual-root");
+        config.apply_path_overrides(None, None);
+        assert_eq!(config.db_path, Path::new("/manual-root/var/lib/pacman/"));
+        assert_eq!(config.log_file, Path::new("/manual-root/var/log/pax.log"));
     }
 
     #[test]

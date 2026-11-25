@@ -1,12 +1,16 @@
+
 pub mod download;
 pub mod downgrade;
 pub mod error;
 pub mod execute;
 pub mod extract;
+
 pub mod hooks;
 pub mod log;
-pub mod journal;
+
 mod preflight;
+pub mod prepared;
+
 pub mod register;
 pub mod removal;
 pub mod scriptlet;

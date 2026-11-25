@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use pax_alpm::desc::{desc_to_package_info, generate_local_desc_from_pkginfo, parse_desc};
@@ -8,6 +10,33 @@ use pax_core::package::{InstallReason, PackageInfo};
 use tar::Archive;
 
 use crate::error::{ExecError, Result};
+
+pub(crate) const PKGINFO_LIMIT: u64 = 4 * 1024 * 1024;
+
+fn read_pkginfo_text<R: Read>(entry: &mut tar::Entry<'_, R>, archive: &Path) -> Result<String> {
+    let size = entry.size();
+    let invalid = |message: String| ExecError::Extraction {
+        pkg: archive.display().to_string(),
+        message: format!(".PKGINFO: {message}"),
+    };
+    if !entry.header().entry_type().is_file() || size > PKGINFO_LIMIT {
+        return Err(invalid(
+            "expected a regular metadata entry of at most 4 MiB".into(),
+        ));
+    }
+    let mut contents = String::new();
+    entry
+        .take(PKGINFO_LIMIT + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| invalid(format!("read bounded metadata: {error}")))?;
+    if contents.len() as u64 != size || contents.len() as u64 > PKGINFO_LIMIT {
+        return Err(invalid(format!(
+            "metadata length mismatch: declared {size}, read {}",
+            contents.len()
+        )));
+    }
+    Ok(contents)
+}
 
 pub struct PackageMetadata {
     pub pkginfo: String,
@@ -26,6 +55,7 @@ pub fn extract_package(
     existing_backup_md5: &HashMap<String, String>,
 ) -> Result<PackageMetadata> {
     validate_package_archive(pkg_path, root_dir)?;
+
     let pkg_name = pkg_path
         .file_name()
         .unwrap_or_default()
@@ -33,7 +63,7 @@ pub fn extract_package(
         .to_string();
 
     // First pass: read .PKGINFO to get backup entries before processing regular files
-    let backup_entries: Vec<String> = {
+    let first_pkginfo = {
         let file = std::fs::File::open(pkg_path)?;
         let decompressor = decompress(file, &pkg_name)?;
         let mut archive = Archive::new(decompressor);
@@ -56,15 +86,7 @@ pub fn extract_package(
             let path_str = path.to_string_lossy().to_string();
             let path_str = path_str.strip_prefix("./").unwrap_or(&path_str).to_string();
             if path_str == ".PKGINFO" {
-                if !entry.header().entry_type().is_file() {
-                    return Err(unsafe_path(&path));
-                }
-                entry
-                    .read_to_string(&mut pkginfo)
-                    .map_err(|e| ExecError::Extraction {
-                        pkg: pkg_name.clone(),
-                        message: format!(".PKGINFO: {e}"),
-                    })?;
+                pkginfo = read_pkginfo_text(&mut entry, pkg_path)?;
                 break;
             }
         }
@@ -77,16 +99,20 @@ pub fn extract_package(
             .find_map(|line| line.strip_prefix("pkgver = "))
             .unwrap_or("");
         validate_identity(name, version)?;
-        parse_backup_from_pkginfo(&pkginfo)
+        pkginfo
     };
+    let backup_entries = parse_backup_from_pkginfo(&first_pkginfo);
 
     // Second pass: extract everything
     let file = std::fs::File::open(pkg_path)?;
     let decompressor = decompress(file, &pkg_name)?;
     let mut archive = Archive::new(decompressor);
-    archive.set_preserve_permissions(true);
-    archive.set_preserve_mtime(true);
-    archive.set_unpack_xattrs(true);
+    // Apply metadata below: tar rejects blank IDs and must not set capabilities
+    // or set-ID bits before our numeric ownership change.
+    archive.set_preserve_permissions(false);
+    archive.set_preserve_ownerships(false);
+    archive.set_preserve_mtime(false);
+    archive.set_unpack_xattrs(false);
 
     let mut pkginfo = String::new();
     let mut mtree = Vec::new();
@@ -94,6 +120,7 @@ pub fn extract_package(
     let mut files: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut backup_md5 = HashMap::new();
+
     std::fs::create_dir_all(root_dir)?;
     let root_dir = root_dir.canonicalize()?;
     for backup in &backup_entries {
@@ -132,12 +159,13 @@ pub fn extract_package(
                             message: "duplicate or non-regular .PKGINFO".into(),
                         });
                     }
-                    entry
-                        .read_to_string(&mut pkginfo)
-                        .map_err(|e| ExecError::Extraction {
+                    pkginfo = read_pkginfo_text(&mut entry, pkg_path)?;
+                    if pkginfo != first_pkginfo {
+                        return Err(ExecError::Extraction {
                             pkg: pkg_name.clone(),
-                            message: format!(".PKGINFO: {e}"),
-                        })?;
+                            message: ".PKGINFO changed between extraction passes".into(),
+                        });
+                    }
                 }
                 ".MTREE" => {
                     entry
@@ -177,10 +205,25 @@ pub fn extract_package(
                 if !entry_type.is_file() {
                     return Err(unsafe_path(&path));
                 }
-                operation = "read backup payload";
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
-                let new_md5 = format!("{:x}", md5::compute(&buf));
+                operation = "stage backup payload";
+                let parent = dest.parent().ok_or_else(|| unsafe_path(&path))?;
+                std::fs::create_dir_all(parent)?;
+                // Keep the incoming inode private even after assigning package ownership.
+                // Stage on the destination filesystem so publication is an atomic rename.
+                let private = tempfile::Builder::new()
+                    .prefix(".pax-backup-")
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(parent)?;
+                let mut temporary = tempfile::NamedTempFile::new_in(private.path())?;
+                let size = entry.size();
+                if std::io::copy(&mut entry, &mut temporary)? != size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated backup payload",
+                    )
+                    .into());
+                }
+                let new_md5 = compute_md5(temporary.path())?;
                 backup_md5.insert(path_str.to_string(), new_md5.clone());
                 operation = "inspect existing backup";
                 let current_md5 = match std::fs::symlink_metadata(&dest) {
@@ -189,19 +232,15 @@ pub fn extract_package(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                     Err(error) => return Err(error.into()),
                 };
-                if let Some(current) = current_md5.as_ref() {
-                    if current == &new_md5 {
-                        return Ok(());
-                    }
-                    if let Some(old) = existing_backup_md5.get(path_str) {
-                        if old == &new_md5 {
-                            return Ok(());
-                        }
-                    }
+                if current_md5.as_ref().is_some_and(|current| {
+                    current != &new_md5 && existing_backup_md5.get(path_str) == Some(&new_md5)
+                }) {
+                    return Ok(());
                 }
-                let should_pacnew = current_md5
-                    .as_ref()
-                    .is_some_and(|current| existing_backup_md5.get(path_str) != Some(current));
+                // C == N converges to the archive inode and metadata, even if O differs.
+                let should_pacnew = current_md5.as_ref().is_some_and(|current| {
+                    current != &new_md5 && existing_backup_md5.get(path_str) != Some(current)
+                });
                 let output = if should_pacnew {
                     dest.with_file_name(format!(
                         "{}.pacnew",
@@ -211,7 +250,8 @@ pub fn extract_package(
                     dest.clone()
                 };
                 operation = "write backup payload (or .pacnew)";
-                write_backup(&output, &buf, entry.header().mode()?)?;
+                ensure_safe_parent(&root_dir, &path)?;
+                write_backup(&output, temporary, &mut entry)?;
                 if should_pacnew {
                     warnings.push(format!("{path_str} installed as {path_str}.pacnew"));
                 }
@@ -262,7 +302,12 @@ pub fn extract_package(
             // Replace only empty directories; never recursively delete user data.
             operation = "inspect destination";
             match std::fs::symlink_metadata(&dest) {
-                Ok(metadata) if metadata.is_dir() && !entry_type.is_dir() => {
+                Ok(metadata) if metadata.is_dir() && entry_type.is_dir() => {
+                    // Existing directory metadata belongs to the live system. Skip
+                    // tar as well: it chmods existing directories during unpack.
+                    return Ok(());
+                }
+                Ok(metadata) if metadata.is_dir() => {
                     operation = "remove empty destination directory";
                     std::fs::remove_dir(&dest)?;
                 }
@@ -287,12 +332,38 @@ pub fn extract_package(
                     return Err(unsafe_path(&path));
                 }
             }
+            // Hardlinks share the live source inode, including a kept local config.
+            if !entry_type.is_hard_link() {
+                ensure_safe_parent(&root_dir, &path)?;
+                operation = "set archive ownership";
+                set_ownership(&dest, entry.header())?;
+                if !entry_type.is_symlink() {
+                    operation = "restore archive permissions";
+                    std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(entry.header().mode()?),
+                    )?;
+                }
+                operation = "set archive extended attributes";
+                unpack_xattrs(&dest, &mut entry)?;
+                // Empty directories keep this timestamp; subsequent child creation
+                // updates populated directories, matching pacman's entry-order behavior.
+                operation = "set archive modification time";
+                set_mtime(&dest, entry.header().mtime()?)?;
+            }
             Ok(())
         })()
         .map_err(|error| ExecError::Extraction {
             pkg: pkg_name.clone(),
             message: format!("{}: {operation}: {error}", path.display()),
         })?;
+    }
+
+    if pkginfo != first_pkginfo {
+        return Err(ExecError::Extraction {
+            pkg: pkg_name,
+            message: "missing or changed .PKGINFO after extraction".into(),
+        });
     }
 
     // Some packages retain obsolete backup declarations in .PKGINFO. Only
@@ -326,6 +397,10 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
         let mut entry = entry?;
         let path = safe_relative_path(&entry.path()?)?;
         let kind = entry.header().entry_type();
+        archive_ids(entry.header()).map_err(|error| ExecError::Extraction {
+            pkg: pkg_path.display().to_string(),
+            message: format!("{}: validate archive ownership: {error}", path.display()),
+        })?;
         if !kind.is_file() && !kind.is_dir() && !kind.is_symlink() && !kind.is_hard_link() {
             return Err(unsafe_path(&path));
         }
@@ -381,9 +456,7 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
                 if pkginfo.is_some() {
                     return Err(unsafe_path(&path));
                 }
-                let mut text = String::new();
-                entry.read_to_string(&mut text)?;
-                pkginfo = Some(text);
+                pkginfo = Some(read_pkginfo_text(&mut entry, pkg_path)?);
             }
         } else {
             payload_paths.insert(path.clone());
@@ -580,20 +653,148 @@ pub(crate) fn validate_identity(name: &str, version: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_backup(path: &Path, data: &[u8], mode: u32) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let parent = path.parent().ok_or_else(|| unsafe_path(path))?;
-    std::fs::create_dir_all(parent)?;
-    // Rename a fresh inode so existing symlinks and hard links cannot redirect writes.
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(data)?;
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(mode))?;
-    temporary
-        .persist(path)
-        .map_err(|error| ExecError::Io(error.error))?;
+fn write_backup<R: Read>(
+    path: &Path,
+    temporary: tempfile::NamedTempFile,
+    entry: &mut tar::Entry<'_, R>,
+) -> Result<()> {
+    (|| -> Result<()> {
+        // chown can clear set-ID bits and capabilities, so apply it before mode/xattrs.
+        set_ownership(temporary.path(), entry.header())?;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(entry.header().mode()?))?;
+        unpack_xattrs(temporary.path(), entry)?;
+        set_mtime(temporary.path(), entry.header().mtime()?)?;
+        // Replace the directory entry, never truncate a possibly hardlinked .pacnew.
+        temporary
+            .persist(path)
+            .map_err(|error| ExecError::Io(error.error))?;
+        Ok(())
+    })()
+    .map_err(|error| ExecError::Extraction {
+        pkg: String::new(),
+        message: format!(
+            "{}: apply backup metadata and publish: {error}",
+            path.display()
+        ),
+    })
+}
+
+pub(crate) fn archive_ids(header: &tar::Header) -> std::io::Result<(libc::uid_t, libc::gid_t)> {
+    fn parse(raw: &[u8], parsed: std::io::Result<u64>, name: &str) -> std::io::Result<u32> {
+        let padding = |byte: &u8| matches!(byte, 0 | b' ');
+        // libarchive treats blank numeric owner fields as zero; tar's parser does not.
+        let Some(first) = raw.iter().position(|byte| !padding(byte)) else {
+            return Ok(0);
+        };
+        if raw[0] & 0x80 == 0 {
+            let last = raw.iter().rposition(|byte| !padding(byte)).unwrap();
+            if !raw[first..=last]
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'7'))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed archive {name}"),
+                ));
+            }
+        }
+        let value = parsed?;
+        // -1 means 'leave unchanged' to chown, not an archive owner to install.
+        if value >= u32::MAX as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("archive {name} out of range: {value}"),
+            ));
+        }
+        Ok(value as u32)
+    }
+    Ok((
+        parse(&header.as_old().uid, header.uid(), "UID")?,
+        parse(&header.as_old().gid, header.gid(), "GID")?,
+    ))
+}
+
+fn set_ownership(path: &Path, header: &tar::Header) -> Result<()> {
+    let (uid, gid) = archive_ids(header)?;
+    if unsafe { libc::geteuid() } != 0 {
+        // Low-level extraction also supports unprivileged callers; transactions require root.
+        return Ok(());
+    }
+    let path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| unsafe_path(path))?;
+    if unsafe { libc::lchown(path.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn set_mtime(path: &Path, seconds: u64) -> Result<()> {
+    let seconds = libc::time_t::try_from(seconds).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive mtime out of range: {error}"),
+        )
+    })?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+    ];
+    let path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| unsafe_path(path))?;
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn unpack_xattrs<R: Read>(path: &Path, entry: &mut tar::Entry<'_, R>) -> Result<()> {
+    let Some(extensions) = entry.pax_extensions()? else {
+        return Ok(());
+    };
+    let c_path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| unsafe_path(path))?;
+    for extension in extensions {
+        let extension = extension?;
+        // Match tar's existing regular-file xattr dialect; do not follow symlink targets.
+        let Some(name) = extension.key_bytes().strip_prefix(b"SCHILY.xattr.") else {
+            continue;
+        };
+        let name = std::ffi::CString::new(name).map_err(|_| unsafe_path(path))?;
+        let value = extension.value_bytes();
+        if unsafe {
+            libc::lsetxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("{}: set xattr {:?}: {error}", path.display(), name),
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -627,11 +828,19 @@ fn parse_backup_from_pkginfo(pkginfo: &str) -> Vec<String> {
 }
 
 fn compute_md5(path: &Path) -> Result<String> {
-    use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(format!("{:x}", md5::compute(&buf)))
+    let mut digest = md5::Context::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let length = match file.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if length == 0 {
+            return Ok(format!("{:x}", digest.finalize()));
+        }
+        digest.consume(&buffer[..length]);
+    }
 }
 
 pub fn read_archive_file_list(pkg_path: &Path) -> Result<Vec<String>> {
@@ -714,12 +923,7 @@ pub fn read_pkginfo(pkg_path: &Path) -> Result<PkgFileInfo> {
         let path_str = path_str.strip_prefix("./").unwrap_or(&path_str);
 
         if path_str == ".PKGINFO" {
-            entry
-                .read_to_string(&mut pkginfo)
-                .map_err(|e| ExecError::Extraction {
-                    pkg: filename.clone(),
-                    message: format!(".PKGINFO: {e}"),
-                })?;
+            pkginfo = read_pkginfo_text(&mut entry, pkg_path)?;
             break;
         }
     }
@@ -819,6 +1023,8 @@ mod tests {
         let pkginfo = b"pkgname = test\npkgver = 1-1\narch = any\nbackup = etc/config\ndepend = libc>=1\noptdepend = tool: optional tool\nprovides = virtual=1\nconflict = other\nreplaces = obsolete\n";
         for (path, data) in [(".PKGINFO", pkginfo.as_slice()), ("etc/config", contents)] {
             let mut header = tar::Header::new_gnu();
+            header.set_uid(0);
+            header.set_gid(0);
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
@@ -826,6 +1032,8 @@ mod tests {
         }
         if let Some((path, target, kind)) = link {
             let mut header = tar::Header::new_gnu();
+            header.set_uid(0);
+            header.set_gid(0);
             header.set_entry_type(kind);
             header.set_size(0);
             header.set_mode(0o777);
@@ -846,6 +1054,8 @@ mod tests {
             ("etc/mc/mc.ext.ini", b"new config".as_slice()),
         ] {
             let mut header = tar::Header::new_gnu();
+            header.set_uid(0);
+            header.set_gid(0);
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
@@ -902,26 +1112,643 @@ mod tests {
     #[test]
     fn backup_three_way_and_archive_baseline() {
         for (old, current, incoming, pacnew, expected) in [
-            ("old", "old", "new", false, "new"),
-            ("old", "edited", "new", true, "edited"),
-            ("old", "new", "new", false, "new"),
-            ("old", "edited", "old", false, "edited"),
+            (Some("old"), Some("old"), "new", false, "new"),
+            (Some("old"), Some("edited"), "new", true, "edited"),
+            (Some("old"), Some("new"), "new", false, "new"),
+            (Some("old"), Some("edited"), "old", false, "edited"),
+            (None, Some("edited"), "new", true, "edited"),
+            (None, Some("new"), "new", false, "new"),
+            (Some("new"), None, "new", false, "new"),
+            (None, None, "new", false, "new"),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             std::fs::create_dir_all(root.join("etc")).unwrap();
-            std::fs::write(root.join("etc/config"), current).unwrap();
+            if let Some(current) = current {
+                std::fs::write(root.join("etc/config"), current).unwrap();
+            }
             let archive = package(temp.path(), incoming.as_bytes(), None);
-            let old = HashMap::from([("etc/config".into(), format!("{:x}", md5::compute(old)))]);
+            let old = old
+                .map(|old| {
+                    HashMap::from([("etc/config".into(), format!("{:x}", md5::compute(old)))])
+                })
+                .unwrap_or_default();
             let metadata = extract_package(&archive, &root, &old).unwrap();
             assert_eq!(
                 std::fs::read_to_string(root.join("etc/config")).unwrap(),
                 expected
             );
             assert_eq!(root.join("etc/config.pacnew").exists(), pacnew);
+            if pacnew {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("etc/config.pacnew")).unwrap(),
+                    incoming
+                );
+                assert_eq!(
+                    metadata.warnings,
+                    ["etc/config installed as etc/config.pacnew"]
+                );
+            } else {
+                assert!(metadata.warnings.is_empty());
+            }
             assert_eq!(
                 metadata.backup_md5["etc/config"],
                 format!("{:x}", md5::compute(incoming))
+            );
+        }
+    }
+
+    #[test]
+    fn pacnew_replaces_links_without_changing_their_targets() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        for hardlink in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("etc")).unwrap();
+            let config = root.join("etc/config");
+            let pacnew = root.join("etc/config.pacnew");
+            let outside = temp.path().join("outside");
+            std::fs::write(&config, b"local").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&outside, b"untouched").unwrap();
+            if hardlink {
+                std::fs::hard_link(&config, &pacnew).unwrap();
+            } else {
+                symlink(&outside, &pacnew).unwrap();
+            }
+            let before = std::fs::metadata(&config).unwrap();
+            let archive = package(temp.path(), b"incoming", None);
+            let old = HashMap::from([("etc/config".into(), format!("{:x}", md5::compute(b"old")))]);
+            let metadata = extract_package(&archive, &root, &old).unwrap();
+            assert_eq!(std::fs::read(&config).unwrap(), b"local");
+            assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+            assert!(std::fs::symlink_metadata(&pacnew).unwrap().is_file());
+            assert_eq!(std::fs::read(&pacnew).unwrap(), b"incoming");
+            let after = std::fs::metadata(&config).unwrap();
+            assert_eq!(
+                (after.ino(), after.mode(), after.mtime(), after.mtime_nsec()),
+                (
+                    before.ino(),
+                    before.mode(),
+                    before.mtime(),
+                    before.mtime_nsec()
+                )
+            );
+            assert_ne!(after.ino(), std::fs::metadata(&pacnew).unwrap().ino());
+            assert_eq!(
+                metadata.backup_md5["etc/config"],
+                format!("{:x}", md5::compute(b"incoming"))
+            );
+            assert_eq!(
+                metadata.warnings,
+                ["etc/config installed as etc/config.pacnew"]
+            );
+            assert_eq!(std::fs::read_dir(root.join("etc")).unwrap().count(), 2);
+        }
+    }
+
+    fn ownership_package(dir: &Path, uid: [u8; 8], gid: [u8; 8]) -> PathBuf {
+        let archive = dir.join("ownership.pkg.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let info = b"pkgname = ownership\npkgver = 1-1\narch = any\nbackup = opt/config\n";
+        for (path, kind, contents) in [
+            (".PKGINFO", tar::EntryType::Regular, info.as_slice()),
+            ("earlier", tar::EntryType::Regular, b"replace".as_slice()),
+            ("opt", tar::EntryType::Directory, b"".as_slice()),
+            ("opt/file", tar::EntryType::Regular, b"payload".as_slice()),
+            ("opt/config", tar::EntryType::Regular, b"config".as_slice()),
+            ("opt/link", tar::EntryType::Symlink, b"".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(if kind.is_dir() { 0o755 } else { 0o644 });
+            header.set_size(contents.len() as u64);
+            if matches!(path, ".PKGINFO" | "earlier") {
+                header.set_uid(0);
+                header.set_gid(0);
+            } else {
+                header.as_old_mut().uid = uid;
+                header.as_old_mut().gid = gid;
+            }
+            if kind.is_symlink() {
+                builder.append_link(&mut header, path, "file").unwrap();
+            } else {
+                builder.append_data(&mut header, path, contents).unwrap();
+            }
+        }
+        builder.finish().unwrap();
+        archive
+    }
+
+    #[test]
+    fn archive_ids_accept_blank_fields_and_validate_nonblank_numbers() {
+        for blank in [[0; 8], [b' '; 8], [0, b' ', 0, b' ', 0, b' ', 0, b' ']] {
+            let mut header = tar::Header::new_gnu();
+            header.as_old_mut().uid = blank;
+            header.as_old_mut().gid = blank;
+            assert_eq!(archive_ids(&header).unwrap(), (0, 0));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_uid(65534);
+        header.set_gid(3_000_000); // GNU base-256, not octal text.
+        assert_eq!(archive_ids(&header).unwrap(), (65534, 3_000_000));
+        for malformed in [*b"invalid!", *b"0000008\0", *b"0\0junk\0\0"] {
+            header.as_old_mut().uid = malformed;
+            assert!(
+                archive_ids(&header)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("UID")
+            );
+            header.set_uid(0);
+            header.as_old_mut().gid = malformed;
+            assert!(
+                archive_ids(&header)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("GID")
+            );
+            header.set_gid(0);
+        }
+        for value in [u32::MAX as u64, u32::MAX as u64 + 1] {
+            header.set_uid(value);
+            assert!(archive_ids(&header).is_err());
+            header.set_uid(0);
+            header.set_gid(value);
+            assert!(archive_ids(&header).is_err());
+            header.set_gid(0);
+        }
+    }
+
+    #[test]
+    fn malformed_archive_ids_are_rejected_before_payload_changes() {
+        for (uid, gid, field) in [(*b"invalid!", [0; 8], "UID"), ([0; 8], *b"invalid!", "GID")] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = ownership_package(temp.path(), uid, gid);
+            for existing in [false, true] {
+                let root = temp
+                    .path()
+                    .join(if existing { "existing" } else { "missing" });
+                if existing {
+                    std::fs::create_dir(&root).unwrap();
+                    std::fs::write(root.join("earlier"), b"keep").unwrap();
+                }
+                let error = crate::preflight::inspect_archive(&archive, &root, None)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("opt") && error.contains(field), "{error}");
+                let error = extract_package(&archive, &root, &HashMap::new())
+                    .err()
+                    .expect("malformed ownership must fail")
+                    .to_string();
+                assert!(error.contains("opt") && error.contains(field), "{error}");
+                assert!(!root.join("opt").exists());
+                if existing {
+                    assert_eq!(std::fs::read(root.join("earlier")).unwrap(), b"keep");
+                } else {
+                    assert!(!root.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root to verify blank archive ownership resolves to numeric zero"]
+    fn root_blank_archive_ids_install_as_zero() {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this regression as root");
+        for blank in [[0; 8], [b' '; 8], [0, b' ', 0, b' ', 0, b' ', 0, b' ']] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = ownership_package(temp.path(), blank, blank);
+            let root = temp.path().join("root");
+            crate::preflight::inspect_archive(&archive, &root, None).unwrap();
+            extract_package(&archive, &root, &HashMap::new()).unwrap();
+            for path in ["opt", "opt/file", "opt/config", "opt/link"] {
+                let metadata = std::fs::symlink_metadata(root.join(path)).unwrap();
+                assert_eq!((metadata.uid(), metadata.gid()), (0, 0), "{path}");
+            }
+            assert_eq!(std::fs::read(root.join("opt/file")).unwrap(), b"payload");
+            assert_eq!(std::fs::read(root.join("opt/config")).unwrap(), b"config");
+            assert_eq!(
+                std::fs::read_link(root.join("opt/link")).unwrap(),
+                Path::new("file")
+            );
+        }
+    }
+
+    fn metadata_package(dir: &Path, target: &Path, mtime: u64) -> PathBuf {
+        let archive = dir.join("metadata.pkg.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let info = b"pkgname = metadata\npkgver = 1-1\narch = any\nbackup = etc/config\n";
+        for (path, kind, contents) in [
+            (".PKGINFO", tar::EntryType::Regular, info.as_slice()),
+            ("empty", tar::EntryType::Directory, b"".as_slice()),
+            ("etc", tar::EntryType::Directory, b"".as_slice()),
+            (
+                "etc/config",
+                tar::EntryType::Regular,
+                b"incoming".as_slice(),
+            ),
+            ("etc/config-copy", tar::EntryType::Link, b"".as_slice()),
+            ("usr", tar::EntryType::Directory, b"".as_slice()),
+            ("usr/file", tar::EntryType::Regular, b"payload".as_slice()),
+            ("usr/link", tar::EntryType::Symlink, b"".as_slice()),
+        ] {
+            if kind.is_file() || kind.is_dir() {
+                builder
+                    .append_pax_extensions([(
+                        "SCHILY.xattr.user.pax-metadata",
+                        b"archive\0value".as_slice(),
+                    )])
+                    .unwrap();
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(contents.len() as u64);
+            header.set_uid(65534);
+            header.set_gid(65533);
+            header.set_mode(if kind.is_dir() { 0o2750 } else { 0o4640 });
+            header.set_mtime(mtime);
+            if kind.is_symlink() {
+                builder.append_link(&mut header, path, target).unwrap();
+            } else if kind.is_hard_link() {
+                // A link must not apply its own metadata to the shared live config inode.
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_mode(0o777);
+                header.set_mtime(mtime + 1);
+                builder
+                    .append_link(&mut header, path, "etc/config")
+                    .unwrap();
+            } else {
+                builder.append_data(&mut header, path, contents).unwrap();
+            }
+        }
+        builder.finish().unwrap();
+        archive
+    }
+
+    fn metadata_xattr(path: &Path) -> Vec<u8> {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut value = vec![0; 64];
+        let count = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                c"user.pax-metadata".as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        assert!(count >= 0, "{}", std::io::Error::last_os_error());
+        value.truncate(count as usize);
+        value
+    }
+
+    #[test]
+    fn existing_directory_metadata_and_reinstallation_hardening_are_preserved() {
+        use std::os::unix::fs::MetadataExt;
+
+        for reinstall in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let archive = temp.path().join("directories.pkg.tar");
+            let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+            let info = b"pkgname = directories\npkgver = 1-1\narch = any\n";
+            for (path, directory, data) in [
+                (".PKGINFO", false, info.as_slice()),
+                ("usr", true, b"".as_slice()),
+                ("usr/file", false, b"payload".as_slice()),
+                ("empty", true, b"".as_slice()),
+                ("new", true, b"".as_slice()),
+            ] {
+                if directory {
+                    builder
+                        .append_pax_extensions([(
+                            "SCHILY.xattr.user.pax-metadata",
+                            b"archive".as_slice(),
+                        )])
+                        .unwrap();
+                }
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(if directory {
+                    tar::EntryType::Directory
+                } else {
+                    tar::EntryType::Regular
+                });
+                header.set_mode(if directory { 0o755 } else { 0o644 });
+                header.set_uid(65534);
+                header.set_gid(65533);
+                header.set_mtime(0);
+                header.set_size(data.len() as u64);
+                builder.append_data(&mut header, path, data).unwrap();
+            }
+            builder.finish().unwrap();
+            drop(builder);
+            if reinstall {
+                extract_package(&archive, &root, &HashMap::new()).unwrap();
+            }
+            let mut before = Vec::new();
+            for path in ["usr", "empty"] {
+                let full = root.join(path);
+                std::fs::create_dir_all(&full).unwrap();
+                std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let c_path = std::ffi::CString::new(full.as_os_str().as_bytes()).unwrap();
+                assert_eq!(
+                    unsafe {
+                        libc::lsetxattr(
+                            c_path.as_ptr(),
+                            c"user.pax-metadata".as_ptr(),
+                            b"local".as_ptr().cast(),
+                            5,
+                            0,
+                        )
+                    },
+                    0
+                );
+                set_mtime(&full, 123).unwrap();
+                before.push((path, std::fs::symlink_metadata(&full).unwrap()));
+            }
+            std::fs::write(root.join("usr/file"), b"replace me").unwrap();
+            let metadata = extract_package(&archive, &root, &HashMap::new()).unwrap();
+            for (path, old) in before {
+                let full = root.join(path);
+                let current = std::fs::symlink_metadata(&full).unwrap();
+                assert_eq!(
+                    (current.ino(), current.uid(), current.gid(), current.mode()),
+                    (old.ino(), old.uid(), old.gid(), old.mode()),
+                    "{path}, reinstall={reinstall}"
+                );
+                assert_eq!(metadata_xattr(&full), b"local");
+                if path == "empty" {
+                    assert_eq!(
+                        (current.mtime(), current.mtime_nsec()),
+                        (old.mtime(), old.mtime_nsec())
+                    );
+                }
+                assert!(metadata.files.contains(&format!("{path}/")));
+            }
+            let new = std::fs::symlink_metadata(root.join("new")).unwrap();
+            assert_eq!((new.mode() & 0o7777, new.mtime()), (0o755, 0));
+            assert_eq!(metadata_xattr(&root.join("new")), b"archive");
+            assert_eq!(std::fs::read(root.join("usr/file")).unwrap(), b"payload");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root for archive numeric ownership and metadata"]
+    fn root_archive_metadata_and_epoch_mtime() {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this regression as root");
+        for mtime in [0, 123456789] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let outside = temp.path().join("outside");
+            std::fs::write(&outside, b"untouched").unwrap();
+            let before = std::fs::metadata(&outside).unwrap();
+            // Include an existing directory as well as an archive-created directory.
+            std::fs::create_dir_all(root.join("usr")).unwrap();
+            let existing_usr = std::fs::symlink_metadata(root.join("usr")).unwrap();
+            let archive = metadata_package(temp.path(), &outside, mtime);
+            extract_package(&archive, &root, &HashMap::new()).unwrap();
+            for path in ["etc", "usr", "empty", "usr/file", "etc/config", "usr/link"] {
+                let full = root.join(path);
+                let metadata = std::fs::symlink_metadata(&full).unwrap();
+                if path == "usr" {
+                    assert_eq!(
+                        (metadata.uid(), metadata.gid(), metadata.mode()),
+                        (existing_usr.uid(), existing_usr.gid(), existing_usr.mode())
+                    );
+                    assert_ne!((metadata.mtime(), metadata.mtime_nsec()), (mtime as i64, 0));
+                    continue;
+                }
+                assert_eq!((metadata.uid(), metadata.gid()), (65534, 65533), "{path}");
+                if path == "etc" {
+                    assert_ne!(
+                        (metadata.mtime(), metadata.mtime_nsec()),
+                        (mtime as i64, 0),
+                        "child creation must update {path} after its archive entry"
+                    );
+                } else {
+                    assert_eq!(
+                        (metadata.mtime(), metadata.mtime_nsec()),
+                        (mtime as i64, 0),
+                        "{path}"
+                    );
+                }
+                if !metadata.is_symlink() {
+                    assert_eq!(
+                        metadata.mode() & 0o7777,
+                        if metadata.is_dir() { 0o2750 } else { 0o4640 },
+                        "{path}"
+                    );
+                    assert_eq!(metadata_xattr(&full), b"archive\0value", "{path}");
+                }
+            }
+            assert_eq!(std::fs::read_link(root.join("usr/link")).unwrap(), outside);
+            let after = std::fs::metadata(&outside).unwrap();
+            assert_eq!(
+                (
+                    after.uid(),
+                    after.gid(),
+                    after.mode(),
+                    after.mtime(),
+                    after.mtime_nsec()
+                ),
+                (
+                    before.uid(),
+                    before.gid(),
+                    before.mode(),
+                    before.mtime(),
+                    before.mtime_nsec()
+                )
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+            assert_eq!(
+                std::fs::metadata(root.join("etc/config")).unwrap().ino(),
+                std::fs::metadata(root.join("etc/config-copy"))
+                    .unwrap()
+                    .ino()
+            );
+            assert_eq!(std::fs::read_dir(root.join("etc")).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root for config ownership, modes and extended attributes"]
+    fn root_backup_metadata_and_original_hardlinks() {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this regression as root");
+        let hash = |data: &str| format!("{:x}", md5::compute(data));
+        for (current, old, pacnew, replaced) in [
+            ("old", Some(hash("old")), false, true),
+            ("local", Some(hash("old")), true, false),
+            ("local", Some(hash("incoming")), false, false),
+            ("incoming", Some(hash("old")), false, true),
+            ("local", None, true, false),
+            ("local", Some(String::new()), true, false),
+            ("local", Some("not-an-md5".into()), true, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("etc")).unwrap();
+            let config = root.join("etc/config");
+            let original = root.join("original-config");
+            let sidecar = root.join("etc/config.pacnew");
+            std::fs::write(&config, current).unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+            set_mtime(&config, 123).unwrap();
+            let c_config = std::ffi::CString::new(config.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                unsafe {
+                    libc::lsetxattr(
+                        c_config.as_ptr(),
+                        c"user.pax-metadata".as_ptr(),
+                        b"local".as_ptr().cast(),
+                        5,
+                        0,
+                    )
+                },
+                0
+            );
+            std::fs::hard_link(&config, &original).unwrap();
+            std::fs::hard_link(&config, &sidecar).unwrap();
+            let before = std::fs::metadata(&config).unwrap();
+            let archive = metadata_package(temp.path(), &original, 0);
+            let old = old
+                .map(|value| HashMap::from([("etc/config".into(), value)]))
+                .unwrap_or_default();
+            let metadata = extract_package(&archive, &root, &old).unwrap();
+            assert_eq!(metadata.backup_md5["etc/config"], hash("incoming"));
+            assert_eq!(std::fs::read_to_string(&original).unwrap(), current);
+            let after = std::fs::metadata(&original).unwrap();
+            assert_eq!(
+                (
+                    after.ino(),
+                    after.uid(),
+                    after.gid(),
+                    after.mode(),
+                    after.mtime()
+                ),
+                (
+                    before.ino(),
+                    before.uid(),
+                    before.gid(),
+                    before.mode(),
+                    before.mtime()
+                )
+            );
+            assert_eq!(metadata_xattr(&original), b"local");
+            assert_eq!(
+                std::fs::read_to_string(&config).unwrap(),
+                if replaced { "incoming" } else { current }
+            );
+            if replaced || pacnew {
+                let output = if pacnew { &sidecar } else { &config };
+                let installed = std::fs::metadata(output).unwrap();
+                assert_ne!(installed.ino(), before.ino());
+                assert_eq!(
+                    (
+                        installed.uid(),
+                        installed.gid(),
+                        installed.mode() & 0o7777,
+                        installed.mtime()
+                    ),
+                    (65534, 65533, 0o4640, 0)
+                );
+                assert_eq!(metadata_xattr(output), b"archive\0value");
+                assert_eq!(std::fs::read(output).unwrap(), b"incoming");
+            }
+            if !pacnew {
+                assert_eq!(std::fs::metadata(&sidecar).unwrap().ino(), before.ino());
+            }
+            if !replaced {
+                assert_eq!(std::fs::metadata(&config).unwrap().ino(), before.ino());
+                assert_eq!(metadata_xattr(&config), b"local");
+            }
+            assert_eq!(
+                std::fs::metadata(root.join("etc/config-copy"))
+                    .unwrap()
+                    .ino(),
+                std::fs::metadata(&config).unwrap().ino()
+            );
+            assert_eq!(std::fs::read_dir(root.join("etc")).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
+    fn converged_backup_replaces_inode_and_restores_archive_metadata() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let config = root.join("etc/config");
+        let original = root.join("original");
+        std::fs::write(&config, b"new").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set_mtime(&config, 500).unwrap();
+        std::fs::hard_link(&config, &original).unwrap();
+        let before = std::fs::metadata(&config).unwrap();
+        let archive = package(temp.path(), b"new", None);
+        let old = HashMap::from([("etc/config".into(), format!("{:x}", md5::compute(b"old")))]);
+        let metadata = extract_package(&archive, &root, &old).unwrap();
+        let installed = std::fs::metadata(&config).unwrap();
+        assert_ne!(installed.ino(), before.ino());
+        assert_eq!(
+            (
+                installed.mtime(),
+                installed.mtime_nsec(),
+                installed.mode() & 0o7777
+            ),
+            (0, 0, 0o644)
+        );
+        let retained = std::fs::metadata(&original).unwrap();
+        assert_eq!(
+            (retained.ino(), retained.mtime(), retained.mode()),
+            (before.ino(), before.mtime(), before.mode())
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), b"new");
+        assert_eq!(std::fs::read(&original).unwrap(), b"new");
+        assert!(!root.join("etc/config.pacnew").exists());
+        assert!(metadata.warnings.is_empty());
+        assert_eq!(
+            metadata.backup_md5["etc/config"],
+            format!("{:x}", md5::compute(b"new"))
+        );
+    }
+
+    #[test]
+    fn backup_streams_multiple_buffers_and_replaces_regular_pacnew() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/config"), b"local").unwrap();
+        std::fs::write(root.join("etc/config.pacnew"), b"old sidecar").unwrap();
+        let contents: Vec<u8> = (0..3 * 64 * 1024 + 37).map(|n| (n % 251) as u8).collect();
+        let archive = package(temp.path(), &contents, None);
+        let metadata = extract_package(&archive, &root, &HashMap::new()).unwrap();
+        assert_eq!(std::fs::read(root.join("etc/config")).unwrap(), b"local");
+        assert_eq!(
+            std::fs::read(root.join("etc/config.pacnew")).unwrap(),
+            contents
+        );
+        assert_eq!(
+            metadata.backup_md5["etc/config"],
+            format!("{:x}", md5::compute(&contents))
+        );
+        assert_eq!(std::fs::read_dir(root.join("etc")).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn md5_streams_empty_and_multi_buffer_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config");
+        for size in [0, 64 * 1024, 2 * 64 * 1024 + 37] {
+            let data: Vec<u8> = (0..size).map(|n| (n % 251) as u8).collect();
+            std::fs::write(&path, &data).unwrap();
+            assert_eq!(
+                compute_md5(&path).unwrap(),
+                format!("{:x}", md5::compute(&data))
             );
         }
     }
@@ -980,12 +1807,16 @@ mod tests {
         let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
         let mut header = tar::Header::new_gnu();
         let pkginfo = b"pkgname = overlay\npkgver = 1-1\n";
+        header.set_uid(0);
+        header.set_gid(0);
         header.set_mode(0o644);
         header.set_size(pkginfo.len() as u64);
         builder
             .append_data(&mut header, ".PKGINFO", pkginfo.as_slice())
             .unwrap();
         let mut header = tar::Header::new_gnu();
+        header.set_uid(0);
+        header.set_gid(0);
         header.set_entry_type(tar::EntryType::Symlink);
         header.set_mode(0o777);
         header.set_size(0);
@@ -993,6 +1824,8 @@ mod tests {
             .append_link(&mut header, "usr/link", target)
             .unwrap();
         let mut header = tar::Header::new_gnu();
+        header.set_uid(0);
+        header.set_gid(0);
         header.set_mode(0o644);
         header.set_size(7);
         builder

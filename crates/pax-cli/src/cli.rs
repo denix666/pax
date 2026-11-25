@@ -272,9 +272,6 @@ pub enum Command {
         noconfirm: bool,
     },
 
-    /// Inspect the transaction journal (diagnostic only; no automatic recovery)
-    TransactionStatus,
-
     /// Remove a stale database lock file
     RemoveLock,
 }
@@ -284,43 +281,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transaction_status_parses_without_arguments() {
-        let cli = Cli::try_parse_from(["pax", "transaction-status"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::TransactionStatus)));
-    }
-
-    #[test]
-    fn transaction_status_preserves_config_root_and_database_options() {
-        let cli = Cli::try_parse_from([
-            "pax",
-            "--config",
-            "custom config.conf",
-            "--root",
-            "/alternate root",
-            "--dbpath",
-            "/alternate database",
+    fn unsupported_recovery_commands_remain_rejected() {
+        for command in [
+            "recover",
+            "recovery",
             "transaction-status",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Some(Command::TransactionStatus)));
-        assert_eq!(cli.config, PathBuf::from("custom config.conf"));
-        assert_eq!(cli.root, Some(PathBuf::from("/alternate root")));
-        assert_eq!(cli.dbpath, Some(PathBuf::from("/alternate database")));
-    }
-
-    #[test]
-    fn transaction_status_rejects_targets_and_mutating_options() {
-        for argument in ["package", "--noconfirm", "--recover", "--retry", "--acknowledge"] {
-            assert!(
-                Cli::try_parse_from(["pax", "transaction-status", argument]).is_err(),
-                "unexpectedly accepted {argument}"
-            );
-        }
-    }
-
-    #[test]
-    fn transaction_status_does_not_add_recovery_commands() {
-        for command in ["recover", "retry", "acknowledge"] {
+            "apply",
+            "rollback",
+            "retry",
+            "acknowledge",
+            "force",
+            "noconfirm",
+        ] {
             assert!(Cli::try_parse_from(["pax", command]).is_err());
         }
         let cli = Cli::try_parse_from(["pax", "remove-lock"]).unwrap();

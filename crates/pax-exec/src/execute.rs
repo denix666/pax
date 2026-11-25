@@ -2,25 +2,27 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use pax_alpm::local::LocalDb;
-use pax_core::package::{InstallReason, PackageInfo, Validation};
+use pax_core::package::{InstallReason, PackageInfo};
 use pax_resolver::pool::package_satisfies_dependency;
 use pax_resolver::{ExecutionStep, RemovalReason, Transaction, execution_plan};
 
-use crate::download::DownloadedPackage;
 use crate::error::{ExecError, Result};
-use crate::extract::{extract_package, read_archive_file_list, read_install_script, read_pkginfo};
-use crate::hooks::{HookWhen, TransactionPackages, load_hooks, run_hooks};
-use crate::journal::{Journal, Phase};
+use crate::extract::{
+    PackageMetadata, extract_package, read_archive_file_list, read_install_script,
+};
+use crate::hooks::{HookWhen, TransactionPackages, collect_hooks, load_hooks, run_hooks};
 use crate::log::PaxLogger;
+use crate::preflight::ArchivePlan;
+use crate::prepared::PreparedArchive;
 use crate::register::{register_package, remove_db_entry};
-use crate::removal::{RemovalTarget, remove_package_paths, remove_package_recorded};
+use crate::removal::{RemovalTarget, remove_package_paths, remove_transaction_package};
 use crate::scriptlet::{ScriptletOp, run_scriptlet};
 
 pub struct InstallContext<'a> {
     pub root_dir: &'a Path,
     pub db_path: &'a Path,
     pub architecture: &'a str,
-    pub downloaded: &'a [DownloadedPackage],
+    pub downloaded: &'a [PreparedArchive],
     pub old_install_scripts: &'a HashMap<String, String>,
     pub old_backup_md5: &'a HashMap<String, HashMap<String, String>>,
     pub hook_dirs: &'a [PathBuf],
@@ -28,8 +30,7 @@ pub struct InstallContext<'a> {
     pub logger: &'a mut PaxLogger,
 }
 
-struct IncomingPackage<'a> {
-    downloaded: &'a DownloadedPackage,
+struct IncomingPackage {
     info: PackageInfo,
     files: Vec<String>,
     install_script: Option<String>,
@@ -43,19 +44,24 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
     pax_alpm::lock::ensure_no_active_transaction(ctx.db_path)?;
     // Inspect every archive and action before hooks or any filesystem mutation.
     eprintln!(":: Verifying transaction archives and destinations...");
+    let mut archive_plans = HashMap::new();
     for (index, package) in ctx.downloaded.iter().enumerate() {
         eprintln!(
             ":: Checking archive {}/{}: {}",
             index + 1,
             ctx.downloaded.len(),
-            package.name
+            package.name()
         );
-        crate::preflight::validate_archive(&package.path, ctx.root_dir, Some(ctx.architecture))?;
+        package.verify_for_database(ctx.db_path)?;
+        let plan = crate::preflight::inspect_archive(
+            package.path(),
+            ctx.root_dir,
+            Some(ctx.architecture),
+        )?;
+        archive_plans.insert(package.name(), plan);
     }
     let incoming = prepare_incoming(tx, ctx.downloaded)?;
-    for package in incoming.values() {
-        crate::extract::validate_package_archive(&package.downloaded.path, ctx.root_dir)?;
-    }
+
     for (name, version) in tx
         .upgrades
         .iter()
@@ -71,11 +77,17 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
             &read_file_list(ctx.db_path, name, &version.to_string())?,
         )?;
     }
-    let installed = read_installed_snapshot(ctx.db_path)?;
+    let installed = read_installed_packages(ctx.db_path)?;
     let incoming_info: Vec<_> = incoming.values().map(|pkg| pkg.info.clone()).collect();
     let steps = execution_plan(tx, &installed, &incoming_info)?;
-    let retained_directories =
-        check_file_conflicts(ctx.root_dir, ctx.db_path, &incoming, tx, &steps)?;
+    let retained_directories = check_file_conflicts_inner(
+        ctx.root_dir,
+        ctx.db_path,
+        &incoming,
+        tx,
+        &steps,
+        Some(&archive_plans),
+    )?;
     if ctx.check_space {
         check_disk_space(ctx.root_dir, ctx.db_path, tx)?;
     }
@@ -96,47 +108,14 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
     {
         old_files.extend(read_file_list(ctx.db_path, name, &version.to_string())?);
     }
+
     let mut hook_packages = transaction_packages(tx, &old_files, &incoming_files);
     hook_packages
         .removed_files
         .retain(|path| !retained_directories.contains(path.trim_end_matches('/')));
 
-    let mut operations = Vec::new();
-    for step in &steps {
-        for name in &step.remove_before {
-            let removal = tx
-                .removals
-                .iter()
-                .find(|action| &action.name == name)
-                .unwrap();
-            let links: Vec<_> = removal
-                .links
-                .iter()
-                .map(|link| format!("{:?} by {}", link.reason, link.incoming))
-                .collect();
-            operations.push(format!(
-                "remove {name} {} ({})",
-                removal.version,
-                links.join(", ")
-            ));
-        }
-        let name = &step.incoming;
-        if let Some(upgrade) = tx.upgrades.iter().find(|action| &action.name == name) {
-            operations.push(format!(
-                "upgrade {name} {} -> {}",
-                upgrade.old_version, upgrade.new_version
-            ));
-        } else {
-            let install = tx
-                .installs
-                .iter()
-                .find(|action| &action.name == name)
-                .unwrap();
-            operations.push(format!("install {name} {}", install.version));
-        }
-    }
-    let mut journal = Journal::begin(ctx.db_path, ctx.root_dir, operations)?;
     ctx.logger.log_transaction_start();
+    let mut failures = Vec::new();
     let result = apply_transaction(
         tx,
         ctx,
@@ -145,43 +124,47 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
         &retained_directories,
         &steps,
         &hook_packages,
-        &mut journal,
+        &mut failures,
     );
-    finish_transaction(result, &mut journal, ctx.db_path, ctx.logger)
+    finish_transaction(result, failures, ctx.logger)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn apply_transaction(
     tx: &Transaction,
     ctx: &mut InstallContext,
-    incoming: &HashMap<&str, IncomingPackage<'_>>,
+    incoming: &HashMap<&str, IncomingPackage>,
     incoming_files: &HashSet<String>,
     retained_directories: &HashSet<String>,
     steps: &[ExecutionStep],
     hook_packages: &TransactionPackages,
-    journal: &mut Journal,
+    failures: &mut Vec<String>,
 ) -> Result<()> {
-    let mut failures = Vec::new();
-    run_recorded_hooks(
+    run_transaction_hooks(
         ctx.root_dir,
         ctx.db_path,
         ctx.hook_dirs,
         &HookWhen::PreTransaction,
         hook_packages,
         ctx.logger,
-        journal,
-        &mut failures,
+        failures,
     )?;
     eprintln!(":: Applying package changes...");
 
     // Only retire packages belonging to this incoming slot. A failure must not
     // trigger removal of packages anchored to later, unrelated replacements.
     for step in steps {
-        for name in &step.remove_before {
+        let name = &step.incoming;
+        let archive = ctx
+            .downloaded
+            .iter()
+            .find(|archive| archive.name() == name)
+            .expect("incoming coverage was validated");
+        for removed_name in &step.remove_before {
             let removal = tx
                 .removals
                 .iter()
-                .find(|action| &action.name == name)
+                .find(|action| &action.name == removed_name)
                 .unwrap();
             for link in &removal.links {
                 if link.reason == RemovalReason::Conflict {
@@ -192,31 +175,27 @@ fn apply_transaction(
                 }
             }
             let version = removal.version.to_string();
-            remove_package_recorded(
+            remove_transaction_package(
                 &RemovalTarget {
-                    name: name.clone(),
+                    name: removed_name.clone(),
                     version: version.clone(),
                 },
                 ctx.root_dir,
                 ctx.db_path,
                 ctx.logger,
-                journal,
-                &mut failures,
+                failures,
                 retained_directories,
             )?;
-            ctx.logger.log_removed(name, &version);
+            ctx.logger.log_removed(removed_name, &version);
         }
-        let name = &step.incoming;
         let package = &incoming[name.as_str()];
         if let Some(upgrade) = tx.upgrades.iter().find(|upgrade| &upgrade.name == name) {
             let old_version = upgrade.old_version.to_string();
             let new_version = upgrade.new_version.to_string();
             let reason = get_existing_reason(ctx.db_path, name, &old_version);
             if let Some(script) = &package.install_script {
-                run_recorded_scriptlet(
-                    journal,
-                    &mut failures,
-                    "pre_upgrade",
+                run_transaction_scriptlet(
+                    failures,
                     script,
                     ScriptletOp::PreUpgrade,
                     &new_version,
@@ -224,7 +203,7 @@ fn apply_transaction(
                     ctx.root_dir,
                     name,
                     ctx.logger,
-                )?;
+                );
             }
 
             let mut retained_paths = incoming_files.clone();
@@ -234,46 +213,42 @@ fn apply_transaction(
                 .join("local")
                 .join(format!("{name}-{old_version}"));
             // Retain paths taken over by any incoming package, irrespective of execution order.
-            journal.step(
-                Phase::Applying,
-                &format!("{name}: remove obsolete paths from {}", old_entry.display()),
-                || remove_package_paths(&old_entry, ctx.root_dir, &retained_paths),
-            )?;
+            remove_package_paths(&old_entry, ctx.root_dir, &retained_paths).map_err(|error| {
+                std::io::Error::other(format!(
+                    "{name} {old_version}: remove obsolete paths from {}: {error}",
+                    old_entry.display()
+                ))
+            })?;
             let backup_md5 = ctx.old_backup_md5.get(name).cloned().unwrap_or_default();
-            let metadata = journal.step(
-                Phase::Applying,
-                &format!("{name}: extract {}", package.downloaded.path.display()),
-                || extract_package(&package.downloaded.path, ctx.root_dir, &backup_md5),
-            )?;
+            let metadata = extract_prepared(archive, ctx.db_path, ctx.root_dir, &backup_md5)?;
             for warning in &metadata.warnings {
                 ctx.logger.log_warning(warning);
             }
-            journal.step(
-                Phase::Applying,
-                &format!("{name}: register {new_version}"),
-                || {
-                    register_package(
-                        ctx.db_path,
-                        &metadata,
-                        reason,
-                        &[Validation::Sha256],
-                        ctx.root_dir,
-                    )
-                },
-            )?;
+            register_package(
+                ctx.db_path,
+                &metadata,
+                reason,
+                archive.validations(),
+                ctx.root_dir,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "{name}: register {new_version} in {}: {error}",
+                    ctx.db_path.display()
+                ))
+            })?;
             if old_version != new_version {
-                journal.step(
-                    Phase::Applying,
-                    &format!("{name}: remove database entry {old_version}"),
-                    || remove_db_entry(ctx.db_path, name, &old_version),
-                )?;
+                remove_db_entry(ctx.db_path, name, &old_version).map_err(|error| {
+                    std::io::Error::other(format!(
+                        "{name}: remove database entry {old_version} from {}: {error}",
+                        ctx.db_path.display()
+                    ))
+                })?;
             }
             ctx.logger.log_upgraded(name, &old_version, &new_version);
             if let Some(script) = &metadata.install {
-                run_recorded_scriptlet(
-                    journal,
-                    &mut failures,
-                    "post_upgrade",
+                run_transaction_scriptlet(
+                    failures,
                     script,
                     ScriptletOp::PostUpgrade,
                     &new_version,
@@ -281,15 +256,13 @@ fn apply_transaction(
                     ctx.root_dir,
                     name,
                     ctx.logger,
-                )?;
+                );
             }
         } else if let Some(install) = tx.installs.iter().find(|install| &install.name == name) {
             let version = install.version.to_string();
             if let Some(script) = &package.install_script {
-                run_recorded_scriptlet(
-                    journal,
-                    &mut failures,
-                    "pre_install",
+                run_transaction_scriptlet(
+                    failures,
                     script,
                     ScriptletOp::PreInstall,
                     &version,
@@ -297,13 +270,9 @@ fn apply_transaction(
                     ctx.root_dir,
                     name,
                     ctx.logger,
-                )?;
+                );
             }
-            let metadata = journal.step(
-                Phase::Applying,
-                &format!("{name}: extract {}", package.downloaded.path.display()),
-                || extract_package(&package.downloaded.path, ctx.root_dir, &HashMap::new()),
-            )?;
+            let metadata = extract_prepared(archive, ctx.db_path, ctx.root_dir, &HashMap::new())?;
             for warning in &metadata.warnings {
                 ctx.logger.log_warning(warning);
             }
@@ -312,25 +281,23 @@ fn apply_transaction(
             } else {
                 InstallReason::Dependency
             };
-            journal.step(
-                Phase::Applying,
-                &format!("{name}: register {version}"),
-                || {
-                    register_package(
-                        ctx.db_path,
-                        &metadata,
-                        reason,
-                        &[Validation::Sha256],
-                        ctx.root_dir,
-                    )
-                },
-            )?;
+            register_package(
+                ctx.db_path,
+                &metadata,
+                reason,
+                archive.validations(),
+                ctx.root_dir,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "{name}: register {version} in {}: {error}",
+                    ctx.db_path.display()
+                ))
+            })?;
             ctx.logger.log_installed(name, &version);
             if let Some(script) = &metadata.install {
-                run_recorded_scriptlet(
-                    journal,
-                    &mut failures,
-                    "post_install",
+                run_transaction_scriptlet(
+                    failures,
                     script,
                     ScriptletOp::PostInstall,
                     &version,
@@ -338,7 +305,7 @@ fn apply_transaction(
                     ctx.root_dir,
                     name,
                     ctx.logger,
-                )?;
+                );
             }
         }
     }
@@ -346,58 +313,68 @@ fn apply_transaction(
     // Never execute all planned post-hooks after a partial filesystem application.
     // This point is reached only after every package has been applied.
     eprintln!(":: Running post-transaction maintenance...");
-    run_recorded_hooks(
+    run_transaction_hooks(
         ctx.root_dir,
         ctx.db_path,
         ctx.hook_dirs,
         &HookWhen::PostTransaction,
         hook_packages,
         ctx.logger,
-        journal,
-        &mut failures,
-    )?;
-    maintenance_result(failures)
+        failures,
+    )
 }
 
-pub(crate) fn maintenance_result(failures: Vec<String>) -> Result<()> {
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ExecError::MaintenanceIncomplete { failures })
-    }
+fn extract_prepared(
+    archive: &PreparedArchive,
+    db_path: &Path,
+    root: &Path,
+    backups: &HashMap<String, String>,
+) -> Result<PackageMetadata> {
+    // Hooks and scriptlets ran since preflight; verify the prepared bytes once more.
+    archive.verify_for_database(db_path)?;
+    extract_package(archive.path(), root, backups).map_err(|error| ExecError::Extraction {
+        pkg: archive.name().to_string(),
+        message: format!(
+            "source {} (prepared {}): {error}",
+            archive.source_path().display(),
+            archive.path().display()
+        ),
+    })
 }
 
 pub(crate) fn finish_transaction(
     result: Result<()>,
-    journal: &mut Journal,
-    db_path: &Path,
+    failures: Vec<String>,
     logger: &mut PaxLogger,
 ) -> Result<()> {
-    let result = result.and_then(|()| journal.complete());
-    if let Err(error) = result {
-        let mut cause = error.to_string();
-        if matches!(error, ExecError::MaintenanceIncomplete { .. }) {
-            logger.log_transaction_incomplete(&cause);
-        } else {
+    match result {
+        Ok(()) if failures.is_empty() => {
+            logger.log_transaction_completed();
+            Ok(())
+        }
+        Ok(()) => {
+            let error = ExecError::MaintenanceIncomplete { failures };
+            logger.log_transaction_incomplete(&error.to_string());
+            Err(error)
+        }
+        Err(error) => {
+            let mut cause = format!(
+                "transaction did not complete; changes may have been partially applied; \
+                 inspect package files and database before retrying: {error}"
+            );
+            if !failures.is_empty() {
+                cause.push_str("\nEarlier maintenance failures:\n");
+                cause.push_str(&failures.join("\n"));
+            }
             logger.log_transaction_failed(&cause);
+            Err(std::io::Error::other(cause).into())
         }
-        if let Err(record_error) = journal.failure(&cause) {
-            cause.push_str(&format!("\nfailed to persist failure: {record_error}"));
-        }
-        return Err(ExecError::TransactionIncomplete {
-            cause,
-            journal: db_path.join("pax-transactions/active.json"),
-        });
     }
-    logger.log_transaction_completed();
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_recorded_scriptlet(
-    journal: &mut Journal,
+pub(crate) fn run_transaction_scriptlet(
     failures: &mut Vec<String>,
-    operation: &str,
     script: &str,
     op: ScriptletOp,
     new_version: &str,
@@ -405,27 +382,10 @@ pub(crate) fn run_recorded_scriptlet(
     root: &Path,
     name: &str,
     logger: &mut PaxLogger,
-) -> Result<()> {
-    let operation = format!("{name}: {operation} {new_version}");
-    journal.intent(Phase::Applying, &operation)?;
-    match run_scriptlet(script, op, new_version, old_version, root, name, logger) {
-        Ok(()) => journal.applied(&operation),
-        Err(error) => {
-            let message = error.to_string();
-            record_maintenance_failure(journal, &message)?;
-            failures.push(message);
-            Ok(())
-        }
+) {
+    if let Err(error) = run_scriptlet(script, op, new_version, old_version, root, name, logger) {
+        failures.push(error.to_string());
     }
-}
-
-fn record_maintenance_failure(journal: &mut Journal, cause: &str) -> Result<()> {
-    journal.failure(cause).map_err(|error| {
-        std::io::Error::other(format!(
-            "{cause}\nfailed to persist maintenance failure: {error}"
-        ))
-        .into()
-    })
 }
 
 fn invalid_transaction(message: impl Into<String>) -> ExecError {
@@ -434,8 +394,8 @@ fn invalid_transaction(message: impl Into<String>) -> ExecError {
 
 fn prepare_incoming<'a>(
     tx: &Transaction,
-    downloaded: &'a [DownloadedPackage],
-) -> Result<HashMap<&'a str, IncomingPackage<'a>>> {
+    downloaded: &'a [PreparedArchive],
+) -> Result<HashMap<&'a str, IncomingPackage>> {
     let mut expected = HashMap::new();
     for (name, version) in tx
         .installs
@@ -472,30 +432,29 @@ fn prepare_incoming<'a>(
 
     let mut incoming = HashMap::new();
     for package in downloaded {
-        let version = expected.get(package.name.as_str()).ok_or_else(|| {
-            invalid_transaction(format!("unexpected downloaded package: {}", package.name))
+        let version = expected.get(package.name()).ok_or_else(|| {
+            invalid_transaction(format!("unexpected prepared package: {}", package.name()))
         })?;
-        let metadata = read_pkginfo(&package.path)?;
-        if metadata.name != package.name || &metadata.version != version {
+        let metadata = package.info();
+        if &metadata.version != version {
             return Err(invalid_transaction(format!(
                 "archive identity mismatch for {}: expected {} {}, found {} {}",
-                package.path.display(),
-                package.name,
+                package.source_path().display(),
+                package.name(),
                 version,
                 metadata.name,
                 metadata.version,
             )));
         }
         let prepared = IncomingPackage {
-            downloaded: package,
-            info: metadata.info,
-            files: read_archive_file_list(&package.path)?,
-            install_script: read_install_script(&package.path)?,
+            info: metadata.info.clone(),
+            files: read_archive_file_list(package.path())?,
+            install_script: read_install_script(package.path())?,
         };
-        if incoming.insert(package.name.as_str(), prepared).is_some() {
+        if incoming.insert(package.name(), prepared).is_some() {
             return Err(invalid_transaction(format!(
-                "duplicate download: {}",
-                package.name
+                "duplicate prepared archive: {}",
+                package.name()
             )));
         }
     }
@@ -543,44 +502,40 @@ fn transaction_packages(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_recorded_hooks(
+pub(crate) fn run_transaction_hooks(
     root: &Path,
     db_path: &Path,
     hook_dirs: &[PathBuf],
     when: &HookWhen,
     packages: &TransactionPackages,
     logger: &mut PaxLogger,
-    journal: &mut Journal,
     failures: &mut Vec<String>,
 ) -> Result<()> {
-    let hooks = load_hooks(hook_dirs);
-    let local = LocalDb::open(db_path)?;
-    // Record each hook separately so a killed hook can be identified on restart.
-    for hook in hooks.iter().filter(|hook| {
-        hook.action.when == *when && !crate::hooks::match_hook(hook, packages).is_empty()
-    }) {
-        let operation = format!("{when:?} hook {}", hook.name);
-        journal.intent(Phase::Hooks, &operation)?;
-        let errors = run_hooks(
-            std::slice::from_ref(hook),
-            when,
-            packages,
-            root,
-            &|dependency| {
-                local
-                    .packages()
-                    .any(|pkg| package_satisfies_dependency(&pkg.info, dependency))
-            },
-            logger,
-        )?;
-        if errors.is_empty() {
-            journal.applied(&operation)?;
-        } else {
-            record_maintenance_failure(journal, &errors.join("\n"))?;
-            failures.extend(errors);
+    let hooks = if *when == HookWhen::PreTransaction {
+        load_hooks(root, hook_dirs)?
+    } else {
+        let (hooks, errors) = collect_hooks(root, hook_dirs);
+        for error in errors {
+            let message = format!("could not load PostTransaction hooks: {error}");
+            eprintln!("warning: {message}");
+            logger.log_warning(&message);
+            failures.push(message);
         }
-    }
+        hooks
+    };
+    let local = LocalDb::open(db_path)?;
+    failures.extend(run_hooks(
+        &hooks,
+        when,
+        packages,
+        root,
+        &|dependency| {
+            local
+                .packages()
+                .any(|pkg| package_satisfies_dependency(&pkg.info, dependency))
+        },
+        logger,
+    )?);
     Ok(())
 }
 
@@ -604,14 +559,26 @@ pub(crate) fn read_file_metadata(files_path: &Path) -> Result<String> {
     })?;
     let sections = content.lines().filter(|line| *line == "%FILES%").count();
     if sections != 1 {
-        // libalpm can write an empty files entry for a payload-free metapackage.
-        // An empty list for a nonempty package is not a usable removal plan.
+        // libalpm writes an empty files entry for payload-free metapackages and
+        // may omit their zero %SIZE%. A declared nonzero size still indicates damage.
         let empty_package = content.is_empty()
             && files_path.parent().is_some_and(|parent| {
                 std::fs::read_to_string(parent.join("desc"))
                     .ok()
                     .is_some_and(|desc| {
-                        desc.lines().skip_while(|line| *line != "%SIZE%").nth(1) == Some("0")
+                        let mut lines = desc.lines();
+                        if lines.any(|line| line == "%SIZE%") {
+                            lines.next() == Some("0")
+                        } else {
+                            let fields = pax_alpm::desc::parse_desc(&desc);
+                            pax_alpm::desc::desc_to_package_info(&fields).is_ok_and(|info| {
+                                crate::extract::validate_identity(
+                                    &info.name,
+                                    &info.version.to_string(),
+                                )
+                                .is_ok()
+                            })
+                        }
                     })
             });
         if !empty_package {
@@ -674,7 +641,7 @@ fn check_disk_space(root_dir: &Path, db_path: &Path, tx: &Transaction) -> Result
     Ok(())
 }
 
-fn read_installed_snapshot(db_path: &Path) -> Result<Vec<PackageInfo>> {
+fn read_installed_packages(db_path: &Path) -> Result<Vec<PackageInfo>> {
     let mut packages = Vec::new();
     for entry in std::fs::read_dir(db_path.join("local"))? {
         let entry = entry?;
@@ -884,12 +851,72 @@ fn retain_parent_directories(path: &str, directories: &mut HashSet<String>) {
     }
 }
 
+pub(crate) fn retained_removal_directories(
+    root_dir: &Path,
+    db_path: &Path,
+    targets: &[RemovalTarget],
+    outgoing_files: &[String],
+) -> Result<HashSet<String>> {
+    let root = root_dir.canonicalize()?;
+    if !root.is_dir() {
+        return Err(invalid_transaction(format!(
+            "ownership root {} is not a directory",
+            root.display()
+        )));
+    }
+    let removing: HashSet<_> = targets
+        .iter()
+        .map(|target| (target.name.as_str(), target.version.as_str()))
+        .collect();
+    let mut parents = HashMap::new();
+    let mut remaining_directories = HashSet::new();
+    for package in read_installed_packages(db_path)? {
+        let version = package.version.to_string();
+        if removing.contains(&(package.name.as_str(), version.as_str())) {
+            continue;
+        }
+        for file in read_file_list(db_path, &package.name, &version)? {
+            let path = ownership_path(&root, &file, &mut parents).map_err(|error| {
+                invalid_transaction(format!(
+                    "{} {version}: inspect retained ownership of {file}: {error}",
+                    package.name
+                ))
+            })?;
+            retain_parent_directories(&path.resolved, &mut remaining_directories);
+            if file.ends_with('/') {
+                remaining_directories.insert(path.resolved);
+            }
+        }
+    }
+    let mut retained = HashSet::new();
+    for file in outgoing_files.iter().filter(|file| file.ends_with('/')) {
+        let path = ownership_path(&root, file, &mut parents)?;
+        if remaining_directories.contains(&path.resolved) {
+            // Cleanup uses lexical paths; preserve the outgoing alias spelling.
+            retained.insert(file.trim_end_matches('/').to_string());
+        }
+    }
+    Ok(retained)
+}
+
+#[cfg(test)]
 fn check_file_conflicts(
     root_dir: &Path,
     db_path: &Path,
-    incoming: &HashMap<&str, IncomingPackage<'_>>,
+    incoming: &HashMap<&str, IncomingPackage>,
     tx: &Transaction,
     steps: &[ExecutionStep],
+) -> Result<HashSet<String>> {
+    check_file_conflicts_inner(root_dir, db_path, incoming, tx, steps, None)
+}
+
+fn check_file_conflicts_inner(
+    root_dir: &Path,
+    db_path: &Path,
+    incoming: &HashMap<&str, IncomingPackage>,
+    tx: &Transaction,
+    steps: &[ExecutionStep],
+    plans: Option<&HashMap<&str, ArchivePlan>>,
 ) -> Result<HashSet<String>> {
     let positions: HashMap<_, _> = steps
         .iter()
@@ -979,10 +1006,23 @@ fn check_file_conflicts(
         }
     }
     let mut incoming_owners: HashMap<String, (&str, bool)> = HashMap::new();
-    let mut lexical_owners: HashMap<&str, (&str, bool)> = HashMap::new();
+    let mut lexical_owners: HashMap<String, (&str, bool)> = HashMap::new();
     let mut conflicts = Vec::new();
     for (name, package) in incoming {
-        for file in &package.files {
+        // Reserve every actual backup's candidate, even if the later three-way
+        // decision keeps the old file. Candidates are not package files or hook targets.
+        let backup_destinations: Vec<_> = plans
+            .and_then(|plans| plans.get(*name))
+            .into_iter()
+            .flat_map(|plan| &plan.backups)
+            .map(|path| format!("{path}.pacnew"))
+            .collect();
+        for (file, backup_destination) in package
+            .files
+            .iter()
+            .map(|file| (file, false))
+            .chain(backup_destinations.iter().map(|file| (file, true)))
+        {
             let directory = file.ends_with('/');
             let ownership = ownership_path(&root, file, &mut parents)?;
             // File lists cannot prove that an upgraded symlink keeps its target.
@@ -1000,7 +1040,7 @@ fn check_file_conflicts(
                 }
             }
             let path = ownership.resolved;
-            lexical_owners.insert(file.trim_end_matches('/'), (*name, directory));
+            lexical_owners.insert(file.trim_end_matches('/').to_string(), (*name, directory));
             if directory {
                 directory_aliases.push((file.trim_end_matches('/').to_string(), path.clone()));
                 retained_directories.insert(path.clone());
@@ -1015,7 +1055,14 @@ fn check_file_conflicts(
             let owners = old_owners.get(&path);
             if let Some(owners) = owners {
                 for owner in owners {
-                    if !changing.contains(owner.package.as_str()) && !(directory && owner.directory)
+                    // Another upgraded package is still retained: its cleanup
+                    // must not remove a sidecar staged earlier in this transaction.
+                    let retained_backup_owner = backup_destination
+                        && owner.package != *name
+                        && !removals.contains_key(owner.package.as_str());
+                    if retained_backup_owner
+                        || (!changing.contains(owner.package.as_str())
+                            && !(directory && owner.directory))
                     {
                         conflicts.push(format!(
                             "  {name}: /{path} already owned by {}",
@@ -1041,6 +1088,11 @@ fn check_file_conflicts(
                         conflicts.push(format!("  {name}: /{path} would be installed before old owner {} is removed; linked removal would delete the new payload", owner.package));
                     }
                 }
+            }
+            // Existing unowned .pacnew files and final symlinks/hardlinks are
+            // legitimate staging destinations, not payload conflicts.
+            if backup_destination {
+                continue;
             }
             match std::fs::symlink_metadata(root.join(&path)) {
                 Ok(metadata) => {
@@ -1129,6 +1181,10 @@ fn parse_name_from_desc(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::DownloadedPackage;
+    use crate::prepared::ArchivePolicy;
+    use crate::removal::remove_package_paths;
+    use pax_core::config::{SigLevel, SigTrust};
     use pax_core::version::Version;
     use pax_resolver::{InstallAction, UpgradeAction};
 
@@ -1191,6 +1247,53 @@ mod tests {
         }
     }
 
+    fn backup_test_archive(
+        dir: &Path,
+        name: &str,
+        version: &str,
+        payload: &str,
+    ) -> DownloadedPackage {
+        let path = dir.join(format!("{name}-{version}.pkg.tar"));
+        let mut builder = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        let info = format!(
+            "pkgname = {name}\npkgver = {version}\narch = any\nbackup = {payload}\nbackup = missing\n"
+        );
+        for (path, contents) in [
+            (".PKGINFO", info.as_bytes()),
+            (payload, b"new config".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, contents).unwrap();
+        }
+        builder.finish().unwrap();
+        DownloadedPackage {
+            name: name.into(),
+            path,
+        }
+    }
+
+    fn prepare_archives(db: &Path, raw: &[DownloadedPackage]) -> Vec<PreparedArchive> {
+        let gpg_dir = tempfile::tempdir().unwrap();
+        raw.iter()
+            .map(|package| {
+                PreparedArchive::prepare(
+                    &package.path,
+                    db,
+                    gpg_dir.path(),
+                    ArchivePolicy {
+                        expected_sha256: None,
+                        sig_level: SigLevel::Never,
+                        sig_trust: SigTrust::TrustedOnly,
+                    },
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
     fn masked_hooks(dir: &Path) -> PathBuf {
         let hooks = dir.join("hooks");
         std::fs::create_dir(&hooks).unwrap();
@@ -1236,27 +1339,50 @@ mod tests {
     }
 
     #[test]
-    fn failure_recording_error_keeps_the_maintenance_cause_and_previous_intent() {
+    fn empty_metapackage_without_size_has_no_files() {
         let temp = tempfile::tempdir().unwrap();
-        let mut journal = Journal::begin(temp.path(), temp.path(), vec![]).unwrap();
-        journal
-            .intent(Phase::Applying, "example: pre_install")
-            .unwrap();
-        let cause = format!(
-            "example: pre_install exit status 42: {}",
-            "x".repeat(8 * 1024 * 1024)
+        let entry = temp.path().join("local/metapackage-1-1");
+        std::fs::create_dir_all(&entry).unwrap();
+        let desc = "%NAME%\nmetapackage\n\n%VERSION%\n1-1\n\n%ARCH%\nany\n\n";
+        std::fs::write(entry.join("desc"), desc).unwrap();
+        std::fs::write(entry.join("files"), "").unwrap();
+        assert!(
+            read_file_list(temp.path(), "metapackage", "1-1")
+                .unwrap()
+                .is_empty()
         );
-        let error = record_maintenance_failure(&mut journal, &cause)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("pre_install exit status 42"));
-        assert!(error.contains("failed to persist maintenance failure"));
-        let record = crate::journal::inspect(temp.path()).unwrap().unwrap();
-        assert_eq!(
-            record.current_operation.as_deref(),
-            Some("example: pre_install")
-        );
-        assert!(record.failure.is_none());
+        for size in ["12\n", "invalid\n", ""] {
+            std::fs::write(entry.join("desc"), format!("{desc}%SIZE%\n{size}")).unwrap();
+            assert!(read_file_list(temp.path(), "metapackage", "1-1").is_err());
+        }
+        for desc in ["", "%NAME%\nmetapackage\n\n", "%VERSION%\n1-1\n\n"] {
+            std::fs::write(entry.join("desc"), desc).unwrap();
+            assert!(read_file_list(temp.path(), "metapackage", "1-1").is_err());
+        }
+        std::fs::remove_file(entry.join("desc")).unwrap();
+        assert!(read_file_list(temp.path(), "metapackage", "1-1").is_err());
+    }
+
+    #[test]
+    fn partial_failure_keeps_operation_and_maintenance_errors_without_state_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("log");
+        let mut logger = PaxLogger::open(&log);
+        logger.log_transaction_start();
+        let error = finish_transaction(
+            Err(std::io::Error::other("example 2-1: extract /root/file: disk full").into()),
+            vec!["example::pre_upgrade: exit status 42".into()],
+            &mut logger,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("partially applied"), "{error}");
+        assert!(error.contains("extract /root/file: disk full"), "{error}");
+        assert!(error.contains("pre_upgrade: exit status 42"), "{error}");
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(contents.contains("transaction failed"));
+        assert!(!contents.contains("transaction completed"));
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -1281,7 +1407,7 @@ mod tests {
             .unwrap()
             .set_len(1024)
             .unwrap();
-        let downloaded = [first, second];
+        let downloaded = prepare_archives(&db, &[first, second]);
         let mut tx = transaction(&["first", "second"]);
         tx.removals.push(pax_resolver::RemovalAction {
             name: "obsolete".into(),
@@ -1326,7 +1452,113 @@ mod tests {
     }
 
     #[test]
-    fn applied_packages_with_failed_scriptlets_leave_an_active_diagnosis() {
+    fn partial_application_preserves_later_replacement_and_skips_planned_post_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = temp.path().join("db");
+        std::fs::create_dir(&root).unwrap();
+        let old = alias_test_entry(&db, "obsolete", "%FILES%\nold\n\n");
+        std::fs::write(root.join("old"), "keep until third").unwrap();
+        let raw: Vec<_> = ["first", "second", "third"]
+            .iter()
+            .map(|name| alias_test_archive(temp.path(), name, "1-1", name))
+            .collect();
+        let prepared = prepare_archives(&db, &raw);
+        let mut tx = transaction(&["first", "second", "third"]);
+        tx.removals.push(pax_resolver::RemovalAction {
+            name: "obsolete".into(),
+            version: Version::parse("1-1").unwrap(),
+            links: vec![pax_resolver::RemovalLink {
+                incoming: "third".into(),
+                reason: RemovalReason::Replaced,
+            }],
+        });
+        let incoming = prepare_incoming(&tx, &prepared).unwrap();
+        let infos: Vec<_> = incoming
+            .values()
+            .map(|package| package.info.clone())
+            .collect();
+        let installed = read_installed_packages(&db).unwrap();
+        let steps = execution_plan(&tx, &installed, &infos).unwrap();
+        let plans = prepared
+            .iter()
+            .map(|archive| {
+                archive.verify_for_database(&db).unwrap();
+                (
+                    archive.name(),
+                    crate::preflight::inspect_archive(archive.path(), &root, Some("auto")).unwrap(),
+                )
+            })
+            .collect();
+        let retained =
+            check_file_conflicts_inner(&root, &db, &incoming, &tx, &steps, Some(&plans)).unwrap();
+        let incoming_files = incoming
+            .values()
+            .flat_map(|package| package.files.iter().cloned())
+            .collect();
+        let packages = transaction_packages(&tx, &HashSet::from(["old".into()]), &incoming_files);
+        // Model damage after preflight, before this archive's extraction turn.
+        std::fs::set_permissions(prepared[1].path(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        std::fs::write(prepared[1].path(), b"damaged prepared archive").unwrap();
+        std::fs::set_permissions(prepared[1].path(), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        let hooks = [masked_hooks(temp.path())];
+        std::fs::write(hooks[0].join("00-post-probe.hook"),
+            "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = PostTransaction\nExec = /must-not-run\n").unwrap();
+        let log = temp.path().join("log");
+        let mut logger = PaxLogger::open(&log);
+        logger.log_transaction_start();
+        let mut failures = Vec::new();
+        let result = apply_transaction(
+            &tx,
+            &mut InstallContext {
+                root_dir: &root,
+                db_path: &db,
+                architecture: "auto",
+                downloaded: &prepared,
+                old_install_scripts: &HashMap::new(),
+                old_backup_md5: &HashMap::new(),
+                hook_dirs: &hooks,
+                check_space: false,
+                logger: &mut logger,
+            },
+            &incoming,
+            &incoming_files,
+            &retained,
+            &steps,
+            &packages,
+            &mut failures,
+        );
+        let error = finish_transaction(result, failures, &mut logger)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("second"), "{error}");
+        assert!(error.contains("partially applied"), "{error}");
+        assert_eq!(std::fs::read(root.join("first")).unwrap(), b"new payload");
+        assert!(db.join("local/first-1-1/desc").is_file());
+        for name in ["second", "third"] {
+            assert!(!root.join(name).exists());
+            assert!(!db.join(format!("local/{name}-1-1")).exists());
+        }
+        assert_eq!(
+            std::fs::read(root.join("old")).unwrap(),
+            b"keep until third"
+        );
+        assert!(old.join("desc").is_file());
+        assert!(!db.join("pax-transactions").exists());
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(!log.contains("00-post-probe"));
+        assert!(!log.contains("transaction completed"));
+    }
+
+    #[test]
+    fn applied_packages_with_failed_scriptlets_report_incomplete_maintenance() {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
@@ -1352,6 +1584,9 @@ mod tests {
                 .unwrap();
         }
         builder.finish().unwrap();
+        drop(builder);
+        let downloaded = prepare_archives(&db, &[downloaded]);
+
         let hooks = masked_hooks(temp.path());
         std::fs::write(hooks.join("00-unmatched.hook"),
             "[Trigger]\nType = Package\nOperation = Install\nTarget = unrelated\n[Action]\nWhen = PostTransaction\nExec = /must-not-run\n").unwrap();
@@ -1363,7 +1598,7 @@ mod tests {
                 root_dir: &root,
                 db_path: &db,
                 architecture: "auto",
-                downloaded: &[downloaded],
+                downloaded: &downloaded,
                 old_install_scripts: &HashMap::new(),
                 old_backup_md5: &HashMap::new(),
                 hook_dirs: &[hooks],
@@ -1379,20 +1614,170 @@ mod tests {
             "payload"
         );
         assert!(db.join("local/example-1-1/desc").exists());
-        let record = crate::journal::inspect(&db).unwrap().unwrap();
-        let failures = record.failure.unwrap();
-        assert!(failures.contains("pre_install"));
-        assert!(failures.contains("post_install"));
-        assert!(
-            !record
-                .completed_operations
-                .iter()
-                .any(|step| step.contains("unmatched"))
-        );
-        assert!(pax_alpm::DbLock::acquire_with_timeout(&db, std::time::Duration::ZERO).is_err());
+        drop(downloaded);
+        assert!(error.contains("pre_install"));
+        assert!(error.contains("post_install"));
+        assert!(!db.join("pax-transactions").exists());
+        assert!(pax_alpm::DbLock::acquire_with_timeout(&db, std::time::Duration::ZERO).is_ok());
         let log = std::fs::read_to_string(log).unwrap();
         assert!(log.contains("transaction incomplete"));
         assert!(!log.contains("transaction completed"));
+        assert!(!log.contains("unmatched"));
+    }
+
+    #[test]
+    fn prepared_archive_survives_source_changes_and_is_cleaned_after_success() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for remove_source in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(db.join("local")).unwrap();
+            std::fs::write(root.join("sentinel"), "keep").unwrap();
+            let _lock = pax_alpm::DbLock::acquire(&db).unwrap();
+            let raw = archive(temp.path(), "example", "example", "1-1");
+            let original = std::fs::read(&raw.path).unwrap();
+            let prepared = prepare_archives(&db, std::slice::from_ref(&raw));
+            let staged_path = prepared[0].path().to_path_buf();
+            let staged_directory = staged_path.parent().unwrap().to_path_buf();
+            assert_ne!(staged_path, raw.path);
+            if remove_source {
+                std::fs::remove_file(&raw.path).unwrap();
+                assert!(!raw.path.exists());
+            } else {
+                std::fs::write(&raw.path, b"not an archive anymore").unwrap();
+                assert_eq!(std::fs::read(&raw.path).unwrap(), b"not an archive anymore");
+            }
+            assert_eq!(std::fs::read(&staged_path).unwrap(), original);
+            let hooks = masked_hooks(temp.path());
+            let log = temp.path().join("log");
+            let mut logger = PaxLogger::open(&log);
+            execute_transaction(
+                &transaction(&["example"]),
+                &mut InstallContext {
+                    root_dir: &root,
+                    db_path: &db,
+                    architecture: "auto",
+                    downloaded: &prepared,
+                    old_install_scripts: &HashMap::new(),
+                    old_backup_md5: &HashMap::new(),
+                    hook_dirs: &[hooks],
+                    check_space: false,
+                    logger: &mut logger,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("file")).unwrap(),
+                "contents"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("sentinel")).unwrap(),
+                "keep"
+            );
+            let desc = std::fs::read_to_string(db.join("local/example-1-1/desc")).unwrap();
+            assert!(desc.contains("%NAME%\nexample\n"));
+            assert!(desc.contains("%VERSION%\n1-1\n"));
+            assert!(!db.join("pax-transactions").exists());
+            assert!(
+                std::fs::read_to_string(log)
+                    .unwrap()
+                    .contains("transaction completed")
+            );
+            assert_eq!(std::fs::read(&staged_path).unwrap(), original);
+            drop(prepared);
+            assert!(!staged_directory.exists());
+            assert_eq!(
+                std::fs::read_to_string(root.join("file")).unwrap(),
+                "contents"
+            );
+            assert!(db.join("local/example-1-1/desc").is_file());
+        }
+    }
+
+    #[test]
+    fn tampered_prepared_archive_stops_execution_before_hooks_or_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = temp.path().join("db");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(db.join("local")).unwrap();
+        std::fs::write(root.join("sentinel"), "keep").unwrap();
+        let _lock = pax_alpm::DbLock::acquire(&db).unwrap();
+        let raw = [
+            alias_test_archive(temp.path(), "first", "1-1", "first-file"),
+            alias_test_archive(temp.path(), "second", "1-1", "second-file"),
+        ];
+        let prepared = prepare_archives(&db, &raw);
+        let staged_directories: Vec<_> = prepared
+            .iter()
+            .map(|archive| archive.path().parent().unwrap().to_path_buf())
+            .collect();
+        let original = std::fs::read(prepared[1].path()).unwrap();
+        let mut tampered = original.clone();
+        let offset = tampered
+            .windows(b"new payload".len())
+            .position(|bytes| bytes == b"new payload")
+            .unwrap();
+        tampered[offset..offset + b"bad payload".len()].copy_from_slice(b"bad payload");
+        std::fs::set_permissions(prepared[1].path(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        std::fs::write(prepared[1].path(), &tampered).unwrap();
+        std::fs::set_permissions(prepared[1].path(), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        assert_eq!(std::fs::read(&raw[1].path).unwrap(), original);
+        let hooks = masked_hooks(temp.path());
+        std::fs::write(hooks.join("00-prepared-probe.hook"),
+            "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
+        let log = temp.path().join("log");
+        let mut logger = PaxLogger::open(&log);
+        let error = execute_transaction(
+            &transaction(&["first", "second"]),
+            &mut InstallContext {
+                root_dir: &root,
+                db_path: &db,
+                architecture: "auto",
+                downloaded: &prepared,
+                old_install_scripts: &HashMap::new(),
+                old_backup_md5: &HashMap::new(),
+                hook_dirs: &[hooks],
+                check_space: false,
+                logger: &mut logger,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("verify prepared package second"), "{error}");
+        assert!(error.contains("SHA-256 mismatch"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("sentinel")).unwrap(),
+            "keep"
+        );
+        assert!(!root.join("first-file").exists());
+        assert!(!root.join("second-file").exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(db.join("local")).unwrap().count(), 0);
+        assert!(!db.join("pax-transactions").exists());
+
+        assert!(
+            !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("transaction started")
+        );
+        drop(prepared);
+        assert!(
+            staged_directories
+                .iter()
+                .all(|directory| !directory.exists())
+        );
     }
 
     #[test]
@@ -1401,13 +1786,16 @@ mod tests {
         let tx = transaction(&["first", "second"]);
         let first = archive(temp.path(), "first", "first", "1-1");
         let wrong_name = archive(temp.path(), "second", "unexpected", "1-1");
-        assert!(prepare_incoming(&tx, &[first, wrong_name]).is_err());
+        let prepared = prepare_archives(temp.path(), &[first, wrong_name]);
+        assert!(prepare_incoming(&tx, &prepared).is_err());
         let first = archive(temp.path(), "first", "first", "1-1");
         let wrong_version = archive(temp.path(), "second", "second", "2-1");
-        assert!(prepare_incoming(&tx, &[first, wrong_version]).is_err());
+        let prepared = prepare_archives(temp.path(), &[first, wrong_version]);
+        assert!(prepare_incoming(&tx, &prepared).is_err());
         let first = archive(temp.path(), "first", "first", "1-1");
+        let prepared = prepare_archives(temp.path(), &[first]);
         assert!(matches!(
-            prepare_incoming(&tx, &[first]),
+            prepare_incoming(&tx, &prepared),
             Err(ExecError::Download { .. })
         ));
     }
@@ -1431,7 +1819,10 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("file"), "local changes").unwrap();
-        let downloaded = [archive(temp.path(), "replacement", "replacement", "1-1")];
+        let downloaded = prepare_archives(
+            &db,
+            &[archive(temp.path(), "replacement", "replacement", "1-1")],
+        );
         let mut tx = transaction(&["replacement"]);
         tx.removals.push(pax_resolver::RemovalAction {
             name: "obsolete".into(),
@@ -1496,19 +1887,10 @@ mod tests {
         let db = temp.path().join("db");
         std::fs::create_dir_all(root.join("shared")).unwrap();
         std::fs::create_dir_all(db.join("local")).unwrap();
-        let first = DownloadedPackage {
-            name: "first".into(),
-            path: PathBuf::new(),
-        };
-        let second = DownloadedPackage {
-            name: "second".into(),
-            path: PathBuf::new(),
-        };
         let mut incoming = HashMap::from([
             (
                 "first",
                 IncomingPackage {
-                    downloaded: &first,
                     info: package_info("first"),
                     files: vec!["shared/".into()],
                     install_script: None,
@@ -1517,7 +1899,6 @@ mod tests {
             (
                 "second",
                 IncomingPackage {
-                    downloaded: &second,
                     info: package_info("second"),
                     files: vec!["shared/".into()],
                     install_script: None,
@@ -1543,6 +1924,245 @@ mod tests {
     }
 
     #[test]
+    fn backup_destinations_allow_unowned_sidecars_but_reject_retained_ownership() {
+        use std::os::unix::fs::MetadataExt;
+
+        for kind in ["absent", "regular", "symlink", "hardlink"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            std::fs::create_dir_all(root.join("real")).unwrap();
+            std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
+            std::fs::write(root.join("real/sentinel"), "keep").unwrap();
+            std::fs::write(root.join("missing.pacnew"), "declaration without payload").unwrap();
+            let entry =
+                alias_test_entry(&db, "other", "%FILES%\nreal/sentinel\nmissing.pacnew\n\n");
+            let sidecar = root.join("real/config.pacnew");
+            match kind {
+                "absent" => {}
+                "regular" => std::fs::write(&sidecar, "previous pacnew").unwrap(),
+                "symlink" => std::os::unix::fs::symlink("sentinel", &sidecar).unwrap(),
+                "hardlink" => std::fs::hard_link(root.join("real/sentinel"), &sidecar).unwrap(),
+                _ => unreachable!(),
+            }
+            let inode = std::fs::symlink_metadata(&sidecar)
+                .ok()
+                .map(|meta| meta.ino());
+            let raw = backup_test_archive(temp.path(), "config", "1-1", "alias/config");
+            let plan = crate::preflight::inspect_archive(&raw.path, &root, Some("auto")).unwrap();
+            assert_eq!(plan.backups, ["alias/config"]);
+
+            let plans = HashMap::from([("config", plan)]);
+            let incoming = HashMap::from([(
+                "config",
+                IncomingPackage {
+                    info: package_info("config"),
+                    files: read_archive_file_list(&raw.path).unwrap(),
+                    install_script: None,
+                },
+            )]);
+            let tx = transaction(&["config"]);
+            let steps = simple_steps(&tx);
+            let directories =
+                check_file_conflicts_inner(&root, &db, &incoming, &tx, &steps, Some(&plans))
+                    .unwrap();
+            assert!(directories.contains("real"));
+
+            std::fs::write(
+                entry.join("files"),
+                "%FILES%\nreal/sentinel\nmissing.pacnew\nreal/config.pacnew\n\n",
+            )
+            .unwrap();
+            // The ordinary payload has no conflict; only the backup candidate is owned.
+            assert!(check_file_conflicts(&root, &db, &incoming, &tx, &steps).is_ok());
+            let error =
+                check_file_conflicts_inner(&root, &db, &incoming, &tx, &steps, Some(&plans))
+                    .unwrap_err();
+            assert!(
+                matches!(&error, ExecError::FileConflict(_)),
+                "{kind}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("/real/config.pacnew already owned by other")
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&sidecar)
+                    .ok()
+                    .map(|meta| meta.ino()),
+                inode
+            );
+            if kind == "symlink" {
+                assert_eq!(std::fs::read_link(&sidecar).unwrap(), Path::new("sentinel"));
+            }
+            if kind != "absent" {
+                let expected = if kind == "regular" {
+                    "previous pacnew"
+                } else {
+                    "keep"
+                };
+                assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), expected);
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("real/sentinel")).unwrap(),
+                "keep"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("missing.pacnew")).unwrap(),
+                "declaration without payload"
+            );
+            assert!(!root.join("real/config").exists());
+            assert!(!db.join("pax-transactions").exists());
+        }
+    }
+
+    #[test]
+    fn backup_destination_conflicts_stop_execution_before_hooks_or_payload() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for upgrade in [false, true] {
+            for collision in [
+                "retained",
+                "incoming-first",
+                "incoming-last",
+                "incoming-child",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("root");
+                let db = temp.path().join("db");
+                std::fs::create_dir_all(root.join("real")).unwrap();
+                std::fs::create_dir_all(db.join("local")).unwrap();
+                std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
+                std::fs::write(root.join("sentinel"), "keep").unwrap();
+                let mut tx = transaction(&["config"]);
+                let version = if upgrade { "2-1" } else { "1-1" };
+                let mut old_entries = Vec::new();
+                if upgrade {
+                    tx.installs.clear();
+                    tx.upgrades.push(alias_test_upgrade("config"));
+                    let baseline = format!("{:x}", md5::compute("original"));
+                    let files =
+                        format!("%FILES%\nalias/config\n\n%BACKUP%\nalias/config\t{baseline}\n\n");
+                    let entry = alias_test_entry(&db, "config", &files);
+                    old_entries.push((entry, files));
+                    std::fs::write(root.join("real/config"), "local changes").unwrap();
+                }
+                let mut raw = vec![backup_test_archive(
+                    temp.path(),
+                    "config",
+                    version,
+                    "alias/config",
+                )];
+                if collision == "retained" {
+                    let files = "%FILES%\nreal/config.pacnew\n\n";
+                    let entry = alias_test_entry(&db, "other", files);
+                    old_entries.push((entry, files.to_string()));
+                    std::fs::write(root.join("real/config.pacnew"), "owned sidecar").unwrap();
+                } else {
+                    let payload = if collision == "incoming-child" {
+                        "real/config.pacnew/child"
+                    } else {
+                        "real/config.pacnew"
+                    };
+                    raw.push(alias_test_archive(temp.path(), "other", "1-1", payload));
+                    tx.installs.extend(transaction(&["other"]).installs);
+                    tx.package_order.push("other".into());
+                    if collision == "incoming-first" {
+                        tx.package_order.reverse();
+                    }
+                }
+                let prepared = prepare_archives(&db, &raw);
+                let incoming = prepare_incoming(&tx, &prepared).unwrap();
+                let installed = read_installed_packages(&db).unwrap();
+                let infos: Vec<_> = incoming
+                    .values()
+                    .map(|package| package.info.clone())
+                    .collect();
+                let steps = execution_plan(&tx, &installed, &infos).unwrap();
+                assert!(check_file_conflicts(&root, &db, &incoming, &tx, &steps).is_ok());
+                let hooks = masked_hooks(temp.path());
+                std::fs::write(hooks.join("00-backup-ownership-probe.hook"),
+                    "[Trigger]\nType = Package\nOperation = Install\nOperation = Upgrade\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
+                let log = temp.path().join("log");
+                let mut logger = PaxLogger::open(&log);
+                let old_descs: Vec<_> = old_entries
+                    .iter()
+                    .map(|(entry, _)| std::fs::read(entry.join("desc")).unwrap())
+                    .collect();
+                let error = execute_transaction(
+                    &tx,
+                    &mut InstallContext {
+                        root_dir: &root,
+                        db_path: &db,
+                        architecture: "auto",
+                        downloaded: &prepared,
+                        old_install_scripts: &HashMap::new(),
+                        old_backup_md5: &HashMap::new(),
+                        hook_dirs: &[hooks],
+                        check_space: false,
+                        logger: &mut logger,
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(&error, ExecError::FileConflict(_)),
+                    "{collision}: {error}"
+                );
+                assert!(error.to_string().contains("config.pacnew"), "{error}");
+                let expected = match collision {
+                    "retained" => "already owned by other",
+                    "incoming-child" => "must remain a directory",
+                    _ => "also supplied by",
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("sentinel")).unwrap(),
+                    "keep"
+                );
+                if upgrade {
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("real/config")).unwrap(),
+                        "local changes"
+                    );
+                } else {
+                    assert!(!root.join("real/config").exists());
+                }
+                if collision == "retained" {
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("real/config.pacnew")).unwrap(),
+                        "owned sidecar"
+                    );
+                } else {
+                    assert!(!root.join("real/config.pacnew").exists());
+                }
+                assert_eq!(
+                    std::fs::read_link(root.join("alias")).unwrap(),
+                    Path::new("real")
+                );
+                for ((entry, files), desc) in old_entries.iter().zip(&old_descs) {
+                    assert_eq!(
+                        std::fs::read_to_string(entry.join("files")).unwrap(),
+                        *files
+                    );
+                    assert_eq!(std::fs::read(entry.join("desc")).unwrap(), *desc);
+                }
+                assert_eq!(
+                    std::fs::read_dir(db.join("local")).unwrap().count(),
+                    old_entries.len()
+                );
+                assert!(!db.join("pax-transactions").exists());
+                assert!(
+                    !std::fs::read_to_string(log)
+                        .unwrap()
+                        .contains("transaction started")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn late_removal_cannot_delete_an_earlier_incoming_file_through_an_alias() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -1554,19 +2174,10 @@ mod tests {
         std::fs::write(entry.join("desc"), "%NAME%\nold\n\n").unwrap();
         std::fs::write(entry.join("files"), "%FILES%\ndir/\ndir/shared\n\n").unwrap();
         std::fs::write(root.join("dir/shared"), "keep").unwrap();
-        let early = DownloadedPackage {
-            name: "early".into(),
-            path: PathBuf::new(),
-        };
-        let late = DownloadedPackage {
-            name: "late".into(),
-            path: PathBuf::new(),
-        };
         let incoming = HashMap::from([
             (
                 "early",
                 IncomingPackage {
-                    downloaded: &early,
                     info: package_info("early"),
                     files: vec!["alias/shared".into()],
                     install_script: None,
@@ -1575,7 +2186,6 @@ mod tests {
             (
                 "late",
                 IncomingPackage {
-                    downloaded: &late,
                     info: package_info("late"),
                     files: vec!["later".into()],
                     install_script: None,
@@ -1651,18 +2261,9 @@ mod tests {
                 let files =
                     format!("%FILES%\n{old_spelling}\n\n%BACKUP%\n{old_spelling}\t{baseline}\n\n");
                 let entry = alias_test_entry(&db, "old", &files);
-                let old = DownloadedPackage {
-                    name: "old".into(),
-                    path: PathBuf::new(),
-                };
-                let new = DownloadedPackage {
-                    name: "new".into(),
-                    path: PathBuf::new(),
-                };
                 let mut incoming = HashMap::from([(
                     "old",
                     IncomingPackage {
-                        downloaded: &old,
                         info: package_info("old"),
                         files: if same_name {
                             vec![new_spelling.into()]
@@ -1679,7 +2280,6 @@ mod tests {
                     incoming.insert(
                         "new",
                         IncomingPackage {
-                            downloaded: &new,
                             info: package_info("new"),
                             files: vec![new_spelling.into()],
                             install_script: None,
@@ -1743,20 +2343,11 @@ mod tests {
             std::os::unix::fs::symlink("../real", root.join("links/alias2")).unwrap();
             let files = "%FILES%\nlinks/alias2\n\n";
             let entry = alias_test_entry(&db, "old", files);
-            let early = DownloadedPackage {
-                name: "early".into(),
-                path: PathBuf::new(),
-            };
             let later_name = if upgrade { "old" } else { "late" };
-            let late = DownloadedPackage {
-                name: later_name.into(),
-                path: PathBuf::new(),
-            };
             let incoming = HashMap::from([
                 (
                     "early",
                     IncomingPackage {
-                        downloaded: &early,
                         info: package_info("early"),
                         files: vec![
                             "alias1/implicit/first".into(),
@@ -1768,7 +2359,6 @@ mod tests {
                 (
                     later_name,
                     IncomingPackage {
-                        downloaded: &late,
                         info: package_info(later_name),
                         files: vec!["late-file".into()],
                         install_script: None,
@@ -1833,14 +2423,9 @@ mod tests {
             if owned {
                 alias_test_entry(&db, "stable", "%FILES%\nalias1\nalias2\n\n");
             }
-            let download = DownloadedPackage {
-                name: "new".into(),
-                path: PathBuf::new(),
-            };
             let incoming = HashMap::from([(
                 "new",
                 IncomingPackage {
-                    downloaded: &download,
                     info: package_info("new"),
                     files: vec![
                         "alias1/implicit/file".into(),
@@ -1970,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn alias_blockers_stop_execution_before_hooks_journal_or_backup_changes() {
+    fn alias_blockers_stop_execution_before_hooks_or_backup_changes() {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
@@ -2042,6 +2627,7 @@ mod tests {
                     )
                 }
             };
+            let downloaded = prepare_archives(&db, &downloaded);
             let hooks = masked_hooks(temp.path());
             std::fs::write(hooks.join("00-alias-probe.hook"),
                 "[Trigger]\nType = Package\nOperation = Install\nOperation = Upgrade\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
@@ -2116,14 +2702,9 @@ mod tests {
             std::fs::write(entry.join("desc"), format!("%NAME%\n{name}\n\n")).unwrap();
             std::fs::write(entry.join("files"), "%FILES%\nshared/\n\n").unwrap();
         }
-        let new = DownloadedPackage {
-            name: "new".into(),
-            path: PathBuf::new(),
-        };
         let incoming = HashMap::from([(
             "new",
             IncomingPackage {
-                downloaded: &new,
                 info: package_info("new"),
                 files: vec!["file".into()],
                 install_script: None,
@@ -2157,19 +2738,10 @@ mod tests {
         std::fs::write(entry.join("desc"), "%NAME%\nold\n\n").unwrap();
         std::fs::write(entry.join("files"), "%FILES%\nshared\n\n").unwrap();
         std::fs::write(root.join("shared"), "old").unwrap();
-        let new = DownloadedPackage {
-            name: "new".into(),
-            path: PathBuf::new(),
-        };
-        let old = DownloadedPackage {
-            name: "old".into(),
-            path: PathBuf::new(),
-        };
         let mut incoming = HashMap::from([
             (
                 "new",
                 IncomingPackage {
-                    downloaded: &new,
                     info: package_info("new"),
                     files: vec!["shared".into()],
                     install_script: None,
@@ -2178,7 +2750,6 @@ mod tests {
             (
                 "old",
                 IncomingPackage {
-                    downloaded: &old,
                     info: package_info("old"),
                     files: vec![],
                     install_script: None,

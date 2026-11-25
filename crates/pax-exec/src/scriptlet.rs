@@ -31,11 +31,18 @@ impl ScriptletOp {
     }
 }
 
-/// Configure the child only: the parent must retain its original root and cwd.
+/// Configure the child only: the parent retains its root, cwd and umask.
 pub(crate) fn command_in_root(program: &str, root_dir: &Path) -> io::Result<Command> {
     let root = std::fs::canonicalize(root_dir)?;
     let mut command = Command::new(program);
     command.current_dir("/");
+    // Match pacman's hook/scriptlet environment without changing the calling process.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
     if root != Path::new("/") {
         let root = CString::new(root.as_os_str().as_bytes())?;
         // Only async-signal-safe operations are allowed between fork and exec.
@@ -167,6 +174,52 @@ pub fn run_scriptlet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_commands_use_standard_umask_without_changing_parent() {
+        const CHILD: &str = "PAX_TEST_RESTRICTIVE_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "scriptlet::tests::system_commands_use_standard_umask_without_changing_parent",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            // Set the mask in a separate test process; other test threads must not see it.
+            unsafe {
+                child.pre_exec(|| {
+                    libc::umask(0o077);
+                    Ok(())
+                });
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let mut command = command_in_root("/bin/bash", Path::new("/")).unwrap();
+        command.args(["-c", "umask"]);
+        let output = command_output(&mut command, None).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0022\n");
+        let output = scriptlet_output(
+            "post_install() { umask; }",
+            ScriptletOp::PostInstall,
+            "1",
+            None,
+            Path::new("/"),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0022\n");
+        let output = Command::new("/bin/bash")
+            .args(["-c", "umask"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0077\n");
+    }
 
     #[test]
     fn versions_are_literal_positional_arguments() {

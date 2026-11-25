@@ -5,7 +5,8 @@ use anyhow::Result;
 use pax_alpm::db::DatabaseHandle;
 use pax_core::config::SigConfig;
 use pax_core::version::Version;
-use pax_exec::{DownloadedPackage, InstallContext, execute_transaction, read_pkginfo};
+use pax_exec::prepared::{ArchivePolicy, PreparedArchive};
+use pax_exec::{InstallContext, execute_transaction};
 use pax_resolver::{ConcretePool, ResolveOptions, build_transaction, resolve, topological_sort};
 
 use super::{collect_old_backup_md5, collect_old_install_scripts, confirm};
@@ -122,28 +123,21 @@ fn install_files(
         let policy = downgrade
             .map(|file| file.policy)
             .unwrap_or(db.config.local_file_sig_level);
-        let canonical = file
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
-        let mut signature = file.as_os_str().to_os_string();
-        signature.push(".sig");
-        let signature = PathBuf::from(signature);
-        let signature = match std::fs::symlink_metadata(&signature) {
-            Ok(_) => Some(signature),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        pax_exec::verify::verify_signature(
-            &canonical,
-            signature.as_deref(),
+        eprintln!(":: Preparing and verifying local archive {}/{}: {}", index + 1, files.len(), file.display());
+        let prepared = PreparedArchive::prepare(
+            file,
+            &db.config.db_path,
             &db.config.gpg_dir,
-            policy.package,
-            policy.package_trust,
+            ArchivePolicy {
+                expected_sha256: None,
+                sig_level: policy.package,
+                sig_trust: policy.package_trust,
+            },
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let metadata = read_pkginfo(&canonical).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let info = metadata.info;
+        let metadata = prepared.info();
+        let info = metadata.info.clone();
         if let Some(downgrade) = downgrade {
             validate_downgrade_archive(downgrade, &info.name, &info.version)?;
         }
@@ -158,10 +152,7 @@ fn install_files(
             anyhow::bail!("multiple incoming files for package {}", info.name);
         }
         targets.push(info.name.clone());
-        downloaded.push(DownloadedPackage {
-            name: info.name.clone(),
-            path: canonical,
-        });
+        downloaded.push(prepared);
         pool.add_sync(info, 0);
     }
 

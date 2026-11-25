@@ -63,8 +63,16 @@ pub fn resolve<P: PackagePool>(
         targets: targets.iter().cloned().collect(),
     };
 
+    // Reserve every explicit candidate before dependencies can use an obsolete
+    // installed version of another target, including targets chosen via provides.
+    let mut roots = Vec::new();
     for target in targets {
-        resolver.resolve_target(target, &[])?;
+        if let Some(id) = resolver.resolve_target(target, &[])? {
+            roots.push(id);
+        }
+    }
+    for id in roots {
+        resolver.resolve_dependencies(id, &[])?;
     }
 
     resolver.plan_removals()?;
@@ -73,11 +81,11 @@ pub fn resolve<P: PackagePool>(
 }
 
 impl<'a, P: PackagePool> Resolver<'a, P> {
-    fn resolve_target(&mut self, name: &str, chain: &[String]) -> Result<()> {
-        if let Some(&id) = self.selected.get(name) {
+    fn resolve_target(&mut self, name: &str, chain: &[String]) -> Result<Option<PackageId>> {
+        if self.selected.contains_key(name) {
             self.reasons
                 .insert(name.to_string(), InstallReason::Explicit);
-            return self.select(id, chain, InstallReason::Explicit);
+            return Ok(None);
         }
         let candidate = preferred_sync(self.pool, name)
             .or_else(|| self.pool.candidates(name).into_iter().next())
@@ -91,15 +99,17 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
             .ok_or_else(|| ResolveError::TargetNotFound {
                 name: name.to_string(),
             })?;
-        self.select(candidate.id, chain, InstallReason::Explicit)
+        Ok(self
+            .reserve(candidate.id, chain, InstallReason::Explicit)?
+            .then_some(candidate.id))
     }
 
-    fn select(&mut self, id: PackageId, chain: &[String], reason: InstallReason) -> Result<()> {
+    fn reserve(&mut self, id: PackageId, chain: &[String], reason: InstallReason) -> Result<bool> {
         let candidate = self.pool.get(id).expect("candidate belongs to pool");
         let name = candidate.info.name.clone();
         if let Some(&selected) = self.selected.get(&name) {
             if selected == id {
-                return Ok(());
+                return Ok(false);
             }
             return Err(ResolveError::DependencyNotFound {
                 dep: Dependency {
@@ -109,12 +119,17 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
                 chain: chain.to_vec(),
             });
         }
-        let deps = candidate.info.depends.clone();
         self.selected.insert(name.clone(), id);
         self.reasons.insert(name.clone(), reason);
-        self.dep_chains.insert(name.clone(), chain.to_vec());
+        self.dep_chains.insert(name, chain.to_vec());
+        Ok(true)
+    }
+
+    fn resolve_dependencies(&mut self, id: PackageId, chain: &[String]) -> Result<()> {
+        let candidate = self.pool.get(id).expect("candidate belongs to pool");
+        let deps = candidate.info.depends.clone();
         let mut next_chain = chain.to_vec();
-        next_chain.push(name);
+        next_chain.push(candidate.info.name.clone());
         for dep in &deps {
             self.resolve_dep(dep, &next_chain)?;
         }
@@ -152,8 +167,8 @@ impl<'a, P: PackagePool> Resolver<'a, P> {
                 })
         });
         if let Some(candidate) = candidate {
-            if !self.selected.contains_key(&candidate.info.name) {
-                return self.select(candidate.id, chain, InstallReason::Dependency);
+            if self.reserve(candidate.id, chain, InstallReason::Dependency)? {
+                return self.resolve_dependencies(candidate.id, chain);
             }
         }
         if let Some(installed) = self.pool.installed_version(&dep.name) {
@@ -591,6 +606,149 @@ mod tests {
         pool.add_sync(make_pkg("app", "1", &["lib<2"]), 0);
         for targets in [["app".into(), "lib".into()], ["lib".into(), "app".into()]] {
             assert!(resolve(&pool, &targets, &ResolveOptions::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_targets_reserve_provider_names_in_either_order() {
+        for retain_alternative in [false, true] {
+            let mut pool = ConcretePool::new(HashSet::new());
+            let mut old = make_pkg("z-provider", "1", &[]);
+            old.provides = vec![Dependency::parse("abi=1").unwrap()];
+            pool.add_local(old);
+            pool.add_local(make_pkg("a-app", "1", &["abi=1"]));
+            let app = pool.add_sync(make_pkg("a-app", "2", &["abi=1"]), 0);
+            let mut new = make_pkg("z-provider", "2", &[]);
+            new.provides = vec![
+                Dependency::parse("abi=2").unwrap(),
+                Dependency::parse("provider-choice").unwrap(),
+            ];
+            let provider = pool.add_sync(new, 0);
+            let mut compat = make_pkg("compat", "9", &[]);
+            compat.provides = vec![Dependency::parse("abi=1").unwrap()];
+            pool.add_sync(compat.clone(), 1);
+            compat.version = Version::parse("1").unwrap();
+            let compat = pool.add_sync(compat, 0);
+            if retain_alternative {
+                let mut retained = make_pkg("unrelated-provider", "1", &[]);
+                retained.provides = vec![Dependency::parse("abi=1").unwrap()];
+                pool.add_local(retained);
+            }
+
+            // A virtual target must reserve its provider's real package name,
+            // not the target spelling or every installed provider of abi.
+            for target in ["z-provider", "provider-choice"] {
+                for targets in [
+                    ["a-app".into(), target.into()],
+                    [target.into(), "a-app".into()],
+                ] {
+                    let mut resolved = resolve(&pool, &targets, &ResolveOptions::default())
+                        .unwrap_or_else(|error| panic!("{targets:?}: {error}"));
+                    let expected = if retain_alternative {
+                        vec![app, provider]
+                    } else {
+                        vec![app, compat, provider]
+                    };
+                    assert_eq!(
+                        resolved
+                            .to_install
+                            .iter()
+                            .map(|pkg| pkg.id)
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert!(resolved.to_remove.is_empty());
+                    for pkg in &resolved.to_install {
+                        assert_eq!(
+                            pkg.reason,
+                            if pkg.id == compat {
+                                InstallReason::Dependency
+                            } else {
+                                InstallReason::Explicit
+                            }
+                        );
+                    }
+
+                    crate::topological_sort(&pool, &mut resolved);
+                    let tx =
+                        crate::build_transaction(&pool, &resolved, &targets, &|_| (0, 0), false)
+                            .unwrap();
+                    assert_eq!(tx.upgrades.len(), 2);
+                    assert_eq!(tx.installs.len(), usize::from(!retain_alternative));
+                    if !retain_alternative {
+                        let compat_pos = tx.package_order.iter().position(|name| name == "compat");
+                        let app_pos = tx.package_order.iter().position(|name| name == "a-app");
+                        assert!(compat_pos.unwrap() < app_pos.unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_target_cycles_still_resolve_each_roots_dependencies() {
+        let mut pool = ConcretePool::new(HashSet::new());
+        pool.add_sync(make_pkg("a", "1", &["b"]), 0);
+        pool.add_sync(make_pkg("b", "1", &["c"]), 0);
+        pool.add_sync(make_pkg("c", "1", &["a", "leaf"]), 0);
+        pool.add_sync(make_pkg("leaf", "1", &[]), 0);
+        for targets in [
+            ["a".into(), "b".into(), "a".into()],
+            ["b".into(), "a".into(), "b".into()],
+        ] {
+            let resolved = resolve(&pool, &targets, &ResolveOptions::default()).unwrap();
+            assert_eq!(resolved.to_install.len(), 4);
+            for pkg in &resolved.to_install {
+                assert_eq!(
+                    pkg.reason,
+                    if pkg.name == "a" || pkg.name == "b" {
+                        InstallReason::Explicit
+                    } else {
+                        InstallReason::Dependency
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_explicit_roots_preserve_version_and_reinstall_policy() {
+        for version in ["1", "2", "3"] {
+            for reinstall in [false, true] {
+                let mut pool = ConcretePool::new(HashSet::from(["lib".into()]));
+                pool.add_local(make_pkg("lib", "2", &[]));
+                let lib = pool.add_sync(make_pkg("lib", version, &[]), 0);
+                pool.add_sync(make_pkg("lib", "9", &[]), 1);
+                pool.add_sync(make_pkg("app", "1", &["lib>=1"]), 0);
+                let options = ResolveOptions {
+                    reinstall,
+                    ..ResolveOptions::default()
+                };
+                for targets in [["app".into(), "lib".into()], ["lib".into(), "app".into()]] {
+                    let mut resolved = resolve(&pool, &targets, &options).unwrap();
+                    assert!(
+                        resolved
+                            .to_install
+                            .iter()
+                            .any(|pkg| { pkg.id == lib && pkg.reason == InstallReason::Explicit })
+                    );
+                    crate::topological_sort(&pool, &mut resolved);
+                    let tx = crate::build_transaction(
+                        &pool,
+                        &resolved,
+                        &targets,
+                        &|_| (0, 0),
+                        reinstall,
+                    )
+                    .unwrap();
+                    assert_eq!(tx.installs.len(), 1);
+                    assert_eq!(tx.upgrades.len(), usize::from(version != "2" || reinstall));
+                    if let Some(upgrade) = tx.upgrades.first() {
+                        assert_eq!(upgrade.name, "lib");
+                        assert_eq!(upgrade.new_version, Version::parse(version).unwrap());
+                    }
+                }
+            }
         }
     }
 

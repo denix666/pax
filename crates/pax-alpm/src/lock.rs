@@ -1,11 +1,13 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// A diagnostic journal is not a stale-lock signal. Never discard it, even if
-/// malformed, or let a fresh mutating command hide an interrupted transaction.
+/// Compatibility guard for unfinished journals from older development builds.
+/// New transactions never create these files; retained evidence is not a stale
+/// lock signal and must be reconciled manually, not silently deleted.
 pub fn ensure_no_active_transaction(db_path: &Path) -> std::io::Result<()> {
     let directory = db_path.join("pax-transactions");
     match std::fs::symlink_metadata(&directory) {
@@ -27,7 +29,7 @@ pub fn ensure_no_active_transaction(db_path: &Path) -> std::io::Result<()> {
         Ok(_) => Err(std::io::Error::new(
             ErrorKind::AlreadyExists,
             format!(
-                "unfinished transaction journal {}; inspect with pax transaction-status using the same --config/--dbpath/--root; do not remove db.lck or retry before reconciling the system (automatic recovery is not available)",
+                "legacy unfinished transaction journal {}; inspect the retained journal, package files and database before switching to normal operations; do not remove db.lck or discard recovery data blindly",
                 active.display()
             ),
         )),
@@ -38,7 +40,7 @@ pub fn ensure_no_active_transaction(db_path: &Path) -> std::io::Result<()> {
 
 pub struct DbLock {
     path: PathBuf,
-    acquired: bool,
+    file: File,
 }
 
 impl DbLock {
@@ -54,14 +56,11 @@ impl DbLock {
         let mut notified = false;
         loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => {
+                Ok(file) => {
                     if notified {
                         eprintln!(":: Lock acquired.");
                     }
-                    let lock = Self {
-                        path,
-                        acquired: true,
-                    };
+                    let lock = Self { path, file };
                     // The preceding owner could have left a journal while we waited.
                     ensure_no_active_transaction(db_path)?;
                     return Ok(lock);
@@ -92,8 +91,12 @@ impl DbLock {
 
 impl Drop for DbLock {
     fn drop(&mut self) {
-        if self.acquired {
-            let _ = std::fs::remove_file(&self.path);
+        if let (Ok(owned), Ok(named)) =
+            (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+        {
+            if named.is_file() && owned.dev() == named.dev() && owned.ino() == named.ino() {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 }
@@ -123,6 +126,21 @@ mod tests {
         symlink("missing", &active).unwrap();
         assert!(ensure_no_active_transaction(&directory).is_err());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn dropping_lock_does_not_unlink_a_replacement() {
+        let directory =
+            std::env::temp_dir().join(format!("pax-replaced-lock-{}", std::process::id()));
+        let lock = DbLock::acquire(&directory).unwrap();
+        std::fs::remove_file(directory.join("db.lck")).unwrap();
+        std::fs::write(directory.join("db.lck"), b"another owner").unwrap();
+        drop(lock);
+        assert_eq!(
+            std::fs::read(directory.join("db.lck")).unwrap(),
+            b"another owner"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

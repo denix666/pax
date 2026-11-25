@@ -1,12 +1,12 @@
 # pax
 
-A modern and fast package manager for Arch-based systems, written in Rust.
+A lightweight package manager for Arch-based systems, written in Rust.
 
 Package manager using pacman's configuration and database formats, with AUR support, dependency resolution, parallel downloads, and shell completions.
 
 ## Disclaimer
 
-This program comes with no warranty. You must use this program at your own risk.
+This program comes with no warranty. You must use this program at your own risk. Pacman-compatible package behavior is the goal, not a guarantee of full parity.
 
 ## Features
 
@@ -17,7 +17,7 @@ This program comes with no warranty. You must use this program at your own risk.
 - **AUR support** — search, install, and build AUR packages via makepkg
 - **Shell completions** — dynamic completions for bash, zsh, and fish with `[installed]` markers
 - **Transaction hooks** — supports alpm hooks (PreTransaction / PostTransaction); reports incomplete maintenance instead of full success
-- **Transaction diagnostics** — persistent operation journal and `transaction-status`; unfinished transactions block further changes
+- **Verified archive copies** — signature checks, final metadata and extraction use the same private temporary copy, independent of later source/cache changes
 - **Archive preflight** — checks complete archive streams, metadata, architecture, links, and incompatible destination types before hooks
 - **Scriptlets** — runs pre/post install/upgrade/remove scriptlets
 - **Backup file handling** — preserves user-modified config files (`.pacnew` / `.pacsave`)
@@ -68,8 +68,7 @@ Most commands that modify the system (install, remove, upgrade, sync) will autom
 | `aur-install` | — | Install packages from AUR |
 | `aur-upgrade` | — | Upgrade installed AUR packages |
 | `aur-search` | — | Search AUR for packages |
-| `transaction-status` | — | Inspect the active transaction journal without changing it |
-| `remove-lock` | — | Remove a stale database lock file when no unfinished transaction journal exists |
+| `remove-lock` | — | Remove a stale database lock file; refuses when an older active transaction record exists |
 
 ### Examples
 
@@ -152,30 +151,10 @@ pax check-files
 # Check files for specific packages
 pax check-files bash glibc
 
-# Remove a stale lock file (if pax or pacman was interrupted)
+# Remove a stale lock only after confirming no package manager is running and inspecting any interrupted changes
 pax remove-lock
 ```
 
-### Transaction diagnostics and limits
-
-Before applying packages, pax checks all incoming archives. During application it records the current hook, scriptlet, extraction, cleanup, or database operation in `DBPath/pax-transactions/active.json`. Successful transactions are archived under `DBPath/pax-transactions/history/`.
-
-```bash
-pax transaction-status
-
-# Use the same configuration, database and root as the interrupted operation
-pax --config /path/to/pacman.conf --dbpath /path/to/db --root /path/to/root transaction-status
-```
-
-The command only displays diagnostic state; it does not repair packages or remove locks. An active journal blocks further pax modifications, including cache cleaning and `remove-lock`. Investigate the running processes, journal, package files and database before attempting manual recovery. Pacman itself does not honor this additional pax journal.
-
-Nonfatal hook and scriptlet failures do not suppress later maintenance, but the command returns an error and keeps the journal active. A failing `PreTransaction` hook with `AbortOnFail` stops application. Post-transaction hooks are not run against the complete planned target set after a partial application failure.
-
-**Transactions are not atomic, and automatic recovery and boot-set protection are not implemented.** The journal is diagnostic: it does not contain old file contents or database backups, and its durability does not imply that package contents are durable. Arbitrary hook effects cannot be rolled back. Kernel changes still require an independently recoverable boot environment.
-
-Replacement and conflict removals are linked to their incoming packages while preserving the install/upgrade dependency order. An early failure does not start later unrelated removals. Unsupported ordering constraints and file transfers that would be deleted by later cleanup are rejected before hooks. This is not atomic replacement: the current replacement can still be partially applied.
-
-Archive checks are deliberately conservative: hardlinks must reference an earlier regular member in the same archive; nonempty directory replacement and incompatible file-to-directory transitions are rejected before hooks. Additional gzip/xz streams and ambiguous metadata are also rejected. Transfers from an upgraded owner through a different alias spelling, or incoming paths traversing a parent symlink owned by a changing package, are currently rejected rather than risking later deletion of the new file or its access path. This is not a promise of identical behavior for every archive accepted by pacman.
 
 ### Downgrading packages
 
@@ -251,25 +230,33 @@ repositories, rather than silently excluding those repositories.
 
 ### Transaction behavior
 
-Package changes hold the database lock before reading the installed state and planning the
-transaction. Waiting for an existing lock is limited to 30 seconds. Dependency checks cover
-the resulting installed state, including versioned providers and reverse dependencies.
-Repository order takes precedence over newer versions in later repositories.
+Package changes share one executor and hold `DBPath/db.lck` before reading installed
+state and planning changes, with a 30-second lock wait. Preflight checks archive identity,
+metadata, architecture, paths, links, destination types, dependencies and file conflicts before
+hooks. Installs and upgrades retain dependency order; replacement removals are linked to
+incoming packages. Configuration handling uses archive checksums as baselines for
+`.pacnew`/`.pacsave`, preserving local edits across upgrades.
 
-Replacement removals happen before installation, and incoming installs and upgrades retain
-dependency order. Incoming archive identities and paths are checked before transaction hooks
-or package changes. Modified backup files retain the incoming package's checksum as their
-baseline, allowing subsequent upgrades to preserve local edits correctly.
+Signature policy applies to fresh and cached archives; invalid cache entries can be replaced
+by verified downloads. `Optional` permits missing, not invalid, signatures; `TrustedOnly`
+requires a trusted signer. Keys are not automatically imported or trusted. Local archives
+follow `LocalFileSigLevel`. Verification and extraction use the same private temporary
+archive copies under `DBPath/.pax-prepared/`, requiring extra disk space. These are not
+retained recovery copies; download-only operations do not create them.
 
-Hooks support `AbortOnFail`, `Depends`, `NeedsTargets`, ordered target exclusions and glob
-patterns. Hooks and package scriptlets run inside the configured root, with `/` as their
-working directory. Hook output is captured and displayed when the command finishes.
+Hooks support `AbortOnFail`, `Depends`, `NeedsTargets`, ordered exclusions and glob patterns.
+Hooks and scriptlets run inside the selected root with working directory `/`. A failing
+`PreTransaction` hook with `AbortOnFail` stops application. Nonfatal hook/scriptlet failures
+allow later maintenance but produce an error, not full success. After partial package
+application, post-transaction hooks are not run against the complete planned target set.
 
-Package signature policy applies to cached downloads as well as fresh ones. Invalid cache
-entries can be replaced by a verified download. `Optional` allows a missing signature but
-rejects an invalid one. `TrustedOnly` requires a trusted signer; keys are not automatically
-imported from public keyservers. Local archives follow `LocalFileSigLevel`. Configure that
-policy explicitly when installing unsigned local builds.
+**Transactions are not atomic:** failures or interruption can leave partial file/database
+changes. There are no persistent transaction snapshots, automatic rollback or boot/crash
+safety guarantees. Inspect processes, logs, package files and the database before retrying
+or removing a lock. A small compatibility guard blocks changes, including cache cleaning
+and `remove-lock`, if `DBPath/pax-transactions/active.json` remains from an older version.
+Old records and saved data are not automatically deleted; resolve that interrupted operation
+before manually retiring its marker. This guard does not track new transactions.
 
 ### Global Options
 
@@ -277,7 +264,7 @@ policy explicitly when installing unsigned local builds.
 |--------|-------------|
 | `--config <PATH>` | Path to pacman.conf (default: `/etc/pacman.conf`) |
 | `--dbpath <PATH>` | Alternate database path |
-| `--root <PATH>` | Alternate root directory |
+| `--root <PATH>` | Alternate root directory; relocates implicit database and log paths |
 | `--completions <SHELL>` | Generate shell completions (`bash`, `zsh`, `fish`) |
 
 ### Install / Upgrade Flags
@@ -323,19 +310,34 @@ pax reads and respects the following pacman.conf directives:
 
 | Directive | Description |
 |-----------|-------------|
+| `RootDir` | Installation root (default: `/`); overridden by `--root` |
+| `DBPath` | Database location; overridden by `--dbpath` |
+| `LogFile` | Operation log location |
+| `GPGDir` | Keyring used for signature verification |
 | `IgnorePkg` | Packages to skip during upgrades |
 | `IgnoreGroup` | Package groups to skip during upgrades |
 | `HoldPkg` | Packages that require extra confirmation before removal |
 | `CheckSpace` | Verify sufficient disk space before installing |
 | `SigLevel` | Package/database PGP signature requirements and trust (global and per-repo) |
 | `LocalFileSigLevel` | Signature policy for local archives, inheriting unspecified global settings |
-| `HookDir` | Additional hook directories; later entries override earlier entries |
+| `HookDir` | Custom hook directories replace the default `/etc/pacman.d/hooks`; later directories override earlier ones |
 | `ParallelDownloads` | Number of concurrent downloads |
 | `CacheDir` | Package cache directory |
 
+With `--root` or `RootDir`, the implicit database and log paths become
+`<root>/var/lib/pacman/` and `<root>/var/log/pax.log`. Explicit `--dbpath`/`DBPath` and
+`LogFile` paths remain as supplied, even when equal to the usual defaults. `CacheDir`,
+`GPGDir` and custom `HookDir` paths are not automatically prefixed with the root either;
+`--root` alone does not relocate all configuration paths.
+
+System hooks are loaded from `<root>/usr/share/libalpm/hooks`. Custom `HookDir` locations
+(or the default `/etc/pacman.d/hooks`) are read as host paths, while hook commands execute
+inside the selected root.
+
 ## Logging
 
-pax logs all operations to `/var/log/pax.log` with timestamps:
+pax logs operations with timestamps to `/var/log/pax.log` by default, or beneath the
+selected root when `LogFile` is not explicitly configured:
 
 ```
 [2026-10-01T12:00:00+0300] [PAX] Running 'pax upgrade'
@@ -346,7 +348,7 @@ pax logs all operations to `/var/log/pax.log` with timestamps:
 [2026-10-01T12:01:01+0300] [PAX-SCRIPTLET] [systemd] Creating group 'systemd-imds'...
 ```
 
-The log file location can be changed via `LogFile` in pacman.conf (default: `/var/log/pax.log`).
+An explicit `LogFile` in pacman.conf is used as supplied, without adding the selected root.
 
 ## Shell Completions
 

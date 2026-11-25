@@ -21,12 +21,7 @@ pub fn list_packages(
     root: Option<&Path>,
 ) -> Result<()> {
     let mut config = PacmanConfig::load(config_path)?;
-    if let Some(dbpath) = dbpath {
-        config.db_path = dbpath.to_path_buf();
-    }
-    if let Some(root) = root {
-        config.root_dir = root.to_path_buf();
-    }
+    config.apply_path_overrides(root, dbpath);
     let mut db = DatabaseHandle::new(config);
 
     match source {
@@ -159,7 +154,7 @@ _pax() {
     cur="${words[cword]}"
     prev="${words[cword-1]}"
 
-    local subcmds="search info query files owner install downgrade remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean transaction-status remove-lock help"
+    local subcmds="search info query files owner install downgrade remove local-install aur-install aur-search aur-upgrade check check-files sync upgrade clean remove-lock help"
 
     local value_prefix=""
     if [[ "$cur" == --*=* ]]; then
@@ -197,7 +192,7 @@ _pax() {
             --completions|--pkg-list)
                 ((i++))
                 ;;
-            search|s|info|i|query|q|files|f|owner|o|install|S|downgrade|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|check|check-files|sync|y|upgrade|u|clean|c|transaction-status|remove-lock)
+            search|s|info|i|query|q|files|f|owner|o|install|S|downgrade|remove|R|local-install|U|aur-install|aur-search|aur-upgrade|check|check-files|sync|y|upgrade|u|clean|c|remove-lock)
                 subcmd="${words[i]}"
                 break
                 ;;
@@ -312,11 +307,6 @@ _pax() {
                 COMPREPLY=($(compgen -W "--dry-run --download-only -w --noconfirm --help" -- "$cur"))
             fi
             ;;
-        transaction-status)
-            if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "--help -h" -- "$cur"))
-            fi
-            ;;
     esac
 }
 complete -F _pax pax
@@ -415,7 +405,6 @@ _pax() {
         'sync:Synchronize package databases'
         'upgrade:Upgrade installed packages'
         'clean:Clean package cache'
-        'transaction-status:Inspect transaction journal (diagnostic only)'
         'remove-lock:Remove a stale database lock file'
     )
 
@@ -525,9 +514,6 @@ _pax() {
                         '--download-only[Download without installing]' \
                         '--noconfirm[Skip confirmation]'
                     ;;
-                transaction-status)
-                    _arguments '--help[Show help]' '-h[Show help]'
-                    ;;
             esac
             ;;
     esac
@@ -562,7 +548,7 @@ function __pax_pkg_list
     pax $global_args --pkg-list "$argv[1]" 2>/dev/null
 end
 
-set -l subcmds search s info i query q files f owner o install S downgrade remove R local-install U aur-install aur-search aur-upgrade check check-files sync y upgrade u clean c transaction-status remove-lock
+set -l subcmds search s info i query q files f owner o install S downgrade remove R local-install U aur-install aur-search aur-upgrade check check-files sync y upgrade u clean c remove-lock
 
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l help -d "Show help"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -l version -d "Show version"
@@ -589,10 +575,6 @@ complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a check -d "Check
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a check-files -d "Check that all package files exist"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a clean -d "Clean package cache"
 complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a remove-lock -d "Remove stale database lock"
-complete -c pax -n "not __fish_seen_subcommand_from $subcmds" -a transaction-status -d "Inspect transaction journal (diagnostic only)"
-
-complete -c pax -n "__fish_seen_subcommand_from transaction-status" -f
-complete -c pax -n "__fish_seen_subcommand_from transaction-status" -s h -l help -d "Show help"
 
 complete -c pax -n "__fish_seen_subcommand_from install S" -l dry-run -d "Show what would be installed"
 complete -c pax -n "__fish_seen_subcommand_from install S" -l noconfirm -d "Skip confirmation"

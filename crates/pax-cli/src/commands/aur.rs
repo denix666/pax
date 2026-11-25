@@ -8,6 +8,7 @@ use owo_colors::OwoColorize;
 use pax_alpm::db::DatabaseHandle;
 use pax_aur::{clone_and_build, resolve_aur_targets};
 use pax_core::config::SigLevel;
+use pax_exec::prepared::prepare_downloaded_packages;
 use pax_exec::{DownloadTarget, InstallContext, execute_transaction};
 use pax_resolver::{ConcretePool, ResolveOptions, build_transaction, resolve, topological_sort};
 
@@ -375,6 +376,14 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let prepared = prepare_downloaded_packages(
+        &downloaded,
+        &targets,
+        &db.config.db_path,
+        &db.config.gpg_dir,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let old_install_scripts = collect_old_install_scripts(&db.config.db_path, &tx);
     let old_backup_md5 = collect_old_backup_md5(&db.config.db_path, &tx);
 
@@ -384,7 +393,7 @@ fn install_repo_packages(db: &mut DatabaseHandle, packages: &[String]) -> Result
         root_dir: &db.config.root_dir,
         db_path: &db.config.db_path,
         architecture: &db.config.architecture,
-        downloaded: &downloaded,
+        downloaded: &prepared,
         old_install_scripts: &old_install_scripts,
         old_backup_md5: &old_backup_md5,
         hook_dirs: &db.config.hook_dirs,

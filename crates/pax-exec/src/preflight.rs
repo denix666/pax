@@ -14,21 +14,48 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{ExecError, Result};
-use crate::extract::validate_identity;
+use crate::extract::{archive_ids, validate_identity};
 
 const BLOCK: u64 = 512;
-const PKGINFO_LIMIT: u64 = 4 * 1024 * 1024;
+const PKGINFO_LIMIT: u64 = crate::extract::PKGINFO_LIMIT;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ArchivePlan {
+    pub backups: Vec<String>,
+}
 
 /// Validate the entire archive without creating the root or changing package files.
 /// `None` skips architecture compatibility, but still requires one nonempty `arch`.
 /// `Some("")` and `Some("auto")` select the architecture of the running executable.
 /// Archive signatures and identity against the transaction remain caller responsibilities.
+#[cfg(test)]
 pub(crate) fn validate_archive(
     path: &Path,
     root: &Path,
     expected_architecture: Option<&str>,
 ) -> Result<()> {
-    validate_inner(path, root, expected_architecture).map_err(|error| ExecError::Extraction {
+    validate_archive_with_backups(path, root, expected_architecture).map(|_| ())
+}
+
+/// Return only backup declarations backed by regular payload, after the complete
+/// archive and destination checks. These paths are not additional hook targets.
+#[cfg(test)]
+pub(crate) fn validate_archive_with_backups(
+    path: &Path,
+    root: &Path,
+    expected_architecture: Option<&str>,
+) -> Result<Vec<String>> {
+    inspect_archive(path, root, expected_architecture).map(|plan| plan.backups)
+}
+
+/// Validate the full archive and destinations, retaining only present backup paths.
+/// Archive signatures and identity against the transaction remain caller responsibilities.
+pub(crate) fn inspect_archive(
+    path: &Path,
+    root: &Path,
+    architecture: Option<&str>,
+) -> Result<ArchivePlan> {
+    validate_inner(path, root, architecture).map_err(|error| ExecError::Extraction {
         pkg: path.display().to_string(),
         message: format!("preflight: {error}"),
     })
@@ -136,7 +163,7 @@ fn open_archive(path: &Path) -> io::Result<Box<dyn Read>> {
     }
 }
 
-fn validate_inner(path: &Path, root: &Path, architecture: Option<&str>) -> io::Result<()> {
+fn validate_inner(path: &Path, root: &Path, architecture: Option<&str>) -> io::Result<ArchivePlan> {
     let reader = context(path, "open decompressor", open_archive(path))?;
     let root = context(root, "resolve installation root", validation_root(root))?;
     let mut state = Inspection::new(root);
@@ -249,6 +276,7 @@ impl Inspection {
         validate_extensions(entry)?;
         let path = relative_path(raw_path)?;
         let kind = entry.header().entry_type();
+        archive_ids(entry.header())?;
         entry.header().mode()?;
         let node = if kind.is_file() {
             if raw_path.as_os_str().as_bytes().ends_with(b"/") {
@@ -307,6 +335,8 @@ impl Inspection {
                     let mut text = String::new();
                     contents.read_to_string(&mut text)?;
                     self.backups = Some(parse_pkginfo(&text, architecture)?);
+                    crate::register::validate_pkginfo(&text)
+                        .map_err(|error| invalid(error.to_string()))?;
                 }
                 ".INSTALL" => validate_utf8(&mut contents)?,
                 ".MTREE" => validate_mtree(&mut contents)?,
@@ -317,6 +347,16 @@ impl Inspection {
             return require_size(contents.bytes, size);
         }
 
+        let database_path = if node == Node::Directory {
+            format!("{name}/")
+        } else {
+            name.to_string()
+        };
+        if !crate::register::safe_file_path(&database_path, true) {
+            return Err(invalid(format!(
+                "{name}: path cannot be represented in the local database file list"
+            )));
+        }
         let destination = self.destination(&path)?;
         if let Some(previous) = self.payload.get(&path) {
             if node != Node::Directory || previous.node != Node::Directory {
@@ -506,12 +546,13 @@ impl Inspection {
         Ok(())
     }
 
-    fn finish(&self) -> io::Result<()> {
+    fn finish(mut self) -> io::Result<ArchivePlan> {
+        let mut present_backups = Vec::new();
         let backups = self
             .backups
-            .as_ref()
+            .take()
             .ok_or_else(|| invalid("missing .PKGINFO"))?;
-        for path in backups {
+        for path in &backups {
             let Some(payload) = self.payload.get(path) else {
                 // Obsolete backup declarations occur in real packages (e.g. mc).
                 continue;
@@ -554,8 +595,12 @@ impl Inspection {
                     absolute.display()
                 )));
             }
+            present_backups.push(path.to_string_lossy().into_owned());
         }
-        Ok(())
+        present_backups.sort();
+        Ok(ArchivePlan {
+            backups: present_backups,
+        })
     }
 }
 
@@ -863,6 +908,100 @@ mod tests {
     }
 
     #[test]
+    fn database_file_list_markers_are_rejected_before_payload_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("earlier"), b"keep").unwrap();
+        for marker in ["%payload%", "%FILES%", "%BACKUP%"] {
+            let bytes = package(
+                INFO,
+                &[
+                    Member::File("earlier", b"replace"),
+                    Member::File(marker, b"invalid database path"),
+                ],
+            );
+            let error = check(&bytes, temp.path()).unwrap_err().to_string();
+            assert!(error.contains("local database file list"), "{error}");
+            assert_eq!(std::fs::read(temp.path().join("earlier")).unwrap(), b"keep");
+            assert!(!temp.path().join(marker).exists());
+        }
+    }
+
+    #[test]
+    fn backup_footprint_excludes_obsolete_declarations_and_preserves_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let bytes = package(
+            &format!("{INFO}backup = ./etc/config\nbackup = etc/obsolete\n"),
+            &[Member::File("etc/config", b"defaults")],
+        );
+        let path = archive(temp.path(), &bytes, "tar");
+        assert_eq!(
+            validate_archive_with_backups(&path, &root, Some("auto")).unwrap(),
+            ["etc/config"]
+        );
+        assert!(!root.join("etc").exists());
+    }
+
+    #[test]
+    fn accepts_duplicate_directories_and_mixed_payload_with_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("missing");
+        let mtree = compress("gz", b"#mtree\n");
+        let bytes = package(
+            INFO,
+            &[
+                Member::Directory("./"),
+                Member::File(".BUILDINFO", &[0xff]),
+                Member::File(".INSTALL", b"# script\n"),
+                Member::File(".MTREE", &mtree),
+                Member::Directory("./usr"),
+                Member::File("./usr/z", b"abc"),
+                Member::Directory("usr"),
+                Member::Symlink("usr/alias", "z"),
+                Member::Hardlink("usr/hard", "./usr/z"),
+                Member::File("usr/empty", b""),
+                Member::File("etc/.hidden", b"x"),
+            ],
+        );
+        let path = archive(temp.path(), &bytes, "tar");
+        let plan = inspect_archive(&path, &root, None).unwrap();
+        assert!(plan.backups.is_empty());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn backup_footprint_uses_archive_payload_without_changing_installed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/config"), b"locally edited").unwrap();
+        std::fs::write(root.join("etc/obsolete"), b"installed but not in archive").unwrap();
+        let data: Vec<u8> = (0..2 * 64 * 1024 + 37).map(|n| (n % 251) as u8).collect();
+        let bytes = package(
+            &format!("{INFO}backup = etc/obsolete\nbackup = etc/empty\nbackup = ./etc/config\n"),
+            &[
+                Member::File("./etc/config", &data),
+                Member::File("etc/empty", b""),
+            ],
+        );
+        for codec in ["tar", "gz", "xz", "zst"] {
+            let path = archive(temp.path(), &compress(codec, &bytes), codec);
+            let plan = inspect_archive(&path, &root, Some("auto")).unwrap();
+            assert_eq!(plan.backups, ["etc/config", "etc/empty"]);
+        }
+        assert_eq!(
+            std::fs::read(root.join("etc/config")).unwrap(),
+            b"locally edited"
+        );
+        assert_eq!(
+            std::fs::read(root.join("etc/obsolete")).unwrap(),
+            b"installed but not in archive"
+        );
+        assert!(!root.join("etc/empty").exists());
+    }
+
+    #[test]
     fn reads_supported_compression_without_creating_root() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("missing/root");
@@ -1047,12 +1186,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("source"), b"old").unwrap();
         std::fs::write(temp.path().join("self"), b"keep").unwrap();
+        std::fs::create_dir_all(temp.path().join("usr/lib")).unwrap();
+        std::fs::write(temp.path().join("usr/lib/source"), b"installed").unwrap();
+        symlink("usr/lib", temp.path().join("lib")).unwrap();
         let cases = [
             vec![Member::Hardlink("link", "missing")],
             vec![Member::Hardlink("link", "source")],
             vec![
                 Member::Hardlink("link", "source"),
                 Member::File("source", b"new"),
+            ],
+            vec![Member::Hardlink("lib/link", "lib/missing")],
+            vec![Member::Hardlink("lib/link", "lib/source")],
+            vec![
+                Member::Hardlink("lib/link", "lib/source"),
+                Member::File("usr/lib/source", b"new"),
             ],
             vec![Member::Hardlink("self", "self")],
             vec![
@@ -1074,6 +1222,11 @@ mod tests {
             assert_eq!(std::fs::read(temp.path().join("self")).unwrap(), b"keep");
             assert_eq!(std::fs::read(temp.path().join("source")).unwrap(), b"old");
             assert!(!temp.path().join("link").exists());
+            assert_eq!(
+                std::fs::read(temp.path().join("usr/lib/source")).unwrap(),
+                b"installed"
+            );
+            assert!(!temp.path().join("lib/link").exists());
         }
         check(
             &package(
@@ -1100,7 +1253,8 @@ mod tests {
                 Member::Hardlink("lib/link", "lib/source"),
             ],
         );
-        check(&bytes, temp.path()).unwrap();
+        let path = archive(temp.path(), &bytes, "tar");
+        validate_archive(&path, temp.path(), None).unwrap();
         let bytes = package(
             INFO,
             &[

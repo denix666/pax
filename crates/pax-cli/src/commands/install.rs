@@ -4,6 +4,7 @@ use anyhow::Result;
 use indicatif::MultiProgress;
 use pax_alpm::db::DatabaseHandle;
 use pax_core::config::SigLevel;
+use pax_exec::prepared::prepare_downloaded_packages;
 use pax_exec::{DownloadTarget, InstallContext, execute_transaction};
 use pax_resolver::{
     ConcretePool, ResolveError, ResolveOptions, build_transaction, resolve, topological_sort,
@@ -280,6 +281,14 @@ fn run_inner(
         return Ok(());
     }
 
+    let prepared = prepare_downloaded_packages(
+        &downloaded,
+        &targets,
+        &db.config.db_path,
+        &db.config.gpg_dir,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let old_install_scripts = collect_old_install_scripts(&db.config.db_path, &tx);
     let old_backup_md5 = collect_old_backup_md5(&db.config.db_path, &tx);
 
@@ -289,7 +298,7 @@ fn run_inner(
         root_dir: &db.config.root_dir,
         db_path: &db.config.db_path,
         architecture: &db.config.architecture,
-        downloaded: &downloaded,
+        downloaded: &prepared,
         old_install_scripts: &old_install_scripts,
         old_backup_md5: &old_backup_md5,
         hook_dirs: &db.config.hook_dirs,

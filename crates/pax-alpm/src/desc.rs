@@ -189,7 +189,7 @@ pub fn generate_local_desc(
         })
         .collect();
     if !val_str.is_empty() {
-        write_field(&mut out, "VALIDATION", &val_str.join(" "));
+        write_field(&mut out, "VALIDATION", &val_str.join("\n"));
     }
 
     write_multi_deps(&mut out, "REPLACES", &info.replaces);
@@ -256,7 +256,7 @@ pub fn generate_local_desc_from_pkginfo(
         })
         .collect();
     if !val_str.is_empty() {
-        write_field(&mut out, "VALIDATION", &val_str.join(" "));
+        write_field(&mut out, "VALIDATION", &val_str.join("\n"));
     }
 
     write_multi_raw(&mut out, "REPLACES", fields.get("replaces"));
@@ -464,6 +464,57 @@ xdata = pkgtype=pkg
         assert_eq!(map["VALIDATION"], vec!["sha256"]);
         assert_eq!(map["DEPENDS"], vec!["glibc", "openssl>=3.0"]);
         assert!(!map.contains_key("REASON"));
+    }
+
+    #[test]
+    fn validation_values_are_separate_lines_in_both_writers() {
+        let pkginfo = "pkgname = example\npkgver = 1-1\narch = any\n";
+        let pkg = desc_to_local_package(&parse_desc(
+            "%NAME%\nexample\n\n%VERSION%\n1-1\n\n%ARCH%\nany\n\n",
+        ))
+        .unwrap();
+        for (validation, expected) in [
+            (vec![], vec![]),
+            (vec![Validation::Pgp], vec!["pgp"]),
+            (vec![Validation::Sha256, Validation::Pgp], vec!["sha256", "pgp"]),
+            (
+                vec![Validation::Md5, Validation::Sha256, Validation::Pgp],
+                vec!["md5", "sha256", "pgp"],
+            ),
+            (vec![Validation::None], vec!["none"]),
+            (vec![Validation::Unknown("future".into())], vec!["future"]),
+        ] {
+            for desc in [
+                generate_local_desc(&pkg, 0, 0, InstallReason::Explicit, &validation),
+                generate_local_desc_from_pkginfo(pkginfo, 0, 0, InstallReason::Explicit, &validation),
+            ] {
+                let fields = parse_desc(&desc);
+                if expected.is_empty() {
+                    assert!(!desc.contains("%VALIDATION%"));
+                } else {
+                    assert_eq!(desc.matches("%VALIDATION%").count(), 1);
+                    assert!(
+                        desc.contains(&format!("%VALIDATION%\n{}\n\n", expected.join("\n"))),
+                        "{desc}"
+                    );
+                    assert_eq!(fields["VALIDATION"], expected);
+                }
+                assert_eq!(desc_to_local_package(&fields).unwrap().validation, validation);
+            }
+        }
+    }
+
+    #[test]
+    fn validation_reader_keeps_legacy_space_separated_values() {
+        for values in ["sha256 pgp", "sha256\npgp"] {
+            let fields = parse_desc(&format!(
+                "%NAME%\nexample\n\n%VERSION%\n1-1\n\n%VALIDATION%\n{values}\n\n"
+            ));
+            assert_eq!(
+                desc_to_local_package(&fields).unwrap().validation,
+                [Validation::Sha256, Validation::Pgp]
+            );
+        }
     }
 
     #[test]

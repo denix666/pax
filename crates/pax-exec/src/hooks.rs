@@ -52,26 +52,56 @@ pub struct Hook {
     pub action: HookAction,
 }
 
-/// HookDir paths are host paths, not paths relative to RootDir (pacman.conf(5)).
-/// The system directory is always included; explicit HookDirs replace the
+/// The system directory is relative to RootDir, as in libalpm's alpm_initialize.
+/// HookDir paths are host paths (pacman.conf(5)); explicit HookDirs replace the
 /// default /etc/pacman.d/hooks. Later directories have higher priority.
-pub fn load_hooks(hook_dirs: &[PathBuf]) -> Vec<Hook> {
-    let mut dirs = vec![PathBuf::from("/usr/share/libalpm/hooks")];
+/// Missing directories and valid triggerless masks are allowed; other load errors are fatal.
+pub fn load_hooks(root_dir: &Path, hook_dirs: &[PathBuf]) -> Result<Vec<Hook>> {
+    let (hooks, errors) = collect_hooks(root_dir, hook_dirs);
+    match errors.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(hooks),
+    }
+}
+
+/// Keep valid hooks after load errors so post-transaction maintenance can continue,
+/// as in libalpm's _alpm_hook_run. Callers must report every returned error.
+pub(crate) fn collect_hooks(root_dir: &Path, hook_dirs: &[PathBuf]) -> (Vec<Hook>, Vec<ExecError>) {
+    let mut dirs = vec![root_dir.join("usr/share/libalpm/hooks")];
     if hook_dirs.is_empty() {
         dirs.push(PathBuf::from("/etc/pacman.d/hooks"));
     } else {
         dirs.extend_from_slice(hook_dirs);
     }
-    load_hook_directories(&dirs)
+    collect_hook_directories(&dirs)
 }
 
-fn load_hook_directories(dirs: &[PathBuf]) -> Vec<Hook> {
+fn collect_hook_directories(dirs: &[PathBuf]) -> (Vec<Hook>, Vec<ExecError>) {
     let mut files = BTreeMap::new();
+    let mut errors = Vec::new();
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(ExecError::Hook {
+                    name: dir.display().to_string(),
+                    message: format!("cannot open hook directory: {error}"),
+                });
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(ExecError::Hook {
+                        name: dir.display().to_string(),
+                        message: format!("cannot read hook directory entry: {error}"),
+                    });
+                    continue;
+                }
+            };
             if entry.path().extension().is_some_and(|ext| ext == "hook") {
                 // Select the winning file before parsing: an empty /dev/null
                 // override must also suppress the lower-priority hook.
@@ -79,23 +109,46 @@ fn load_hook_directories(dirs: &[PathBuf]) -> Vec<Hook> {
             }
         }
     }
-    let mut hooks: Vec<_> = files
-        .into_iter()
-        .filter_map(|(name, path)| {
-            let content = std::fs::read_to_string(path).ok()?;
-            parse_hook(&name.to_string_lossy(), &content)
-        })
-        .collect();
+    let mut hooks = Vec::new();
+    for path in files.into_values() {
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|error| ExecError::Hook {
+                name: path.display().to_string(),
+                message: format!("cannot read hook file: {error}"),
+            })
+            .and_then(|content| parse_hook(&path, &content));
+        match parsed {
+            Ok(Some(hook)) => hooks.push(hook),
+            Ok(None) => {}
+            Err(error) => errors.push(error),
+        }
+    }
     hooks.sort_by(|a, b| {
         a.name
             .strip_suffix(".hook")
             .unwrap_or(&a.name)
             .cmp(b.name.strip_suffix(".hook").unwrap_or(&b.name))
     });
-    hooks
+    (hooks, errors)
 }
 
-fn parse_hook(name: &str, content: &str) -> Option<Hook> {
+fn parse_hook(path: &Path, content: &str) -> Result<Option<Hook>> {
+    let error = |message: String| ExecError::Hook {
+        name: path.display().to_string(),
+        message: format!("cannot parse hook: {message}"),
+    };
+    let validate_trigger = |trigger: &Trigger, has_type: bool| {
+        let missing = if !has_type {
+            "Type"
+        } else if trigger.operations.is_empty() {
+            "Operation"
+        } else if trigger.targets.is_empty() {
+            "Target"
+        } else {
+            return Ok(());
+        };
+        Err(error(format!("missing {missing} in [Trigger]")))
+    };
     let mut triggers = Vec::new();
     let mut description = None;
     let mut when = None;
@@ -106,27 +159,20 @@ fn parse_hook(name: &str, content: &str) -> Option<Hook> {
     let mut current_trigger: Option<Trigger> = None;
     let mut trigger_has_type = false;
     let mut in_action = false;
-    let mut seen_action = false;
 
-    for line in content.lines().map(str::trim) {
+    for (index, line) in content.lines().map(str::trim).enumerate() {
+        let line_error = |message: &str| error(format!("line {}: {message}", index + 1));
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line == "[Trigger]" || line == "[Action]" {
             if let Some(trigger) = current_trigger.take() {
-                if !trigger_has_type || trigger.operations.is_empty() || trigger.targets.is_empty()
-                {
-                    return None;
-                }
+                validate_trigger(&trigger, trigger_has_type)?;
                 triggers.push(trigger);
             }
             in_action = line == "[Action]";
-            if in_action {
-                if seen_action {
-                    return None;
-                }
-                seen_action = true;
-            } else {
+            // libalpm keeps one action across repeated [Action] sections.
+            if !in_action {
                 trigger_has_type = false;
                 current_trigger = Some(Trigger {
                     trigger_type: TriggerType::Package,
@@ -136,18 +182,21 @@ fn parse_hook(name: &str, content: &str) -> Option<Hook> {
             }
             continue;
         }
+        if line.starts_with('[') {
+            return Err(line_error(&format!("invalid section {line:?}")));
+        }
         let (key, value) = match line.split_once('=') {
             Some((key, value)) => (key.trim(), Some(value.trim())),
             None => (line, None),
         };
         if let Some(trigger) = current_trigger.as_mut() {
-            let value = value?;
+            let value = value.ok_or_else(|| line_error(&format!("missing value for {key}")))?;
             match key {
                 "Type" => {
                     trigger.trigger_type = match value {
                         "Package" => TriggerType::Package,
                         "Path" | "File" => TriggerType::Path,
-                        _ => return None,
+                        _ => return Err(line_error(&format!("invalid Type {value:?}"))),
                     };
                     trigger_has_type = true;
                 }
@@ -155,10 +204,10 @@ fn parse_hook(name: &str, content: &str) -> Option<Hook> {
                     "Install" => TriggerOp::Install,
                     "Upgrade" => TriggerOp::Upgrade,
                     "Remove" => TriggerOp::Remove,
-                    _ => return None,
+                    _ => return Err(line_error(&format!("invalid Operation {value:?}"))),
                 }),
                 "Target" if !value.is_empty() => trigger.targets.push(value.to_string()),
-                _ => return None,
+                _ => return Err(line_error(&format!("invalid trigger directive {line:?}"))),
             }
         } else if in_action {
             match (key, value) {
@@ -167,49 +216,57 @@ fn parse_hook(name: &str, content: &str) -> Option<Hook> {
                     when = Some(match value {
                         "PreTransaction" => HookWhen::PreTransaction,
                         "PostTransaction" => HookWhen::PostTransaction,
-                        _ => return None,
+                        _ => return Err(line_error(&format!("invalid When {value:?}"))),
                     })
                 }
                 ("Exec", Some(value)) => {
-                    split_exec(value)?;
+                    split_exec(value).ok_or_else(|| line_error("invalid Exec arguments"))?;
                     exec = Some(value.to_string());
                 }
                 ("Depends", Some(value)) if !value.is_empty() => {
-                    let dependency = Dependency::parse(value).ok()?;
+                    let dependency = Dependency::parse(value).map_err(|cause| {
+                        line_error(&format!("invalid Depends {value:?}: {cause}"))
+                    })?;
                     if dependency.name.is_empty() {
-                        return None;
+                        return Err(line_error("empty dependency name in Depends"));
                     }
                     depends.push(dependency);
                 }
                 ("NeedsTargets", None) => needs_targets = true,
                 ("AbortOnFail", None) => abort_on_fail = true,
-                _ => return None,
+                _ => return Err(line_error(&format!("invalid action directive {line:?}"))),
             }
         } else {
-            return None;
+            return Err(line_error(&format!(
+                "directive outside a section: {line:?}"
+            )));
         }
     }
     if let Some(trigger) = current_trigger {
-        if !trigger_has_type || trigger.operations.is_empty() || trigger.targets.is_empty() {
-            return None;
-        }
+        validate_trigger(&trigger, trigger_has_type)?;
         triggers.push(trigger);
     }
     if triggers.is_empty() {
-        return None;
+        // libalpm permits triggerless dummy masks, including empty /dev/null.
+        // Syntax is still checked above; only required When/Exec are waived.
+        return Ok(None);
     }
-    Some(Hook {
-        name: name.to_string(),
+    Ok(Some(Hook {
+        name: path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned(),
         triggers,
         action: HookAction {
             description,
-            when: when?,
-            exec: exec?,
+            when: when.ok_or_else(|| error("missing When in [Action]".into()))?,
+            exec: exec.ok_or_else(|| error("missing Exec in [Action]".into()))?,
             needs_targets,
             abort_on_fail,
             depends,
         },
-    })
+    }))
 }
 
 #[derive(Default)]
@@ -415,9 +472,9 @@ mod tests {
     use super::*;
 
     fn hook(exec: &str, flags: &str, when: &str) -> Hook {
-        parse_hook("test.hook", &format!(
+        parse_hook(Path::new("test.hook"), &format!(
             "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = {when}\nExec = {exec}\n{flags}\n"
-        )).unwrap()
+        )).unwrap().unwrap()
     }
 
     #[test]
@@ -437,7 +494,9 @@ mod tests {
             let content = format!(
                 "[Trigger]\nType = {kind}\nOperation = Install\nTarget = *\nTarget = !foo*\nTarget = foo-keep\n[Action]\nWhen = PostTransaction\nExec = /bin/true\n"
             );
-            let hook = parse_hook("test.hook", &content).unwrap();
+            let hook = parse_hook(Path::new("test.hook"), &content)
+                .unwrap()
+                .unwrap();
             let candidates = vec!["foo-drop".into(), "foo-keep".into(), "other".into()];
             let tx = TransactionPackages {
                 installed: candidates.clone(),
@@ -487,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn later_directory_overrides_and_dev_null_disables() {
+    fn later_directory_overrides_and_triggerless_masks_disable() {
         let base = tempfile::tempdir().unwrap();
         let override_dir = tempfile::tempdir().unwrap();
         let content = "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = PostTransaction\nExec = /bin/true\n";
@@ -498,10 +557,30 @@ mod tests {
         )
         .unwrap();
         let dirs = [base.path().to_path_buf(), override_dir.path().to_path_buf()];
-        assert_eq!(load_hook_directories(&dirs)[0].action.exec, "/bin/false");
+        assert_eq!(
+            load_hooks(base.path(), &dirs).unwrap()[0].action.exec,
+            "/bin/false"
+        );
+        // Even a malformed lower-priority hook must not be read through a mask.
+        for lower in [content, "[invalid]"] {
+            std::fs::write(base.path().join("test.hook"), lower).unwrap();
+            for mask in [
+                "",
+                " \n\t",
+                "# disabled\n",
+                "[Action]\n",
+                "[Action]\nDescription = disabled\n",
+                "[Action]\nWhen = PreTransaction\n",
+                "[Action]\nExec = /bin/false\n",
+                "[Action]\nNeedsTargets\nAbortOnFail\nDepends = missing\n[Action]\nWhen = PostTransaction\nExec = /must/not/run\n",
+            ] {
+                std::fs::write(override_dir.path().join("test.hook"), mask).unwrap();
+                assert!(load_hooks(base.path(), &dirs).unwrap().is_empty());
+            }
+        }
         std::fs::remove_file(override_dir.path().join("test.hook")).unwrap();
         std::os::unix::fs::symlink("/dev/null", override_dir.path().join("test.hook")).unwrap();
-        assert!(load_hook_directories(&dirs).is_empty());
+        assert!(load_hooks(base.path(), &dirs).unwrap().is_empty());
     }
 
     #[test]
@@ -663,15 +742,270 @@ mod tests {
     }
 
     #[test]
-    fn required_fields_are_validated() {
-        assert!(parse_hook("empty.hook", "").is_none());
-        assert!(parse_hook("bad.hook", "[Trigger]\nOperation = Install\nTarget = *\n[Action]\nWhen = PostTransaction\nExec = /bin/true").is_none());
-        assert!(
-            parse_hook(
-                "bad.hook",
-                "[Action]\nWhen = PostTransaction\nExec = /bin/true"
-            )
-            .is_none()
+    fn required_fields_and_invalid_directives_report_path_and_cause() {
+        let valid = "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = PostTransaction\nExec = /bin/true\n";
+        for (from, to, cause) in [
+            ("Type = Package\n", "", "missing Type"),
+            ("Operation = Install\n", "", "missing Operation"),
+            ("Target = *\n", "", "missing Target"),
+            ("When = PostTransaction\n", "", "missing When"),
+            ("Exec = /bin/true\n", "", "missing Exec"),
+            ("Type = Package", "Type = Bad", "line 2: invalid Type"),
+            (
+                "Operation = Install",
+                "Operation = Bad",
+                "line 3: invalid Operation",
+            ),
+            ("Target = *", "Target", "line 4: missing value for Target"),
+            (
+                "Target = *",
+                "Target =",
+                "line 4: invalid trigger directive",
+            ),
+            ("[Action]", "[Bad]", "line 5: invalid section"),
+            (
+                "When = PostTransaction",
+                "When = Bad",
+                "line 6: invalid When",
+            ),
+            (
+                "Exec = /bin/true",
+                "Exec = '",
+                "line 7: invalid Exec arguments",
+            ),
+            (
+                "Exec = /bin/true",
+                "Unknown = x",
+                "line 7: invalid action directive",
+            ),
+        ] {
+            let error = parse_hook(Path::new("/custom/bad.hook"), &valid.replace(from, to))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("/custom/bad.hook"), "{error}");
+            assert!(error.contains(cause), "{error}");
+        }
+        for (content, cause) in [
+            ("Type = Package", "directive outside a section"),
+            ("[Action]\nWhen = Bad", "invalid When"),
+            ("[Action]\nExec = '", "invalid Exec arguments"),
+            ("[Action]\nUnknown = x", "invalid action directive"),
+            ("[Action]\n[Bad]", "invalid section"),
+            ("[Trigger]", "missing Type"),
+        ] {
+            let error = parse_hook(Path::new("bad.hook"), content)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(cause), "{error}");
+        }
+    }
+
+    #[test]
+    fn repeated_action_sections_accumulate_directives() {
+        let content = "[Trigger]\nType = Package\nOperation = Install\nTarget = *\nTarget = !foo*\nTarget = foo-keep\n\
+            [Action]\nWhen = PreTransaction\nExec = /bin/false\nDescription = first\nDepends = first>=2\nNeedsTargets\nAbortOnFail\n\
+            [Trigger]\nType = Path\nOperation = Upgrade\nTarget = usr/*\n\
+            [Action]\nDepends = second\nDescription = last\nWhen = PostTransaction\nExec = /bin/true\n[Action]\n";
+        let hook = parse_hook(Path::new("repeated.hook"), content)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook.triggers.len(), 2);
+        assert_eq!(hook.triggers[0].targets, ["*", "!foo*", "foo-keep"]);
+        assert_eq!(hook.triggers[1].trigger_type, TriggerType::Path);
+        assert_eq!(hook.action.description.as_deref(), Some("last"));
+        assert_eq!(hook.action.when, HookWhen::PostTransaction);
+        assert_eq!(hook.action.exec, "/bin/true");
+        assert!(hook.action.needs_targets);
+        assert!(hook.action.abort_on_fail);
+        assert_eq!(
+            hook.action
+                .depends
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["first>=2", "second"]
         );
+    }
+
+    #[test]
+    fn missing_hook_directories_are_allowed_but_other_errors_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("hooks");
+        assert!(
+            load_hooks(temp.path(), std::slice::from_ref(&dir))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&dir, "not a directory").unwrap();
+        let cause = std::fs::read_dir(&dir).unwrap_err().to_string();
+        let error = load_hooks(temp.path(), std::slice::from_ref(&dir))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&dir.display().to_string()), "{error}");
+        assert!(error.contains("cannot open hook directory"), "{error}");
+        assert!(error.contains(&cause), "{error}");
+
+        let content = "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = PostTransaction\nExec = /bin/true\n";
+        std::fs::write(temp.path().join("valid.hook"), content).unwrap();
+        let (hooks, errors) = collect_hooks(temp.path(), &[dir, temp.path().to_path_buf()]);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].name, "valid.hook");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].to_string(), error);
+    }
+
+    #[test]
+    fn invalid_or_unreadable_winning_hooks_do_not_fall_back() {
+        let base = tempfile::tempdir().unwrap();
+        let override_dir = tempfile::tempdir().unwrap();
+        let dirs = [base.path().to_path_buf(), override_dir.path().to_path_buf()];
+        let content = "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /bin/true\nAbortOnFail\n";
+        std::fs::write(base.path().join("guard.hook"), content).unwrap();
+        let path = override_dir.path().join("guard.hook");
+        std::fs::write(&path, content.replace("Type = Package", "Type = Bad")).unwrap();
+        let error = load_hooks(base.path(), &dirs).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("invalid Type"), "{error}");
+
+        std::fs::write(&path, [0xff]).unwrap();
+        let cause = std::fs::read_to_string(&path).unwrap_err().to_string();
+        let error = load_hooks(base.path(), &dirs).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("cannot read hook file"), "{error}");
+        assert!(error.contains(&cause), "{error}");
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(override_dir.path().join("missing"), &path).unwrap();
+        let cause = std::fs::read_to_string(&path).unwrap_err().to_string();
+        let error = load_hooks(base.path(), &dirs).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("cannot read hook file"), "{error}");
+        assert!(error.contains(&cause), "{error}");
+    }
+
+    #[test]
+    fn system_hooks_are_root_relative_but_explicit_directories_are_host_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let system = root.join("usr/share/libalpm/hooks");
+        let host = temp.path().join("host-hooks");
+        let rooted_host = root.join(host.strip_prefix("/").unwrap());
+        let rooted_default = root.join("etc/pacman.d/hooks");
+        for dir in [&system, &host, &rooted_host, &rooted_default] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let content = "[Trigger]\nType = Package\nOperation = Install\nTarget = *\n[Action]\nWhen = PostTransaction\nExec = /bin/true\n";
+        std::fs::write(system.join("a.hook"), content).unwrap();
+        std::fs::write(system.join("a-.hook"), content).unwrap();
+        std::fs::write(system.join("masked.hook"), content).unwrap();
+        std::fs::write(
+            host.join("a-.hook"),
+            content.replace("/bin/true", "/bin/false"),
+        )
+        .unwrap();
+        std::fs::write(host.join("masked.hook"), "").unwrap();
+        for dir in [&rooted_host, &rooted_default] {
+            std::fs::write(dir.join("bad.hook"), "[invalid]").unwrap();
+        }
+        let hooks = load_hooks(&root, &[host]).unwrap();
+        assert_eq!(
+            hooks
+                .iter()
+                .map(|hook| hook.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.hook", "a-.hook"]
+        );
+        assert_eq!(hooks[0].action.exec, "/bin/true");
+        assert_eq!(hooks[1].action.exec, "/bin/false");
+    }
+
+    #[test]
+    fn load_errors_prevent_all_pre_actions_but_allow_valid_post_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let masks = temp.path().join("masks");
+        let fixtures = temp.path().join("hooks");
+        let db = temp.path().join("db");
+        std::fs::create_dir(&masks).unwrap();
+        std::fs::create_dir(&fixtures).unwrap();
+        std::fs::create_dir_all(db.join("local")).unwrap();
+        // Execute only fixture echo commands without chroot privileges. Every
+        // host system hook is masked by filename; host files are never modified.
+        match std::fs::read_dir("/usr/share/libalpm/hooks") {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.unwrap();
+                    if entry.path().extension().is_some_and(|ext| ext == "hook") {
+                        std::fs::write(masks.join(entry.file_name()), "").unwrap();
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot enumerate system hooks for masking: {error}"),
+        }
+        let malformed = fixtures.join("50-invalid.hook");
+        let unreadable = fixtures.join("60-unreadable.hook");
+        std::fs::write(&malformed, "[invalid]").unwrap();
+        std::fs::write(&unreadable, [0xff]).unwrap();
+        let hook_dirs = [masks, fixtures.clone()];
+        let packages = TransactionPackages {
+            installed: vec!["pax-step4-fixture".into()],
+            ..Default::default()
+        };
+        for (when, when_name) in [
+            (HookWhen::PreTransaction, "PreTransaction"),
+            (HookWhen::PostTransaction, "PostTransaction"),
+        ] {
+            for (name, marker) in [
+                ("00-first.hook", "pax-step4-first-ran"),
+                ("90-last.hook", "pax-step4-last-ran"),
+            ] {
+                let content = format!(
+                    "[Trigger]\nType = Package\nOperation = Install\nTarget = pax-step4-fixture\n[Action]\nWhen = {when_name}\nExec = /bin/echo {marker}\n"
+                );
+                std::fs::write(fixtures.join(name), content).unwrap();
+            }
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let mut logger = PaxLogger::open(log.path());
+            let mut failures = Vec::new();
+            let result = crate::execute::run_transaction_hooks(
+                Path::new("/"),
+                &db,
+                &hook_dirs,
+                &when,
+                &packages,
+                &mut logger,
+                &mut failures,
+            );
+            if when == HookWhen::PreTransaction {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&malformed.display().to_string()), "{error}");
+                assert!(error.contains("invalid section"), "{error}");
+                assert!(failures.is_empty());
+                let content = std::fs::read_to_string(log.path()).unwrap();
+                assert!(!content.contains("running '"));
+                assert!(!content.contains("pax-step4-first-ran"));
+                assert!(!content.contains("pax-step4-last-ran"));
+            } else {
+                result.unwrap();
+                assert_eq!(failures.len(), 2);
+                for (failure, path) in failures.iter().zip([&malformed, &unreadable]) {
+                    assert!(failure.contains("PostTransaction"));
+                    assert!(failure.contains(&path.display().to_string()));
+                }
+                assert!(failures[0].contains("invalid section"));
+                assert!(failures[1].contains("cannot read hook file"));
+                let error =
+                    crate::execute::finish_transaction(Ok(()), failures, &mut logger).unwrap_err();
+                assert!(matches!(error, ExecError::MaintenanceIncomplete { .. }));
+                let content = std::fs::read_to_string(log.path()).unwrap();
+                let first = content.find("pax-step4-first-ran").unwrap();
+                let last = content.find("pax-step4-last-ran").unwrap();
+                assert!(first < last);
+                assert!(content.contains("packages were applied"));
+                assert!(content.contains(&malformed.display().to_string()));
+                assert!(content.contains(&unreadable.display().to_string()));
+                assert!(!content.contains("transaction completed"));
+            }
+        }
     }
 }
