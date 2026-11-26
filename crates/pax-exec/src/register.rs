@@ -11,7 +11,7 @@ use pax_alpm::desc::{generate_files_content, generate_local_desc_from_pkginfo};
 use pax_core::package::{InstallReason, Validation};
 
 use crate::error::{ExecError, Result};
-use crate::extract::{PackageMetadata, validate_identity};
+use crate::extract::{PackageMetadata, metadata_modified_time, validate_identity};
 
 // Callers must hold the database lock across planning and these operations.
 // RENAME_EXCHANGE is atomic publication, not an inode compare-and-swap.
@@ -46,6 +46,7 @@ fn register_with_sync(
         validation,
     );
     let files = generate_files_content(&metadata.files, &backup);
+
     let local = open_local(db_path, true)?.expect("create opens local directory");
     let entry = OsString::from(format!("{name}-{version}"));
     let existing = inspect_entry(&local, &entry)?;
@@ -57,12 +58,14 @@ fn register_with_sync(
             &local.path.join(&staging),
             "desc",
             desc.as_bytes(),
+            None,
         )?;
         write_metadata(
             &staging_path,
             &local.path.join(&staging),
             "files",
             files.as_bytes(),
+            None,
         )?;
         if !metadata.mtree.is_empty() {
             write_metadata(
@@ -70,6 +73,7 @@ fn register_with_sync(
                 &local.path.join(&staging),
                 "mtree",
                 &metadata.mtree,
+                None,
             )?;
         }
         if let Some(install) = &metadata.install {
@@ -78,6 +82,16 @@ fn register_with_sync(
                 &local.path.join(&staging),
                 "install",
                 install.as_bytes(),
+                Some(metadata.install_mtime),
+            )?;
+        }
+        if let Some(changelog) = &metadata.changelog {
+            write_metadata(
+                &staging_path,
+                &local.path.join(&staging),
+                "changelog",
+                changelog,
+                Some(metadata.changelog_mtime),
             )?;
         }
         let directory = context(
@@ -229,6 +243,30 @@ fn validate_metadata(
         pkg: name.clone(),
         message,
     };
+    for (entry, present, mtime) in [
+        (
+            "install",
+            metadata.install.is_some(),
+            metadata.install_mtime,
+        ),
+        (
+            "changelog",
+            metadata.changelog.is_some(),
+            metadata.changelog_mtime,
+        ),
+    ] {
+        if present {
+            metadata_modified_time(mtime).map_err(|error| {
+                invalid(format!(
+                    "{entry}: invalid archive modification time: {error}"
+                ))
+            })?;
+        }
+    }
+    if let Some(changelog) = &metadata.changelog {
+        crate::extract::validate_metadata_size(changelog.len() as u64)
+            .map_err(|error| invalid(format!("changelog: {error}")))?;
+    }
     let installed_size = metadata
         .pkginfo
         .lines()
@@ -569,7 +607,13 @@ fn inspect_entry(local: &LocalDirectory, entry: &OsStr) -> Result<bool> {
     }
 }
 
-fn write_metadata(directory: &Path, display: &Path, name: &str, contents: &[u8]) -> Result<()> {
+fn write_metadata(
+    directory: &Path,
+    display: &Path,
+    name: &str,
+    contents: &[u8],
+    mtime: Option<u64>,
+) -> Result<()> {
     let path = display.join(name);
     let mut file = context(
         "create database metadata file",
@@ -591,6 +635,18 @@ fn write_metadata(directory: &Path, display: &Path, name: &str, contents: &[u8])
         &path,
         file.set_permissions(fs::Permissions::from_mode(0o644)),
     )?;
+    if let Some(seconds) = mtime {
+        let modified = context(
+            "validate database metadata modification time",
+            &path,
+            metadata_modified_time(seconds),
+        )?;
+        context(
+            "set database metadata modification time",
+            &path,
+            file.set_modified(modified),
+        )?;
+    }
     context("sync database metadata file", &path, file.sync_all())
 }
 
@@ -638,8 +694,10 @@ fn discard_staging(local: &LocalDirectory, staging: &OsStr, error: ExecError) ->
     }
 }
 
-const MAX_RETIRED_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RETIRED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_RETIRED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+// Include the newly retained changelog without reducing the previous budget
+// for desc, files, mtree and install. Individual files remain capped at 64 MiB.
+const MAX_RETIRED_TOTAL_BYTES: u64 = 5 * MAX_RETIRED_FILE_BYTES;
 const MAX_RETIRED_ITEMS: usize = 65_536;
 
 // Keep a process-local copy until cleanup's final fsync. This is only for
@@ -684,7 +742,7 @@ impl RetiredContents {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "retired metadata {} exceeds the 64 MiB file or 256 MiB aggregate limit ({} bytes remaining)",
+                        "retired metadata {} exceeds the 64 MiB file or 320 MiB aggregate limit ({} bytes remaining)",
                         entry.file_name().to_string_lossy(),
                         remaining
                     ),
@@ -846,6 +904,9 @@ mod tests {
             pkginfo: "pkgname = test\npkgver = 1-1\nsize = 17\n".into(),
             mtree: b"opaque mtree".to_vec(),
             install: Some("post_install() { :; }\n".into()),
+            install_mtime: 0,
+            changelog: None,
+            changelog_mtime: 0,
             files: vec!["etc/".into(), "etc/config".into()],
             backup: vec!["etc/config".into()],
             backup_md5: HashMap::from([(
@@ -876,6 +937,268 @@ mod tests {
             .collect();
         assert_eq!(paths.len(), 1);
         local.join(&paths[0])
+    }
+
+    fn auxiliary_archive(path: &Path, mtime: u64, include: bool, changelog: &[u8]) {
+        let mut archive = tar::Builder::new(File::create(path).unwrap());
+        let mut members = vec![(
+            ".PKGINFO",
+            b"pkgname = auxiliary\npkgver = 1-1\narch = any\n".as_slice(),
+        )];
+        if include {
+            members.push((".INSTALL", b"post_install() { :; }\n"));
+            members.push((".CHANGELOG", changelog));
+        }
+        members.push(("usr/payload", b"payload"));
+        for (name, data) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(mtime);
+            archive.append_data(&mut header, name, data).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn archive_auxiliary_install_timestamp_is_preserved() {
+        for mtime in [0, 123456789] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = temp.path().join("auxiliary.pkg.tar");
+            auxiliary_archive(&archive, mtime, true, b"history\n");
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            let extracted =
+                crate::extract::extract_package(&archive, &root, &HashMap::new()).unwrap();
+            register(&db, &extracted).unwrap();
+            let script = db.join("local/auxiliary-1-1/install");
+            assert_eq!(fs::read(&script).unwrap(), b"post_install() { :; }\n");
+            assert_eq!(fs::metadata(&script).unwrap().mtime(), mtime as i64);
+            assert_eq!(fs::metadata(&script).unwrap().mtime_nsec(), 0);
+            assert!(!root.join(".INSTALL").exists());
+        }
+    }
+
+    #[test]
+    fn archive_auxiliary_changelog_is_preserved_and_retired() {
+        for contents in [b"\xffbinary history\n".as_slice(), b""] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = temp.path().join("auxiliary.pkg.tar");
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            let entry = db.join("local/auxiliary-1-1");
+            for (include, mtime) in [(true, 0), (true, 123456789), (false, 0)] {
+                auxiliary_archive(&archive, mtime, include, contents);
+                let extracted =
+                    crate::extract::extract_package(&archive, &root, &HashMap::new()).unwrap();
+                register(&db, &extracted).unwrap();
+                if include {
+                    assert_eq!(fs::read(entry.join("changelog")).unwrap(), contents);
+                    assert_eq!(
+                        fs::metadata(entry.join("changelog")).unwrap().mtime(),
+                        mtime as i64
+                    );
+                    assert_eq!(
+                        fs::metadata(entry.join("changelog")).unwrap().mtime_nsec(),
+                        0
+                    );
+                } else {
+                    assert!(!entry.join("changelog").exists());
+                    assert!(!entry.join("install").exists());
+                }
+                assert!(!root.join(".CHANGELOG").exists());
+                assert_eq!(extracted.files, ["usr/payload"]);
+                assert!(
+                    !fs::read_to_string(entry.join("files"))
+                        .unwrap()
+                        .contains("CHANGELOG")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_auxiliary_timestamp_precedes_all_filesystem_changes() {
+        for name in [".INSTALL", ".CHANGELOG"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("invalid.pkg.tar");
+            let mut archive = tar::Builder::new(File::create(&path).unwrap());
+            for (member, data) in [
+                (
+                    ".PKGINFO",
+                    b"pkgname = invalid\npkgver = 1-1\narch = any\n".as_slice(),
+                ),
+                ("usr/first", b"must not be extracted".as_slice()),
+                (name, b"metadata".as_slice()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_mtime(if member == name { u64::MAX } else { 0 });
+                archive.append_data(&mut header, member, data).unwrap();
+            }
+            archive.finish().unwrap();
+            drop(archive);
+            let root = temp.path().join("root");
+            let error = crate::extract::extract_package(&path, &root, &HashMap::new())
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(name));
+            assert!(!root.exists());
+            assert!(crate::preflight::validate_archive(&path, &root, Some("auto")).is_err());
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn registration_rejects_invalid_auxiliary_timestamps_before_creating_database() {
+        for install in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = temp.path().join("db");
+            let mut metadata = metadata();
+            if install {
+                metadata.install_mtime = u64::MAX;
+            } else {
+                metadata.changelog = Some(Vec::new());
+                metadata.changelog_mtime = u64::MAX;
+            }
+            let error = register(&db, &metadata).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(if install { "install" } else { "changelog" })
+            );
+            assert!(error.to_string().contains("modification time"));
+            assert!(!db.exists());
+        }
+    }
+
+    #[test]
+    fn oversized_auxiliary_metadata_is_rejected_by_both_archive_validators() {
+        for name in [".INSTALL", ".MTREE", ".CHANGELOG"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("oversized.pkg.tar");
+            auxiliary_archive(&path, 0, false, b"");
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.truncate(bytes.len() - 1024);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(MAX_RETIRED_FILE_BYTES + 1);
+            header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(0);
+            header.set_cksum();
+            bytes.extend_from_slice(header.as_bytes());
+            // No oversized payload is needed: the declaration itself must fail.
+            bytes.extend_from_slice(&[0; 1024]);
+            fs::write(&path, bytes).unwrap();
+            let root = temp.path().join("root");
+            let fast = crate::extract::extract_package(&path, &root, &HashMap::new())
+                .err()
+                .unwrap();
+            let full = crate::preflight::validate_archive(&path, &root, Some("auto")).unwrap_err();
+            for error in [fast, full] {
+                assert!(error.to_string().contains(name), "{error}");
+                assert!(error.to_string().contains("64 MiB"), "{error}");
+            }
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn changelog_size_boundary_can_be_reinstalled_and_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("db");
+        let mut metadata = metadata();
+        metadata.changelog = Some(vec![0xff; MAX_RETIRED_FILE_BYTES as usize + 1]);
+        let error = register(&db, &metadata).unwrap_err();
+        assert!(error.to_string().contains("changelog"));
+        assert!(error.to_string().contains("64 MiB"));
+        assert!(!db.exists());
+        metadata.changelog.as_mut().unwrap().pop();
+        register(&db, &metadata).unwrap();
+        register(&db, &metadata).unwrap();
+        let file = fs::metadata(db.join("local/test-1-1/changelog")).unwrap();
+        assert_eq!(file.len(), MAX_RETIRED_FILE_BYTES);
+        assert_eq!(file.mtime(), 0);
+        remove_db_entry(&db, "test", "1-1").unwrap();
+        assert!(entries(&db.join("local")).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires root and PAX_TEST_AUX_ARCHIVES containing real package archive paths"]
+    fn real_archive_auxiliary_metadata_matches_database() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let paths =
+            std::env::var_os("PAX_TEST_AUX_ARCHIVES").expect("set explicit real archive paths");
+        let mut installs = 0;
+        let mut changelogs = 0;
+        for path in std::env::split_paths(&paths) {
+            let filename = path.file_name().unwrap().to_string_lossy();
+            assert!(
+                filename.ends_with(".zst"),
+                "supply the real .pkg.tar.zst archives"
+            );
+            let mut archive =
+                tar::Archive::new(zstd::Decoder::new(File::open(&path).unwrap()).unwrap());
+            let mut expected = Vec::new();
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let name = entry
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .trim_start_matches("./")
+                    .to_string();
+                let target = match name.as_str() {
+                    ".INSTALL" => {
+                        installs += 1;
+                        "install"
+                    }
+                    ".CHANGELOG" => {
+                        changelogs += 1;
+                        "changelog"
+                    }
+                    _ => continue,
+                };
+                let mtime = entry.header().mtime().unwrap();
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).unwrap();
+                expected.push((target, mtime, contents));
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            for _ in 0..2 {
+                let extracted =
+                    crate::extract::extract_package(&path, &root, &HashMap::new()).unwrap();
+                register(&db, &extracted).unwrap();
+                let (name, version) = parse_name_version(&extracted.pkginfo).unwrap();
+                let local = db.join("local").join(format!("{name}-{version}"));
+                for (target, mtime, contents) in &expected {
+                    let metadata = fs::metadata(local.join(target)).unwrap();
+                    assert_eq!(
+                        fs::read(local.join(target)).unwrap(),
+                        *contents,
+                        "{filename}: {target}"
+                    );
+                    assert_eq!(metadata.mtime(), *mtime as i64, "{filename}: {target}");
+                    assert_eq!(metadata.mtime_nsec(), 0);
+                    assert_eq!(metadata.mode() & 0o7777, 0o644);
+                }
+                assert!(extracted.files.iter().all(|name| !name.starts_with('.')));
+            }
+            eprintln!("Verified real auxiliary metadata: {filename}");
+        }
+        assert!(
+            installs > 0 && changelogs > 0,
+            "archives must cover both install and changelog"
+        );
     }
 
     #[test]

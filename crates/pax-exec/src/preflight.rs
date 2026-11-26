@@ -377,7 +377,7 @@ impl Inspection {
             if node != Node::Regular {
                 return Err(invalid("non-regular metadata entry"));
             }
-            if matches!(name, ".PKGINFO" | ".INSTALL" | ".MTREE") {
+            if matches!(name, ".PKGINFO" | ".INSTALL" | ".MTREE" | ".CHANGELOG") {
                 // The existing metadata readers strip exactly one leading './'.
                 let raw = raw_path.as_os_str().as_bytes();
                 if raw.strip_prefix(b"./").unwrap_or(raw) != name.as_bytes() {
@@ -386,6 +386,19 @@ impl Inspection {
                 if !self.metadata.insert(path.clone()) {
                     return Err(invalid(format!("duplicate {name}")));
                 }
+            }
+            if matches!(name, ".INSTALL" | ".MTREE" | ".CHANGELOG") {
+                crate::extract::validate_metadata_size(size)?;
+            }
+            if matches!(name, ".INSTALL" | ".CHANGELOG") {
+                context(
+                    &path,
+                    "validate archive modification time",
+                    entry
+                        .header()
+                        .mtime()
+                        .and_then(crate::extract::metadata_modified_time),
+                )?;
             }
             let mut contents = Counted::new(&mut *entry);
             match name {
@@ -1237,12 +1250,14 @@ mod tests {
     #[test]
     fn metadata_entries_are_unique_and_text_is_utf8() {
         let temp = tempfile::tempdir().unwrap();
-        for name in [".PKGINFO", ".INSTALL", ".MTREE"] {
+        for name in [".PKGINFO", ".INSTALL", ".MTREE", ".CHANGELOG"] {
             let bytes = package(
                 INFO,
                 &[Member::File(name, b"first"), Member::File(name, &[0xff])],
             );
             assert!(check(&bytes, temp.path()).is_err());
+            let path = archive(temp.path(), &bytes, "tar");
+            assert!(crate::extract::validate_package_archive(&path, temp.path()).is_err());
         }
         for name in [".INSTALL", ".MTREE"] {
             assert!(check(&package(INFO, &[Member::File(name, &[0xff])]), temp.path()).is_err());

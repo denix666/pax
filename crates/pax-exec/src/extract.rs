@@ -13,6 +13,27 @@ use crate::error::{ExecError, Result};
 
 pub(crate) const PKGINFO_LIMIT: u64 = 4 * 1024 * 1024;
 
+pub(crate) fn validate_metadata_size(size: u64) -> std::io::Result<()> {
+    if size > crate::register::MAX_RETIRED_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "archive metadata exceeds the 64 MiB file limit",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn metadata_modified_time(seconds: u64) -> std::io::Result<std::time::SystemTime> {
+    std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(seconds))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archive metadata modification time is out of range",
+            )
+        })
+}
+
 fn read_pkginfo_text<R: Read>(entry: &mut tar::Entry<'_, R>, archive: &Path) -> Result<String> {
     let size = entry.size();
     let invalid = |message: String| ExecError::Extraction {
@@ -42,6 +63,10 @@ pub struct PackageMetadata {
     pub pkginfo: String,
     pub mtree: Vec<u8>,
     pub install: Option<String>,
+    /// Archive timestamp; meaningful only when the corresponding entry is present.
+    pub install_mtime: u64,
+    pub changelog: Option<Vec<u8>>,
+    pub changelog_mtime: u64,
     pub files: Vec<String>,
     pub backup: Vec<String>,
     /// MD5 of each backup's incoming archive contents, even when kept as .pacnew.
@@ -117,6 +142,9 @@ pub fn extract_package(
     let mut pkginfo = String::new();
     let mut mtree = Vec::new();
     let mut install = None;
+    let mut install_mtime = 0;
+    let mut changelog = None;
+    let mut changelog_mtime = 0;
     let mut files: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut backup_md5 = HashMap::new();
@@ -176,6 +204,7 @@ pub fn extract_package(
                         })?;
                 }
                 ".INSTALL" => {
+                    install_mtime = entry.header().mtime()?;
                     let mut s = String::new();
                     entry
                         .read_to_string(&mut s)
@@ -184,6 +213,28 @@ pub fn extract_package(
                             message: format!(".INSTALL: {e}"),
                         })?;
                     install = Some(s);
+                }
+                ".CHANGELOG" => {
+                    changelog_mtime = entry.header().mtime()?;
+                    let mut contents = Vec::new();
+                    entry
+                        .by_ref()
+                        .take(crate::register::MAX_RETIRED_FILE_BYTES + 1)
+                        .read_to_end(&mut contents)
+                        .map_err(|error| ExecError::Extraction {
+                            pkg: pkg_name.clone(),
+                            message: format!(".CHANGELOG: {error}"),
+                        })?;
+                    if contents.len() as u64 != entry.size()
+                        || contents.len() as u64 > crate::register::MAX_RETIRED_FILE_BYTES
+                    {
+                        return Err(ExecError::Extraction {
+                            pkg: pkg_name.clone(),
+                            message: ".CHANGELOG: invalid metadata length or exceeded 64 MiB limit"
+                                .into(),
+                        });
+                    }
+                    changelog = Some(contents);
                 }
                 _ => {}
             }
@@ -305,6 +356,14 @@ pub fn extract_package(
                 Ok(metadata) if metadata.is_dir() && entry_type.is_dir() => {
                     // Existing directory metadata belongs to the live system. Skip
                     // tar as well: it chmods existing directories during unpack.
+                    let filesystem_mode = metadata.permissions().mode() & 0o7777;
+                    let archive_mode = entry.header().mode()? & 0o7777;
+                    if filesystem_mode != archive_mode {
+                        warnings.push(format!(
+                            "directory permissions differ on {}/\nfilesystem: {filesystem_mode:o}  package: {archive_mode:o}",
+                            dest.display(),
+                        ));
+                    }
                     return Ok(());
                 }
                 Ok(metadata) if metadata.is_dir() => {
@@ -401,6 +460,9 @@ pub fn extract_package(
         pkginfo,
         mtree,
         install,
+        install_mtime,
+        changelog,
+        changelog_mtime,
         files,
         backup: backup_entries,
         backup_md5,
@@ -423,6 +485,7 @@ fn validate_package_archive_inner(
     let root = validation_root(root_dir)?;
     let mut overlays: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     let mut pkginfo = None;
+    let mut metadata_paths = std::collections::HashSet::new();
     let mut regular_files = std::collections::HashSet::new();
     let mut resolved_regular_files = std::collections::HashSet::new();
     let mut payload_paths = std::collections::HashSet::new();
@@ -495,6 +558,34 @@ fn validate_package_archive_inner(
         if name.starts_with('.') {
             if !kind.is_file() {
                 return Err(unsafe_path(&path));
+            }
+            if matches!(name, ".PKGINFO" | ".INSTALL" | ".MTREE" | ".CHANGELOG") {
+                let raw = entry.path()?;
+                let raw = raw.as_os_str().as_bytes();
+                if raw.strip_prefix(b"./").unwrap_or(raw) != name.as_bytes()
+                    || !metadata_paths.insert(path.clone())
+                {
+                    return Err(ExecError::Extraction {
+                        pkg: pkg_path.display().to_string(),
+                        message: format!("{name}: duplicate or non-canonical metadata entry"),
+                    });
+                }
+            }
+            if matches!(name, ".INSTALL" | ".MTREE" | ".CHANGELOG") {
+                validate_metadata_size(entry.size()).map_err(|error| ExecError::Extraction {
+                    pkg: pkg_path.display().to_string(),
+                    message: format!("{name}: {error}"),
+                })?;
+            }
+            if matches!(name, ".INSTALL" | ".CHANGELOG") {
+                entry
+                    .header()
+                    .mtime()
+                    .and_then(metadata_modified_time)
+                    .map_err(|error| ExecError::Extraction {
+                        pkg: pkg_path.display().to_string(),
+                        message: format!("{name}: validate archive modification time: {error}"),
+                    })?;
             }
             if name == ".PKGINFO" {
                 if pkginfo.is_some() {
@@ -1590,7 +1681,8 @@ mod tests {
             builder.finish().unwrap();
             drop(builder);
             if reinstall {
-                extract_package(&archive, &root, &HashMap::new()).unwrap();
+                let initial = extract_package(&archive, &root, &HashMap::new()).unwrap();
+                assert!(initial.warnings.is_empty());
             }
             let mut before = Vec::new();
             for path in ["usr", "empty"] {
@@ -1615,6 +1707,13 @@ mod tests {
             }
             std::fs::write(root.join("usr/file"), b"replace me").unwrap();
             let metadata = extract_package(&archive, &root, &HashMap::new()).unwrap();
+            assert_eq!(
+                metadata.warnings,
+                ["usr", "empty"].map(|path| format!(
+                    "directory permissions differ on {}/\nfilesystem: 700  package: 755",
+                    root.join(path).display(),
+                ))
+            );
             for (path, old) in before {
                 let full = root.join(path);
                 let current = std::fs::symlink_metadata(&full).unwrap();

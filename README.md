@@ -234,10 +234,19 @@ Package changes share one executor and hold `DBPath/db.lck` before reading insta
 state and planning changes, with a 30-second lock wait. Preflight checks archive identity,
 metadata, architecture, paths, links, destination types, dependencies and file conflicts before
 hooks. Installs and upgrades retain dependency order; replacement removals are linked to
-incoming packages. Configuration handling uses archive checksums as baselines for
-`.pacnew`/`.pacsave`, preserving local edits across upgrades. Dependency cycles do not
-push unrelated dependents ahead of their providers, but steps within a cycle may
-have temporarily unsatisfied dependencies.
+incoming packages. Removed consumers precede their providers' removal or incompatible
+upgrade; only the affected removals move earlier when their replacement links fall
+later. Unrelated removals stay with their own replacements. Old versions of packages
+being upgraded may temporarily lose dependencies; incoming packages and the final
+state are validated separately. Dependency cycles do not push unrelated dependents
+ahead of their providers, but steps within a cycle may have temporarily unsatisfied
+dependencies. Configuration handling uses archive checksums as baselines for
+`.pacnew`/`.pacsave`, preserving local edits across upgrades.
+
+Install scripts and changelogs are retained in the local database with their archive
+modification times. `.INSTALL`, `.MTREE` and `.CHANGELOG` entries are limited to
+64 MiB each. Existing directories keep their metadata; differing archive permissions
+produce a warning on stderr and in the operation log, rather than an automatic chmod.
 
 An explicit archive directory can replace a symlink owned as a file by an upgraded
 or linked-removed package, without modifying the link's target. Retained ownership

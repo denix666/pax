@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_impossible_removal_order_after_successful_resolution() {
+    fn builder_schedules_linked_removal_chain_after_resolution() {
         let mut pool = ConcretePool::new(HashSet::new());
         pool.add_local(make_pkg("old-lib", "1", &[]));
         pool.add_local(make_pkg("old-app", "1", &["old-lib"]));
@@ -340,10 +340,21 @@ mod tests {
         let targets = ["new-lib".into(), "new-app".into()];
         let mut resolved = resolve(&pool, &targets, &ResolveOptions::default()).unwrap();
         crate::topo::topological_sort(&pool, &mut resolved);
-        assert!(matches!(
-            build_transaction(&pool, &resolved, &targets, &|_| (0, 0), false),
-            Err(ResolveError::ExecutionPlanCycle { .. })
-        ));
+        let tx = build_transaction(&pool, &resolved, &targets, &|_| (0, 0), false).unwrap();
+        assert_eq!(tx.package_order, ["new-lib", "new-app"]);
+        let installed = pool
+            .all_installed()
+            .iter()
+            .map(|pkg| pkg.info.clone())
+            .collect::<Vec<_>>();
+        let incoming = resolved
+            .to_install
+            .iter()
+            .map(|pkg| pool.get(pkg.id).unwrap().info.clone())
+            .collect::<Vec<_>>();
+        let steps = execution_plan(&tx, &installed, &incoming).unwrap();
+        assert_eq!(steps[0].remove_before, ["old-app", "old-lib"]);
+        assert!(steps[1].remove_before.is_empty());
     }
 
     #[test]

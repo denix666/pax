@@ -222,6 +222,7 @@ fn apply_transaction(
             let backup_md5 = ctx.old_backup_md5.get(name).cloned().unwrap_or_default();
             let metadata = extract_prepared(archive, ctx.db_path, ctx.root_dir, &backup_md5)?;
             for warning in &metadata.warnings {
+                eprintln!("warning: {warning}");
                 ctx.logger.log_warning(warning);
             }
             register_package(
@@ -274,6 +275,7 @@ fn apply_transaction(
             }
             let metadata = extract_prepared(archive, ctx.db_path, ctx.root_dir, &HashMap::new())?;
             for warning in &metadata.warnings {
+                eprintln!("warning: {warning}");
                 ctx.logger.log_warning(warning);
             }
             let reason = if install.explicit {

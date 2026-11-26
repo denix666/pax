@@ -22,11 +22,12 @@ type Packages<'a> = BTreeMap<&'a str, &'a PackageInfo>;
 /// applying a plan must hold the database lock and validate it again using the
 /// actual archive metadata before hooks. This function performs no I/O.
 ///
-/// Each removal stays immediately before its earliest linked incoming action.
-/// Installed dependencies constrain removal order, except when an upgrade itself
-/// anchors removal of its old provider. Other fixed slots can remain impossible.
-/// Linked plans allow incoming cycle fallback only when it does not
-/// mask an explicitly removed installed provider. This is not a filesystem
+/// Each removal runs as late as its links and outgoing dependency order permit.
+/// A removed consumer precedes removal or incompatible upgrade of its providers.
+/// Old dependencies of upgraded consumers do not impose reverse upgrade ordering;
+/// incoming dependencies and the final state are checked separately.
+/// Linked plans allow incoming cycle fallback only when it does not mask an
+/// explicitly removed installed provider. This is not a filesystem
 /// ownership or boot-safety check, nor a guarantee of continuously satisfied
 /// dependencies between individual steps.
 pub fn execution_plan(
@@ -83,27 +84,8 @@ pub fn execution_plan(
     for index in 1..tx.package_order.len() {
         graph.before(index - 1, index, "preserve package_order".into());
     }
-    let mut anchors = BTreeMap::new();
     for action in &tx.removals {
-        // Nonempty links and their endpoints were checked by validate_actions.
-        let anchor = action
-            .links
-            .iter()
-            .map(|link| positions[link.incoming.as_str()])
-            .min()
-            .unwrap();
-        anchors.insert(action.name.as_str(), anchor);
         let node = removal_nodes[action.name.as_str()];
-        if anchor > 0 {
-            graph.before(
-                anchor - 1,
-                node,
-                format!(
-                    "keep removal in the slot before {}",
-                    tx.package_order[anchor]
-                ),
-            );
-        }
         for link in &action.links {
             graph.before(
                 node,
@@ -119,9 +101,25 @@ pub fn execution_plan(
         &retained,
         &positions,
         &removal_nodes,
-        &anchors,
     );
     let order = graph.order()?;
+    // Apply nodes have fixed slots. In reverse topological order, every removal
+    // inherits its earliest successor deadline. This moves only dependency-linked
+    // removals earlier, while leaving unrelated removals at their own links.
+    let mut slots: Vec<_> = (0..graph.labels.len()).collect();
+    for &node in order.iter().rev() {
+        if node >= tx.package_order.len() {
+            slots[node] = graph.edges[node]
+                .keys()
+                .map(|&next| slots[next])
+                .min()
+                .expect("validated removal has an incoming link");
+        }
+    }
+    let anchors = removal_nodes
+        .iter()
+        .map(|(&name, &node)| (name, slots[node]))
+        .collect();
     validate_incoming_order(tx, &installed, &incoming, &retained, &positions, &anchors)?;
     for node in order {
         if node >= tx.package_order.len() {
@@ -304,13 +302,9 @@ fn add_outgoing_dependencies(
     retained: &Packages<'_>,
     positions: &BTreeMap<&str, usize>,
     removals: &BTreeMap<&str, usize>,
-    anchors: &BTreeMap<&str, usize>,
 ) {
     for consumer in installed.values() {
-        let removed_consumer = removals.get(consumer.name.as_str()).copied();
-        let Some(consumer_node) =
-            removed_consumer.or_else(|| positions.get(consumer.name.as_str()).copied())
-        else {
+        let Some(&consumer_node) = removals.get(consumer.name.as_str()) else {
             continue;
         };
         for dep in &consumer.depends {
@@ -326,12 +320,9 @@ fn add_outgoing_dependencies(
                     continue;
                 }
                 let provider_node = removals.get(provider.name.as_str()).copied().or_else(|| {
-                    // Do not impose reverse upgrade ordering on ordinary upgrades.
-                    // Only an explicitly removed consumer needs protection here.
-                    if removed_consumer.is_some()
-                        && incoming
-                            .get(provider.name.as_str())
-                            .is_some_and(|new| !package_satisfies(new, dep))
+                    if incoming
+                        .get(provider.name.as_str())
+                        .is_some_and(|new| !package_satisfies(new, dep))
                     {
                         positions.get(provider.name.as_str()).copied()
                     } else {
@@ -339,14 +330,6 @@ fn add_outgoing_dependencies(
                     }
                 });
                 if let Some(provider_node) = provider_node {
-                    // Retiring an upgrade's own old provider belongs to this
-                    // same slot, not after the upgrade that replaces it. The
-                    // incoming dependency checks still validate the new package.
-                    if removed_consumer.is_none()
-                        && anchors.get(provider.name.as_str()) == Some(&consumer_node)
-                    {
-                        continue;
-                    }
                     graph.before(
                         consumer_node,
                         provider_node,
@@ -658,6 +641,190 @@ mod tests {
     }
 
     #[test]
+    fn kernel_and_module_replacements_with_both_metas_share_the_required_removal_slot() {
+        // Reported installed versions; incoming versions/dependencies are synthetic.
+        let installed = [
+            package("linux-meta", "7.1-1", &["linux71"], &[]),
+            package("linux71", "7.1.13-2", &[], &[]),
+            package("linux71-broadcom-wl", "6.30.223.271-28", &["linux71"], &[]),
+            package("linux-broadcom-wl-meta", "1", &["linux71-broadcom-wl"], &[]),
+            package("old-unrelated", "1", &[], &[]),
+        ];
+        let incoming = [
+            package("prepare", "1", &[], &[]),
+            package("linux73", "7.3-1", &["prepare"], &[]),
+            package("linux-meta", "7.3-1", &["linux73"], &[]),
+            package("linux73-broadcom-wl", "1", &["linux73", "linux-meta"], &[]),
+            package("openconnect", "1", &["linux73-broadcom-wl"], &[]),
+            package("wpa_supplicant", "1", &["openconnect"], &[]),
+            package("gvfs", "1", &["wpa_supplicant"], &[]),
+            package(
+                "linux-broadcom-wl-meta",
+                "2",
+                &["linux73-broadcom-wl", "gvfs"],
+                &[],
+            ),
+            package("unrelated", "1", &[], &[]),
+        ];
+        let order: Vec<_> = incoming.iter().map(|pkg| pkg.name.as_str()).collect();
+        let tx = transaction(
+            &installed,
+            &incoming,
+            &order,
+            &[
+                ("linux71", &["linux-meta"]),
+                ("linux71-broadcom-wl", &["linux-broadcom-wl-meta"]),
+                ("old-unrelated", &["unrelated"]),
+            ],
+        );
+        assert_eq!(
+            execution_plan(&tx, &installed, &incoming).unwrap(),
+            vec![
+                step("prepare", &[]),
+                step("linux73", &[]),
+                step("linux-meta", &["linux71-broadcom-wl", "linux71"]),
+                step("linux73-broadcom-wl", &[]),
+                step("openconnect", &[]),
+                step("wpa_supplicant", &[]),
+                step("gvfs", &[]),
+                step("linux-broadcom-wl-meta", &[]),
+                step("unrelated", &["old-unrelated"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn removal_slots_match_dependency_deadlines_for_all_four_node_dags() {
+        let names = ["old-z", "old-b", "old-y", "old-a"];
+        let pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        let replacements = ["new-0", "new-1", "new-2", "new-3"];
+        let order = ["prepare", "new-0", "new-1", "new-2", "new-3", "unrelated"];
+        let mut cases = 0;
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let permutation = [a, b, c, d];
+                        if permutation.iter().collect::<BTreeSet<_>>().len() != 4 {
+                            continue;
+                        }
+                        for mask in 0..64 {
+                            let edges: Vec<_> = pairs
+                                .iter()
+                                .enumerate()
+                                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                                .map(|(_, &edge)| edge)
+                                .collect();
+                            let mut installed: Vec<_> = names
+                                .iter()
+                                .enumerate()
+                                .map(|(i, name)| {
+                                    let depends: Vec<_> = edges
+                                        .iter()
+                                        .filter(|&&(from, _)| from == i)
+                                        .map(|&(_, to)| names[to])
+                                        .collect();
+                                    package(name, "1", &depends, &[])
+                                })
+                                .collect();
+                            installed.push(package("old-unrelated", "1", &[], &[]));
+                            let mut incoming: Vec<_> = order
+                                .iter()
+                                .map(|name| package(name, "1", &[], &[]))
+                                .collect();
+                            let links: Vec<_> = permutation
+                                .iter()
+                                .map(|&slot| vec![replacements[slot]])
+                                .collect();
+                            let mut removals: Vec<_> = names
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &name)| (name, links[i].as_slice()))
+                                .collect();
+                            removals.push(("old-unrelated", &["unrelated"]));
+                            let mut tx = transaction(&installed, &incoming, &order, &removals);
+                            // Independent fixed-point oracle for the latest legal slots.
+                            let mut expected = permutation.map(|slot| slot + 1);
+                            loop {
+                                let before = expected;
+                                for &(consumer, provider) in &edges {
+                                    expected[consumer] = expected[consumer].min(expected[provider]);
+                                }
+                                if expected == before {
+                                    break;
+                                }
+                            }
+                            installed.reverse();
+                            incoming.reverse();
+                            tx.removals.reverse();
+                            let plan = execution_plan(&tx, &installed, &incoming).unwrap();
+                            assert_eq!(
+                                plan.iter().map(|s| s.incoming.as_str()).collect::<Vec<_>>(),
+                                order
+                            );
+                            let flattened: Vec<_> =
+                                plan.iter().flat_map(|s| &s.remove_before).collect();
+                            assert_eq!(flattened.len(), 5);
+                            for (i, name) in names.iter().enumerate() {
+                                let slot = plan
+                                    .iter()
+                                    .position(|s| s.remove_before.iter().any(|n| n == name))
+                                    .unwrap();
+                                assert_eq!(
+                                    slot, expected[i],
+                                    "mask={mask}, permutation={permutation:?}, package={name}"
+                                );
+                            }
+                            for &(consumer, provider) in &edges {
+                                let position = |name| {
+                                    flattened.iter().position(|n| n.as_str() == name).unwrap()
+                                };
+                                assert!(position(names[consumer]) < position(names[provider]));
+                            }
+                            assert!(plan[0].remove_before.is_empty());
+                            assert_eq!(plan[5].remove_before, ["old-unrelated"]);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 1536);
+    }
+
+    #[test]
+    fn propagated_removal_slots_are_used_for_incoming_dependency_validation() {
+        let installed = [
+            package("old-provider", "1", &[], &[]),
+            package("old-consumer", "1", &["old-provider"], &["abi=2"]),
+        ];
+        for closes_cycle in [false, true] {
+            let incoming = [
+                package("early", "1", &["abi>=2"], &[]),
+                package(
+                    "late",
+                    "1",
+                    if closes_cycle { &["early"] } else { &[] },
+                    &["abi=2"],
+                ),
+            ];
+            let tx = transaction(
+                &installed,
+                &incoming,
+                &["early", "late"],
+                &[("old-provider", &["early"]), ("old-consumer", &["late"])],
+            );
+            let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
+            assert!(matches!(error, ResolveError::InvalidExecutionPlan { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("blocked by removal of old-consumer 1")
+            );
+        }
+    }
+
+    #[test]
     fn interleaved_actions_keep_order_and_unrelated_removals_stay_late() {
         let installed = [
             package("middle", "1", &[], &[]),
@@ -774,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn impossible_cross_anchor_order_reports_the_constraint_cycle() {
+    fn removed_consumer_moves_before_its_provider_across_link_anchors() {
         let installed = [
             package("old-lib", "1", &[], &[]),
             package("old-app", "1", &["old-lib"], &[]),
@@ -789,19 +956,13 @@ mod tests {
             &["new-lib", "new-app"],
             &[("old-lib", &["new-lib"]), ("old-app", &["new-app"])],
         );
-        let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
-        assert!(matches!(error, ResolveError::ExecutionPlanCycle { .. }));
-        let message = error.to_string();
-        for text in [
-            "remove old-app",
-            "remove old-lib",
-            "apply new-lib",
-            "needs old-lib",
-            "slot before new-app",
-            "Replaced link",
-        ] {
-            assert!(message.contains(text), "{message}");
-        }
+        assert_eq!(
+            execution_plan(&tx, &installed, &incoming).unwrap(),
+            vec![
+                step("new-lib", &["old-app", "old-lib"]),
+                step("new-app", &[])
+            ]
+        );
         assert_eq!(tx.package_order, ["new-lib", "new-app"]);
     }
 
@@ -864,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_upgrade_must_precede_or_anchor_explicit_provider_removal() {
+    fn old_dependencies_of_upgraded_consumers_do_not_reverse_incoming_order() {
         let installed = [
             package("old", "1", &[], &[]),
             package("consumer", "1", &["old"], &[]),
@@ -885,27 +1046,26 @@ mod tests {
         );
         let mut late = tx.clone();
         late.package_order.reverse();
-        assert!(matches!(
-            execution_plan(&late, &installed, &incoming),
-            Err(ResolveError::ExecutionPlanCycle { .. })
-        ));
+        assert_eq!(
+            execution_plan(&late, &installed, &incoming).unwrap(),
+            vec![step("new", &["old"]), step("consumer", &[])]
+        );
         let mut same_slot = tx;
         same_slot.removals[0].links[0].incoming = "consumer".into();
         assert_eq!(
             execution_plan(&same_slot, &installed, &incoming).unwrap(),
             vec![step("consumer", &["old"]), step("new", &[])]
         );
-        // A link to the consumer is insufficient when another link anchors the
-        // same removal earlier: this must not relax unrelated cross-slot order.
+        // Multiple links still mean one removal before the earliest link.
         same_slot.removals[0].links.push(RemovalLink {
             incoming: "new".into(),
             reason: RemovalReason::Conflict,
         });
         same_slot.package_order.reverse();
-        assert!(matches!(
-            execution_plan(&same_slot, &installed, &incoming),
-            Err(ResolveError::ExecutionPlanCycle { .. })
-        ));
+        assert_eq!(
+            execution_plan(&same_slot, &installed, &incoming).unwrap(),
+            vec![step("new", &["old"]), step("consumer", &[])]
+        );
     }
 
     #[test]
@@ -1000,10 +1160,10 @@ mod tests {
                     vec![step("library", &[]), step("new-app", &["old-app"])]
                 );
             } else {
-                assert!(matches!(
-                    result,
-                    Err(ResolveError::ExecutionPlanCycle { .. })
-                ));
+                assert_eq!(
+                    result.unwrap(),
+                    vec![step("library", &["old-app"]), step("new-app", &[])]
+                );
                 let mut early = tx;
                 early.package_order.reverse();
                 assert_eq!(
@@ -1035,9 +1195,20 @@ mod tests {
                     ("consumer", &["new-consumer"]),
                 ],
             );
+            let expected = if provided == "virtual=2:1-4" {
+                vec![
+                    step("new-provider", &["provider"]),
+                    step("new-consumer", &["consumer"]),
+                ]
+            } else {
+                vec![
+                    step("new-provider", &["consumer", "provider"]),
+                    step("new-consumer", &[]),
+                ]
+            };
             assert_eq!(
-                execution_plan(&tx, &installed, &incoming).is_ok(),
-                provided == "virtual=2:1-4"
+                execution_plan(&tx, &installed, &incoming).unwrap(),
+                expected
             );
         }
     }
@@ -1063,9 +1234,13 @@ mod tests {
                 ("consumer", &["late"]),
             ],
         );
-        let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
-        assert!(matches!(error, ResolveError::ExecutionPlanCycle { .. }));
-        assert!(error.to_string().contains("from second"));
+        assert_eq!(
+            execution_plan(&tx, &installed, &incoming).unwrap(),
+            vec![
+                step("early", &["consumer", "second"]),
+                step("late", &["first"])
+            ]
+        );
     }
 
     #[test]
@@ -1099,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn mhwd_replacement_cycle_keeps_database_upgrade_before_driver_removals() {
+    fn mhwd_replacement_cycle_keeps_drivers_at_their_incoming_slot() {
         // Unreported versions and dependencies of retained packages are stubbed;
         // the MHWD cycle, database dependency lists and incoming versions are exact.
         let mut installed = vec![
@@ -1209,12 +1384,16 @@ mod tests {
         );
 
         tx.package_order.swap(1, 2);
-        let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
-        assert!(matches!(&error, ResolveError::ExecutionPlanCycle { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("installed mhwd-db 20260107-1 needs mhwd-nvidia-")
+        assert_eq!(
+            execution_plan(&tx, &installed, &incoming).unwrap(),
+            vec![
+                step("mhwd", &[]),
+                step(
+                    "mhwd-nvidia-580xx",
+                    &["mhwd-nvidia-570xx", "mhwd-nvidia-575xx"]
+                ),
+                step("mhwd-db", &[]),
+            ]
         );
     }
 
