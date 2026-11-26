@@ -23,8 +23,9 @@ type Packages<'a> = BTreeMap<&'a str, &'a PackageInfo>;
 /// actual archive metadata before hooks. This function performs no I/O.
 ///
 /// Each removal stays immediately before its earliest linked incoming action.
-/// Installed dependencies constrain removal order and may make those fixed slots
-/// impossible. Linked plans allow incoming cycle fallback only when it does not
+/// Installed dependencies constrain removal order, except when an upgrade itself
+/// anchors removal of its old provider. Other fixed slots can remain impossible.
+/// Linked plans allow incoming cycle fallback only when it does not
 /// mask an explicitly removed installed provider. This is not a filesystem
 /// ownership or boot-safety check, nor a guarantee of continuously satisfied
 /// dependencies between individual steps.
@@ -118,6 +119,7 @@ pub fn execution_plan(
         &retained,
         &positions,
         &removal_nodes,
+        &anchors,
     );
     let order = graph.order()?;
     validate_incoming_order(tx, &installed, &incoming, &retained, &positions, &anchors)?;
@@ -302,6 +304,7 @@ fn add_outgoing_dependencies(
     retained: &Packages<'_>,
     positions: &BTreeMap<&str, usize>,
     removals: &BTreeMap<&str, usize>,
+    anchors: &BTreeMap<&str, usize>,
 ) {
     for consumer in installed.values() {
         let removed_consumer = removals.get(consumer.name.as_str()).copied();
@@ -336,6 +339,14 @@ fn add_outgoing_dependencies(
                     }
                 });
                 if let Some(provider_node) = provider_node {
+                    // Retiring an upgrade's own old provider belongs to this
+                    // same slot, not after the upgrade that replaces it. The
+                    // incoming dependency checks still validate the new package.
+                    if removed_consumer.is_none()
+                        && anchors.get(provider.name.as_str()) == Some(&consumer_node)
+                    {
+                        continue;
+                    }
                     graph.before(
                         consumer_node,
                         provider_node,
@@ -814,7 +825,46 @@ mod tests {
     }
 
     #[test]
-    fn consumer_upgrade_must_precede_explicit_provider_removal() {
+    fn meta_upgrade_replaces_its_own_old_dependency() {
+        // The reported installed versions are real; the incoming migration is
+        // synthetic because the report does not include repository metadata.
+        for already_installed in [false, true] {
+            let mut installed = vec![
+                package("linux-meta", "7.1-1", &["linux71"], &[]),
+                package("linux71", "7.1.13-2", &[], &[]),
+            ];
+            let new_kernel = package("linux618", "6.18.63-3", &[], &[]);
+            let mut new_meta = package("linux-meta", "7.2-1", &["linux618>=6.18"], &[]);
+            new_meta.replaces = vec![Dependency::parse("linux71").unwrap()];
+            let (incoming, order, expected) = if already_installed {
+                installed.push(new_kernel);
+                (
+                    vec![new_meta],
+                    vec!["linux-meta"],
+                    vec![step("linux-meta", &["linux71"])],
+                )
+            } else {
+                (
+                    vec![new_kernel, new_meta],
+                    vec!["linux618", "linux-meta"],
+                    vec![step("linux618", &[]), step("linux-meta", &["linux71"])],
+                )
+            };
+            let tx = transaction(
+                &installed,
+                &incoming,
+                &order,
+                &[("linux71", &["linux-meta"])],
+            );
+            assert_eq!(
+                execution_plan(&tx, &installed, &incoming).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn consumer_upgrade_must_precede_or_anchor_explicit_provider_removal() {
         let installed = [
             package("old", "1", &[], &[]),
             package("consumer", "1", &["old"], &[]),
@@ -841,10 +891,84 @@ mod tests {
         ));
         let mut same_slot = tx;
         same_slot.removals[0].links[0].incoming = "consumer".into();
+        assert_eq!(
+            execution_plan(&same_slot, &installed, &incoming).unwrap(),
+            vec![step("consumer", &["old"]), step("new", &[])]
+        );
+        // A link to the consumer is insufficient when another link anchors the
+        // same removal earlier: this must not relax unrelated cross-slot order.
+        same_slot.removals[0].links.push(RemovalLink {
+            incoming: "new".into(),
+            reason: RemovalReason::Conflict,
+        });
+        same_slot.package_order.reverse();
         assert!(matches!(
             execution_plan(&same_slot, &installed, &incoming),
             Err(ResolveError::ExecutionPlanCycle { .. })
         ));
+    }
+
+    #[test]
+    fn own_provider_removal_keeps_versioned_final_dependency_checks() {
+        for consumer in ["meta", "retained-app"] {
+            let installed = [
+                package("old", "1", &[], &["abi=2"]),
+                package("meta", "1", &["abi>=2"], &[]),
+                package("retained-app", "1", &["abi>=2"], &[]),
+                package("alternative", "1", &[], &["abi=1"]),
+            ];
+            let mut incoming = vec![package("meta", "2", &[], &[])];
+            if consumer == "meta" {
+                incoming[0].depends = vec![Dependency::parse("abi>=2").unwrap()];
+                incoming.push(package("retained-app", "2", &[], &[]));
+            }
+            let order: Vec<_> = incoming.iter().map(|pkg| pkg.name.as_str()).collect();
+            let tx = transaction(&installed, &incoming, &order, &[("old", &["meta"])]);
+            let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
+            assert!(matches!(error, ResolveError::InvalidExecutionPlan { .. }));
+            let message = error.to_string();
+            assert!(message.contains(consumer), "{message}");
+            assert!(
+                message.contains("abi>=2 is unsatisfied in the final state"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_provider_removal_still_requires_new_dependencies_in_time() {
+        let installed = [
+            package("old", "1", &[], &["abi=2"]),
+            package("meta", "1", &["abi>=2"], &[]),
+        ];
+        for closes_cycle in [false, true] {
+            let incoming = [
+                package("meta", "2", &["abi>=2"], &[]),
+                package(
+                    "new",
+                    "1",
+                    if closes_cycle { &["meta>=2"] } else { &[] },
+                    &["abi=2"],
+                ),
+            ];
+            let tx = transaction(
+                &installed,
+                &incoming,
+                &["meta", "new"],
+                &[("old", &["meta"])],
+            );
+            let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
+            assert!(matches!(error, ResolveError::InvalidExecutionPlan { .. }));
+            assert!(error.to_string().contains("blocked by removal of old 1"));
+            if !closes_cycle {
+                let mut early = tx;
+                early.package_order.reverse();
+                assert_eq!(
+                    execution_plan(&early, &installed, &incoming).unwrap(),
+                    vec![step("new", &[]), step("meta", &["old"])]
+                );
+            }
+        }
     }
 
     #[test]
