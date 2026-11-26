@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pax_core::package::PackageInfo;
+use pax_core::package::{Dependency, PackageInfo};
 use pax_core::version::Version;
 
 use crate::error::{ResolveError, Result};
@@ -24,9 +24,10 @@ type Packages<'a> = BTreeMap<&'a str, &'a PackageInfo>;
 ///
 /// Each removal stays immediately before its earliest linked incoming action.
 /// Installed dependencies constrain removal order and may make those fixed slots
-/// impossible. Incoming dependency-cycle fallback is preserved only for plans
-/// without removals. This is not a filesystem ownership or boot-safety check, nor
-/// a guarantee of continuously satisfied dependencies between individual steps.
+/// impossible. Linked plans allow incoming cycle fallback only when it does not
+/// mask an explicitly removed installed provider. This is not a filesystem
+/// ownership or boot-safety check, nor a guarantee of continuously satisfied
+/// dependencies between individual steps.
 pub fn execution_plan(
     tx: &Transaction,
     installed: &[PackageInfo],
@@ -119,7 +120,7 @@ pub fn execution_plan(
         &removal_nodes,
     );
     let order = graph.order()?;
-    validate_incoming_order(tx, &installed, &incoming, &positions, &anchors)?;
+    validate_incoming_order(tx, &installed, &incoming, &retained, &positions, &anchors)?;
     for node in order {
         if node >= tx.package_order.len() {
             let action = &tx.removals[node - tx.package_order.len()];
@@ -349,13 +350,68 @@ fn add_outgoing_dependencies(
     }
 }
 
+fn incoming_provider<'a>(incoming: &Packages<'a>, dep: &Dependency) -> Option<&'a PackageInfo> {
+    // Packages is name-sorted: use the same canonical selected witness as topo,
+    // not whichever matching provider happens to close a cycle.
+    incoming
+        .values()
+        .copied()
+        .find(|provider| package_satisfies(provider, dep))
+}
+
+fn incoming_dependency_graph(
+    incoming: &Packages<'_>,
+    retained: &Packages<'_>,
+    positions: &BTreeMap<&str, usize>,
+) -> Vec<Vec<usize>> {
+    let mut graph = vec![Vec::new(); incoming.len()];
+    for pkg in incoming.values() {
+        let edges = &mut graph[positions[pkg.name.as_str()]];
+        for dep in &pkg.depends {
+            if package_satisfies(pkg, dep)
+                || retained
+                    .values()
+                    .any(|provider| package_satisfies(provider, dep))
+            {
+                continue;
+            }
+            if let Some(provider) = incoming_provider(incoming, dep) {
+                edges.push(positions[provider.name.as_str()]);
+            }
+        }
+        edges.sort_unstable();
+        edges.dedup();
+    }
+    graph
+}
+
+fn dependency_reaches(graph: &[Vec<usize>], start: usize, target: usize) -> bool {
+    let mut visited = vec![false; graph.len()];
+    let mut pending = vec![start];
+    visited[start] = true;
+    while let Some(node) = pending.pop() {
+        if node == target {
+            return true;
+        }
+        for &next in &graph[node] {
+            if !visited[next] {
+                visited[next] = true;
+                pending.push(next);
+            }
+        }
+    }
+    false
+}
+
 fn validate_incoming_order(
     tx: &Transaction,
     installed: &Packages<'_>,
     incoming: &Packages<'_>,
+    retained: &Packages<'_>,
     positions: &BTreeMap<&str, usize>,
     anchors: &BTreeMap<&str, usize>,
 ) -> Result<()> {
+    let dependencies = incoming_dependency_graph(incoming, retained, positions);
     for (index, name) in tx.package_order.iter().enumerate() {
         let pkg = incoming[name.as_str()];
         for dep in &pkg.depends {
@@ -376,8 +432,31 @@ fn validate_incoming_order(
             {
                 continue;
             }
+            let removed_provider = installed.values().copied().find(|old| {
+                anchors
+                    .get(old.name.as_str())
+                    .is_some_and(|anchor| *anchor <= index)
+                    && package_satisfies(old, dep)
+            });
+            if removed_provider.is_none()
+                && incoming_provider(incoming, dep).is_some_and(|provider| {
+                    let position = positions[provider.name.as_str()];
+                    // Follow the full incoming graph, including already applied
+                    // upgrades that can belong to this same dependency cycle.
+                    position > index && dependency_reaches(&dependencies, position, index)
+                })
+            {
+                continue;
+            }
+            let reason = match removed_provider {
+                Some(old) => format!(
+                    "incoming cycle fallback is blocked by removal of {} {}",
+                    old.name, old.version,
+                ),
+                None => "no pending canonical provider closes an incoming dependency cycle".into(),
+            };
             return Err(invalid(format!(
-                "apply {} {}: dependency {dep} is unavailable after removals in this slot; linked plans cannot use incoming cycle/order fallback",
+                "apply {} {}: dependency {dep} is unavailable after removals in this slot; {reason}",
                 pkg.name, pkg.version,
             )));
         }
@@ -866,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_cycle_compatibility_is_unchanged_without_removals() {
+    fn incoming_cycle_fallback_allows_unrelated_removals() {
         let incoming = [
             package("a", "1", &["b"], &[]),
             package("b", "1", &["a"], &[]),
@@ -879,11 +958,13 @@ mod tests {
             );
         }
         let installed = [package("old", "1", &[], &[])];
-        let tx = transaction(&installed, &incoming, &["a", "b"], &[("old", &["a"])]);
-        let message = execution_plan(&tx, &installed, &incoming)
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("dependency b is unavailable"), "{message}");
+        for order in [["a", "b"], ["b", "a"]] {
+            let tx = transaction(&installed, &incoming, &order, &[("old", &[order[0]])]);
+            assert_eq!(
+                execution_plan(&tx, &installed, &incoming).unwrap(),
+                vec![step(order[0], &["old"]), step(order[1], &[])]
+            );
+        }
         // An installed future upgrade can satisfy the first dependency now.
         let installed = [package("old", "1", &[], &[]), package("b", "0", &[], &[])];
         let tx = transaction(&installed, &incoming, &["a", "b"], &[("old", &["a"])]);
@@ -891,6 +972,325 @@ mod tests {
             execution_plan(&tx, &installed, &incoming).unwrap(),
             vec![step("a", &["old"]), step("b", &[])]
         );
+    }
+
+    #[test]
+    fn mhwd_replacement_cycle_keeps_database_upgrade_before_driver_removals() {
+        // Unreported versions and dependencies of retained packages are stubbed;
+        // the MHWD cycle, database dependency lists and incoming versions are exact.
+        let mut installed = vec![
+            package(
+                "mhwd",
+                "0.6.6-6",
+                &["hwinfo", "mesa", "mhwd-db", "pacman"],
+                &[],
+            ),
+            package(
+                "mhwd-db",
+                "20260107-1",
+                &[
+                    "libnotify",
+                    "mhwd-amdgpu",
+                    "mhwd-ati",
+                    "mhwd-nvidia>=455",
+                    "mhwd-nvidia-390xx",
+                    "mhwd-nvidia-470xx",
+                    "mhwd-nvidia-570xx",
+                    "mhwd-nvidia-575xx",
+                    "nvidia-driver-assistant",
+                ],
+                &[],
+            ),
+            package("mhwd-nvidia-570xx", "1", &["mhwd"], &[]),
+            package("mhwd-nvidia-575xx", "1", &["mhwd"], &[]),
+            package("mhwd-nvidia", "455", &[], &[]),
+        ];
+        installed.extend(
+            [
+                "hwinfo",
+                "mesa",
+                "pacman",
+                "libnotify",
+                "mhwd-amdgpu",
+                "mhwd-ati",
+                "mhwd-nvidia-390xx",
+                "mhwd-nvidia-470xx",
+                "nvidia-driver-assistant",
+            ]
+            .into_iter()
+            .map(|name| package(name, "1", &[], &[])),
+        );
+        let mut incoming = [
+            package(
+                "mhwd",
+                "0.6.6-8",
+                &["hwinfo", "mesa", "mhwd-db>=20250929", "pacman"],
+                &[],
+            ),
+            package(
+                "mhwd-db",
+                "20260305-2",
+                &[
+                    "libnotify",
+                    "mhwd-amdgpu",
+                    "mhwd-ati",
+                    "mhwd-nvidia>=455",
+                    "mhwd-nvidia-390xx",
+                    "mhwd-nvidia-470xx",
+                    "mhwd-nvidia-580xx",
+                    "nvidia-driver-assistant",
+                ],
+                &[],
+            ),
+            package("mhwd-nvidia-580xx", "580.196.07-2", &["mhwd"], &[]),
+        ];
+        incoming[2].replaces = ["mhwd-nvidia-570xx", "mhwd-nvidia-575xx"]
+            .into_iter()
+            .map(|name| Dependency::parse(name).unwrap())
+            .collect();
+        incoming[2].conflicts = incoming[2].replaces.clone();
+        let mut tx = transaction(
+            &installed,
+            &incoming,
+            &["mhwd", "mhwd-db", "mhwd-nvidia-580xx"],
+            &[
+                ("mhwd-nvidia-570xx", &["mhwd-nvidia-580xx"]),
+                ("mhwd-nvidia-575xx", &["mhwd-nvidia-580xx"]),
+            ],
+        );
+        for removal in &mut tx.removals {
+            removal.links.push(RemovalLink {
+                incoming: "mhwd-nvidia-580xx".into(),
+                reason: RemovalReason::Conflict,
+            });
+        }
+        let expected = vec![
+            step("mhwd", &[]),
+            step("mhwd-db", &[]),
+            step(
+                "mhwd-nvidia-580xx",
+                &["mhwd-nvidia-570xx", "mhwd-nvidia-575xx"],
+            ),
+        ];
+        assert_eq!(
+            execution_plan(&tx, &installed, &incoming).unwrap(),
+            expected
+        );
+        installed.reverse();
+        incoming.reverse();
+        tx.removals.reverse();
+        assert_eq!(
+            execution_plan(&tx, &installed, &incoming).unwrap(),
+            expected
+        );
+
+        tx.package_order.swap(1, 2);
+        let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
+        assert!(matches!(&error, ResolveError::ExecutionPlanCycle { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("installed mhwd-db 20260107-1 needs mhwd-nvidia-")
+        );
+    }
+
+    #[test]
+    fn incoming_cycle_cannot_hide_a_matching_provider_removed_in_or_before_its_slot() {
+        let incoming = [
+            package("prepare", "1", &[], &[]),
+            package("app", "1", &["api>=2"], &[]),
+            package("provider", "1", &["app"], &["api=2"]),
+        ];
+        for provided in ["api", "api=1", "api=2"] {
+            let installed = [package("old", "1", &[], &[provided])];
+            for anchor in ["prepare", "app"] {
+                let tx = transaction(
+                    &installed,
+                    &incoming,
+                    &["prepare", "app", "provider"],
+                    &[("old", &[anchor])],
+                );
+                let result = execution_plan(&tx, &installed, &incoming);
+                if provided == "api=2" {
+                    let error = result.unwrap_err();
+                    assert!(matches!(&error, ResolveError::InvalidExecutionPlan { .. }));
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("dependency api>=2 is unavailable"),
+                        "{message}"
+                    );
+                    assert!(message.contains("blocked by removal of old 1"), "{message}");
+                } else {
+                    // Removing a nonmatching old provision did not cause this
+                    // missing dependency; the actual incoming cycle may proceed.
+                    assert!(result.is_ok(), "{provided}, {anchor}: {result:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_forward_dependency_cannot_borrow_a_providers_unrelated_cycle() {
+        let installed = [package("old", "1", &[], &[])];
+        for provider_cycle in [false, true] {
+            let incoming = [
+                package("app", "1", &["api>=2"], &[]),
+                package(
+                    "provider",
+                    "1",
+                    if provider_cycle { &["peer"] } else { &[] },
+                    &["api=2"],
+                ),
+                package("peer", "1", &["provider"], &[]),
+            ];
+            let tx = transaction(
+                &installed,
+                &incoming,
+                &["app", "provider", "peer"],
+                &[("old", &["app"])],
+            );
+            let error = execution_plan(&tx, &installed, &incoming).unwrap_err();
+            assert!(matches!(&error, ResolveError::InvalidExecutionPlan { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("no pending canonical provider closes an incoming dependency cycle")
+            );
+        }
+    }
+
+    #[test]
+    fn incoming_cycle_checks_versions_on_both_dependency_directions() {
+        let installed = [package("old", "1", &[], &[])];
+        for api in ["api", "api=1", "api=2"] {
+            for back in ["back", "back=1", "back=2:1-4"] {
+                let incoming = [
+                    package("app", "1", &["api>=2"], &[back]),
+                    package("provider", "99", &["back>=2:1-3"], &[api]),
+                    package("z-backup", "1", &[], &["back=2:1-4"]),
+                ];
+                let tx = transaction(
+                    &installed,
+                    &incoming,
+                    &["app", "provider", "z-backup"],
+                    &[("old", &["app"])],
+                );
+                let result = execution_plan(&tx, &installed, &incoming);
+                if api != "api=2" {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("dependency api>=2 is unsatisfied in the final state")
+                    );
+                } else if back != "back=2:1-4" {
+                    // Final dependencies are satisfied by z-backup, but its edge
+                    // cannot close the provider -> app return path.
+                    assert!(result.unwrap_err().to_string().contains(
+                        "no pending canonical provider closes an incoming dependency cycle"
+                    ));
+                } else {
+                    assert_eq!(
+                        result.unwrap(),
+                        vec![
+                            step("app", &["old"]),
+                            step("provider", &[]),
+                            step("z-backup", &[])
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_cycle_graph_omits_self_and_retained_satisfied_dependencies() {
+        for satisfied_by in ["cycle", "self", "retained"] {
+            let mut installed = vec![package("old", "1", &[], &[])];
+            let mut incoming = [
+                package("app", "1", &["api>=2"], &["back=2"]),
+                package("provider", "1", &["back>=2"], &["api=2"]),
+            ];
+            if satisfied_by == "self" {
+                incoming[1]
+                    .provides
+                    .push(Dependency::parse("back=2").unwrap());
+            } else if satisfied_by == "retained" {
+                installed.push(package("retained", "1", &[], &["back=2"]));
+            }
+            let tx = transaction(
+                &installed,
+                &incoming,
+                &["app", "provider"],
+                &[("old", &["app"])],
+            );
+            let result = execution_plan(&tx, &installed, &incoming);
+            if satisfied_by == "cycle" {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(
+                    result.unwrap_err().to_string().contains(
+                        "no pending canonical provider closes an incoming dependency cycle"
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_cycle_uses_only_the_canonical_selected_provider() {
+        let installed = [package("old", "1", &[], &[])];
+        for canonical_cycle in [false, true] {
+            let mut incoming = [
+                package("app", "1", &["api>=2"], &[]),
+                package(
+                    "a-provider",
+                    "1",
+                    if canonical_cycle { &["app"] } else { &[] },
+                    &["api=2"],
+                ),
+                package(
+                    "z-provider",
+                    "1",
+                    if canonical_cycle { &[] } else { &["app"] },
+                    &["api=2"],
+                ),
+            ];
+            let tx = transaction(
+                &installed,
+                &incoming,
+                &["app", "z-provider", "a-provider"],
+                &[("old", &["app"])],
+            );
+            for _ in 0..2 {
+                let result = execution_plan(&tx, &installed, &incoming);
+                if canonical_cycle {
+                    assert_eq!(
+                        result.unwrap(),
+                        vec![
+                            step("app", &["old"]),
+                            step("z-provider", &[]),
+                            step("a-provider", &[])
+                        ]
+                    );
+                } else {
+                    assert!(result.unwrap_err().to_string().contains(
+                        "no pending canonical provider closes an incoming dependency cycle"
+                    ));
+                }
+                incoming.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_dependency_reachability_handles_long_paths_and_cycles_iteratively() {
+        let mut graph: Vec<_> = (0..20_000).map(|node| vec![node + 1]).collect();
+        graph.push(Vec::new());
+        assert!(dependency_reaches(&graph, 0, 20_000));
+        graph[19_999] = vec![0];
+        assert!(dependency_reaches(&graph, 0, 19_999));
+        assert!(!dependency_reaches(&graph, 0, 20_000));
     }
 
     #[test]

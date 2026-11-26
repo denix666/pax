@@ -5,7 +5,8 @@
 //! Conservative restrictions: two tar end blocks and aligned zero padding are required;
 //! gzip/xz must contain one stream (matching the extractor); hardlinks must reference an
 //! earlier regular payload in this archive, not another hardlink or an installed file.
-//! Nonempty directories are never assumed to become empty during the transaction.
+//! Only transaction inspection may defer nonempty directory replacements; ownership
+//! and the existing cleanup order must prove they become empty before extraction.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, Metadata};
@@ -22,6 +23,28 @@ const PKGINFO_LIMIT: u64 = crate::extract::PKGINFO_LIMIT;
 #[derive(Clone, Debug)]
 pub(crate) struct ArchivePlan {
     pub backups: Vec<String>,
+    // Root-relative destinations with resolved parents, but not the final symlink.
+    // These are candidates, not authorization to replace an unowned object.
+    pub directory_replacements: HashSet<PathBuf>,
+    // All directory-to-leaf namespace changes, including initially empty directories.
+    pub directory_to_leaf_replacements: HashSet<PathBuf>,
+    // Nonempty directory-to-leaf candidates requiring a separate cleanup proof.
+    // Strict inspection and extraction never authorize these from this set.
+    pub deferred_directory_replacements: HashSet<PathBuf>,
+    // Filesystem links traversed by payload parents or hardlink sources, not
+    // incoming symlink data or the final leaf replaced by an explicit directory.
+    pub traversed_symlinks: HashSet<PathBuf>,
+    // Parent namespace components, including those later cancelled by '..' in
+    // link targets. Directory entries and symlink data alone are not traversals.
+    pub traversed_directories: HashSet<PathBuf>,
+}
+
+pub(crate) fn below_directory_replacement(path: &Path, replacements: &HashSet<PathBuf>) -> bool {
+    !replacements.is_empty()
+        && path
+            .ancestors()
+            .skip(1)
+            .any(|parent| replacements.contains(parent))
 }
 
 /// Validate the entire archive without creating the root or changing package files.
@@ -48,16 +71,37 @@ pub(crate) fn validate_archive_with_backups(
     inspect_archive(path, root, expected_architecture).map(|plan| plan.backups)
 }
 
-/// Validate the full archive and destinations, retaining only present backup paths.
+/// Validate the full archive and destinations, recording backups, conversions and link dependencies.
 /// Archive signatures and identity against the transaction remain caller responsibilities.
 pub(crate) fn inspect_archive(
     path: &Path,
     root: &Path,
     architecture: Option<&str>,
 ) -> Result<ArchivePlan> {
-    validate_inner(path, root, architecture).map_err(|error| ExecError::Extraction {
-        pkg: path.display().to_string(),
-        message: format!("preflight: {error}"),
+    inspect_archive_inner(path, root, architecture, false)
+}
+
+/// Transaction-only inspection: the caller must prove deferred directories are
+/// vacated by ordinary obsolete-path cleanup before running any hooks.
+pub(crate) fn inspect_transaction_archive(
+    path: &Path,
+    root: &Path,
+    architecture: Option<&str>,
+) -> Result<ArchivePlan> {
+    inspect_archive_inner(path, root, architecture, true)
+}
+
+fn inspect_archive_inner(
+    path: &Path,
+    root: &Path,
+    architecture: Option<&str>,
+    defer_nonempty_directories: bool,
+) -> Result<ArchivePlan> {
+    validate_inner(path, root, architecture, defer_nonempty_directories).map_err(|error| {
+        ExecError::Extraction {
+            pkg: path.display().to_string(),
+            message: format!("preflight: {error}"),
+        }
     })
 }
 
@@ -163,10 +207,15 @@ fn open_archive(path: &Path) -> io::Result<Box<dyn Read>> {
     }
 }
 
-fn validate_inner(path: &Path, root: &Path, architecture: Option<&str>) -> io::Result<ArchivePlan> {
+fn validate_inner(
+    path: &Path,
+    root: &Path,
+    architecture: Option<&str>,
+    defer_nonempty_directories: bool,
+) -> io::Result<ArchivePlan> {
     let reader = context(path, "open decompressor", open_archive(path))?;
     let root = context(root, "resolve installation root", validation_root(root))?;
-    let mut state = Inspection::new(root);
+    let mut state = Inspection::new(root, defer_nonempty_directories);
     let mut archive = tar::Archive::new(Counted::new(reader));
     let mut next_header = 0;
     for entry in archive.entries()? {
@@ -254,16 +303,28 @@ struct Inspection {
     payload: HashMap<PathBuf, Payload>,
     metadata: HashSet<PathBuf>,
     backups: Option<HashSet<PathBuf>>,
+    directory_replacements: HashSet<PathBuf>,
+    directory_to_leaf_replacements: HashSet<PathBuf>,
+    deferred_directory_replacements: HashSet<PathBuf>,
+    defer_nonempty_directories: bool,
+    traversed_symlinks: HashSet<PathBuf>,
+    traversed_directories: HashSet<PathBuf>,
 }
 
 impl Inspection {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, defer_nonempty_directories: bool) -> Self {
         Self {
             root,
             nodes: HashMap::new(),
             payload: HashMap::new(),
             metadata: HashSet::new(),
             backups: None,
+            directory_replacements: HashSet::new(),
+            directory_to_leaf_replacements: HashSet::new(),
+            deferred_directory_replacements: HashSet::new(),
+            defer_nonempty_directories,
+            traversed_symlinks: HashSet::new(),
+            traversed_directories: HashSet::new(),
         }
     }
 
@@ -409,7 +470,7 @@ impl Inspection {
         Ok(())
     }
 
-    fn destination(&self, path: &Path) -> io::Result<PathBuf> {
+    fn destination(&mut self, path: &Path) -> io::Result<PathBuf> {
         let parent = path.parent().unwrap_or(Path::new(""));
         let mut pending: VecDeque<_> = parent
             .components()
@@ -425,12 +486,13 @@ impl Inspection {
                     && self.nodes.get(&resolved) != Some(&Node::Directory)
                 {
                     let absolute = self.root.join(&resolved);
-                    if !context(
-                        &absolute,
-                        "inspect parent symlink target",
-                        optional_metadata(&absolute),
-                    )?
-                    .is_some_and(|metadata| metadata.is_dir())
+                    if below_directory_replacement(&resolved, &self.directory_replacements)
+                        || !context(
+                            &absolute,
+                            "inspect parent symlink target",
+                            optional_metadata(&absolute),
+                        )?
+                        .is_some_and(|metadata| metadata.is_dir())
                     {
                         return Err(invalid(format!(
                             "dangling parent symlink target {}",
@@ -459,10 +521,14 @@ impl Inspection {
                         candidate.display()
                     )));
                 }
+                None if below_directory_replacement(&candidate, &self.directory_replacements) => {
+                    None
+                }
                 None => {
                     let absolute = self.root.join(&candidate);
                     match optional_metadata(&absolute)? {
                         Some(meta) if meta.file_type().is_symlink() => {
+                            self.traversed_symlinks.insert(candidate.clone());
                             Some(std::fs::read_link(absolute)?)
                         }
                         Some(meta) if !meta.is_dir() => {
@@ -499,6 +565,7 @@ impl Inspection {
                     pending.push_front(Some(component.as_os_str().to_os_string()));
                 }
             } else {
+                self.traversed_directories.insert(candidate);
                 resolved.push(part);
             }
         }
@@ -508,7 +575,12 @@ impl Inspection {
         ))
     }
 
-    fn check_destination(&self, destination: &Path, node: &Node) -> io::Result<()> {
+    fn check_destination(&mut self, destination: &Path, node: &Node) -> io::Result<()> {
+        // Only earlier explicit conversions vacate descendants. Never inspect
+        // their old targets (which may be dangling or outside the root).
+        if below_directory_replacement(destination, &self.directory_replacements) {
+            return Ok(());
+        }
         let absolute = self.root.join(destination);
         let Some(metadata) = context(
             &absolute,
@@ -518,13 +590,24 @@ impl Inspection {
         else {
             return Ok(());
         };
-        if *node == Node::Directory && !metadata.is_dir() {
+        if *node == Node::Directory && metadata.file_type().is_symlink() {
+            if self.traversed_symlinks.contains(destination) {
+                return Err(invalid(format!(
+                    "{}: cannot convert a symlink traversed by an earlier archive member",
+                    absolute.display()
+                )));
+            }
+            self.directory_replacements
+                .insert(destination.to_path_buf());
+        } else if *node == Node::Directory && !metadata.is_dir() {
             return Err(invalid(format!(
                 "{}: cannot replace an existing non-directory with a directory",
                 absolute.display()
             )));
         }
         if *node != Node::Directory && metadata.is_dir() {
+            self.directory_to_leaf_replacements
+                .insert(destination.to_path_buf());
             let mut children = context(
                 &absolute,
                 "inspect directory contents",
@@ -537,10 +620,14 @@ impl Inspection {
             )?
             .is_some()
             {
-                return Err(invalid(format!(
-                    "{}: cannot replace a nonempty directory with a non-directory",
-                    absolute.display()
-                )));
+                if !self.defer_nonempty_directories {
+                    return Err(invalid(format!(
+                        "{}: cannot replace a nonempty directory with a non-directory",
+                        absolute.display()
+                    )));
+                }
+                self.deferred_directory_replacements
+                    .insert(destination.to_path_buf());
             }
         }
         Ok(())
@@ -560,6 +647,12 @@ impl Inspection {
             if payload.node != Node::Regular {
                 return Err(invalid(format!(
                     "backup {} is not a regular payload",
+                    path.display()
+                )));
+            }
+            if below_directory_replacement(&payload.destination, &self.directory_replacements) {
+                return Err(invalid(format!(
+                    "backup {} is below a symlink-to-directory replacement; preserving the old backup namespace is unsupported",
                     path.display()
                 )));
             }
@@ -600,6 +693,11 @@ impl Inspection {
         present_backups.sort();
         Ok(ArchivePlan {
             backups: present_backups,
+            directory_replacements: self.directory_replacements,
+            directory_to_leaf_replacements: self.directory_to_leaf_replacements,
+            deferred_directory_replacements: self.deferred_directory_replacements,
+            traversed_symlinks: self.traversed_symlinks,
+            traversed_directories: self.traversed_directories,
         })
     }
 }
@@ -863,6 +961,34 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = archive(temp.path(), bytes, "tar");
         validate_archive(&path, root, Some("x86_64"))
+    }
+
+    #[test]
+    #[ignore = "requires PAX_TEST_CACHED_ARCHIVES and PAX_TEST_INSTALL_ROOT for read-only transaction inspection"]
+    fn inspect_all_cached_transaction_archives() {
+        let cache = PathBuf::from(std::env::var_os("PAX_TEST_CACHED_ARCHIVES").unwrap());
+        let root = PathBuf::from(std::env::var_os("PAX_TEST_INSTALL_ROOT").unwrap());
+        let mut archives: Vec<_> = std::fs::read_dir(cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                path.is_file()
+                    && [".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+            })
+            .collect();
+        archives.sort();
+        assert!(!archives.is_empty());
+        let mut errors = Vec::new();
+        for archive in &archives {
+            if let Err(error) = inspect_transaction_archive(archive, &root, Some("auto")) {
+                errors.push(error.to_string());
+            }
+        }
+        eprintln!("Inspected {} cached transaction archives", archives.len());
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
     }
 
     #[test]
@@ -1218,7 +1344,10 @@ mod tests {
             ],
         ];
         for members in cases {
-            assert!(check(&package(INFO, &members), temp.path()).is_err());
+            let bytes = package(INFO, &members);
+            assert!(check(&bytes, temp.path()).is_err());
+            let path = archive(temp.path(), &bytes, "tar");
+            assert!(crate::extract::validate_package_archive(&path, temp.path()).is_err());
             assert_eq!(std::fs::read(temp.path().join("self")).unwrap(), b"keep");
             assert_eq!(std::fs::read(temp.path().join("source")).unwrap(), b"old");
             assert!(!temp.path().join("link").exists());
@@ -1239,6 +1368,55 @@ mod tests {
             temp.path(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn records_directory_traversal_cancelled_by_symlink_dotdot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("tree")).unwrap();
+        std::fs::create_dir(root.join("landing")).unwrap();
+        symlink("tree/../landing", root.join("alias")).unwrap();
+        for members in [
+            vec![Member::File("alias/victim", b"new")],
+            vec![
+                Member::Directory("tree/"),
+                Member::File("alias/victim", b"new"),
+            ],
+            vec![
+                Member::File("landing/victim", b"new"),
+                Member::Hardlink("copy", "alias/victim"),
+            ],
+        ] {
+            let path = archive(temp.path(), &package(INFO, &members), "tar");
+            let plan = inspect_archive(&path, &root, None).unwrap();
+            assert_eq!(
+                plan.traversed_directories,
+                HashSet::from([PathBuf::from("tree"), PathBuf::from("landing")])
+            );
+            assert_eq!(
+                plan.traversed_symlinks,
+                HashSet::from([PathBuf::from("alias")])
+            );
+        }
+        let path = archive(
+            temp.path(),
+            &package(
+                INFO,
+                &[
+                    Member::Directory("tree/"),
+                    Member::Directory("landing/"),
+                    Member::Symlink("link", "tree/../landing"),
+                ],
+            ),
+            "tar",
+        );
+        let plan = inspect_archive(&path, &root, None).unwrap();
+        assert!(plan.traversed_directories.is_empty());
+        assert!(plan.traversed_symlinks.is_empty());
+        assert!(!root.join("landing/victim").exists());
+        assert!(!root.join("copy").exists());
+        assert!(!root.join("link").exists());
     }
 
     #[test]
@@ -1431,6 +1609,89 @@ mod tests {
             ],
         );
         assert!(check(&bytes, temp.path()).is_err());
+    }
+
+    #[test]
+    fn transaction_inspection_only_defers_nonempty_directory_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("tree")).unwrap();
+        std::fs::write(root.join("tree/local"), b"keep").unwrap();
+        std::fs::write(root.join("ordinary"), b"keep file").unwrap();
+        for member in [
+            Member::File("tree", b"new"),
+            Member::Symlink("tree", "target"),
+            Member::Hardlink("tree", "source"),
+        ] {
+            let bytes = package(INFO, &[Member::File("source", b"new source"), member]);
+            let path = archive(temp.path(), &bytes, "tar");
+            let plan = inspect_transaction_archive(&path, &root, None).unwrap();
+            assert_eq!(
+                plan.deferred_directory_replacements,
+                HashSet::from([PathBuf::from("tree")])
+            );
+            assert_eq!(
+                plan.directory_to_leaf_replacements,
+                plan.deferred_directory_replacements
+            );
+            assert!(plan.directory_replacements.is_empty());
+            let error = inspect_archive(&path, &root, None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot replace a nonempty directory"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(root.join("tree/local")).unwrap(), b"keep");
+            assert!(!root.join("source").exists());
+        }
+        for members in [
+            vec![Member::Directory("ordinary")],
+            vec![
+                Member::File("tree/child", b"new"),
+                Member::Symlink("tree", "target"),
+            ],
+            vec![
+                Member::Symlink("tree", "../outside"),
+                Member::File("tree/child", b"new"),
+            ],
+            vec![Member::Hardlink("tree", "ordinary")],
+        ] {
+            let path = archive(temp.path(), &package(INFO, &members), "tar");
+            assert!(inspect_transaction_archive(&path, &root, None).is_err());
+            assert_eq!(std::fs::read(root.join("tree/local")).unwrap(), b"keep");
+            assert_eq!(std::fs::read(root.join("ordinary")).unwrap(), b"keep file");
+        }
+    }
+
+    #[test]
+    fn empty_directory_to_leaf_changes_are_recorded_without_deferral() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        for member in [
+            Member::File("empty", b"new"),
+            Member::Symlink("empty", "target"),
+            Member::Hardlink("empty", "source"),
+        ] {
+            let bytes = package(INFO, &[Member::File("source", b"new source"), member]);
+            let path = archive(temp.path(), &bytes, "tar");
+            for plan in [
+                inspect_archive(&path, &root, None).unwrap(),
+                inspect_transaction_archive(&path, &root, None).unwrap(),
+            ] {
+                assert_eq!(
+                    plan.directory_to_leaf_replacements,
+                    HashSet::from([PathBuf::from("empty")])
+                );
+                assert!(plan.deferred_directory_replacements.is_empty());
+                assert!(plan.directory_replacements.is_empty());
+                assert!(plan.traversed_directories.is_empty());
+            }
+            assert!(root.join("empty").is_dir());
+            assert_eq!(std::fs::read_dir(root.join("empty")).unwrap().count(), 0);
+            assert!(!root.join("source").exists());
+        }
     }
 
     #[test]

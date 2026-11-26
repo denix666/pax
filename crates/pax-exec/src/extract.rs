@@ -54,7 +54,7 @@ pub fn extract_package(
     root_dir: &Path,
     existing_backup_md5: &HashMap<String, String>,
 ) -> Result<PackageMetadata> {
-    validate_package_archive(pkg_path, root_dir)?;
+    let directory_replacements = validate_package_archive_inner(pkg_path, root_dir)?;
 
     let pkg_name = pkg_path
         .file_name()
@@ -311,6 +311,31 @@ pub fn extract_package(
                     operation = "remove empty destination directory";
                     std::fs::remove_dir(&dest)?;
                 }
+                Ok(metadata) if entry_type.is_dir() && metadata.file_type().is_symlink() => {
+                    let parent = dest
+                        .parent()
+                        .ok_or_else(|| unsafe_path(&path))?
+                        .canonicalize()?;
+                    let resolved = parent.join(dest.file_name().ok_or_else(|| unsafe_path(&path))?);
+                    let relative = resolved
+                        .strip_prefix(&root_dir)
+                        .map_err(|_| unsafe_path(&path))?;
+                    if !directory_replacements.contains(relative) {
+                        return Err(unsafe_path(&path));
+                    }
+                    // Unlink only the rechecked leaf. Its target is neither
+                    // traversed nor deleted, including dangling/external targets.
+                    operation = "unlink symlink for explicit directory entry";
+                    std::fs::remove_file(&dest)?;
+                    operation = "create replacement directory";
+                    std::fs::create_dir(&dest)?;
+                }
+                Ok(_) if entry_type.is_dir() => {
+                    return Err(std::io::Error::other(
+                        "cannot replace an existing non-directory with a directory",
+                    )
+                    .into());
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -386,12 +411,20 @@ pub fn extract_package(
 /// Inspect every member without creating files or directories. Incoming symlinks
 /// are tracked in archive order so later members cannot write through escaping links.
 pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> {
+    validate_package_archive_inner(pkg_path, root_dir).map(|_| ())
+}
+
+fn validate_package_archive_inner(
+    pkg_path: &Path,
+    root_dir: &Path,
+) -> Result<std::collections::HashSet<PathBuf>> {
     let filename = pkg_path.file_name().unwrap_or_default().to_string_lossy();
     let mut archive = Archive::new(decompress(std::fs::File::open(pkg_path)?, &filename)?);
     let root = validation_root(root_dir)?;
     let mut overlays: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     let mut pkginfo = None;
     let mut regular_files = std::collections::HashSet::new();
+    let mut resolved_regular_files = std::collections::HashSet::new();
     let mut payload_paths = std::collections::HashSet::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -412,11 +445,23 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
         }
         let name = path.to_str().ok_or_else(|| unsafe_path(&path))?;
         entry.header().mode()?;
-        if kind.is_dir() {
-            resolve_archive_parent(&root, &path.join(".pax-validation"), &overlays)?;
-        }
         let parent = resolve_archive_parent(&root, &path, &overlays)?;
         let destination = parent.join(path.file_name().ok_or_else(|| unsafe_path(&path))?);
+        if kind.is_dir() {
+            match std::fs::symlink_metadata(root.join(&destination)) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    // Structural conversions need the full, archive-ordered view:
+                    // validating descendants against the old link target is wrong.
+                    return crate::preflight::inspect_archive(pkg_path, root_dir, None)
+                        .map(|plan| plan.directory_replacements);
+                }
+                Ok(metadata) if !metadata.is_dir() => return Err(unsafe_path(&path)),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            resolve_archive_parent(&root, &path.join(".pax-validation"), &overlays)?;
+        }
         let target = if kind.is_symlink() || kind.is_hard_link() {
             let target = entry
                 .link_name()?
@@ -432,16 +477,15 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
                 }
                 let parent = resolve_archive_parent(&root, &target, &overlays)?;
                 let source = parent.join(target.file_name().ok_or_else(|| unsafe_path(&target))?);
-                if matches!(overlays.get(&source), Some(Some(_))) {
-                    return Err(unsafe_path(&target));
-                }
-                if !overlays.contains_key(&source) {
-                    match std::fs::symlink_metadata(root.join(&source)) {
-                        Ok(metadata) if !metadata.is_file() => return Err(unsafe_path(&target)),
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
+                if source == destination || !resolved_regular_files.contains(&source) {
+                    return Err(ExecError::Extraction {
+                        pkg: pkg_path.display().to_string(),
+                        message: format!(
+                            "{}: hardlink source {} is not an earlier regular payload in this archive",
+                            path.display(),
+                            target.display()
+                        ),
+                    });
                 }
             }
             Some(target)
@@ -462,9 +506,14 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
             payload_paths.insert(path.clone());
             if kind.is_file() {
                 regular_files.insert(path.clone());
+                // The live inode may be a kept backup, but its archive entry
+                // must still precede the hardlink in this same resolved namespace.
+                resolved_regular_files.insert(destination.clone());
+            } else {
+                resolved_regular_files.remove(&destination);
             }
-            // Directory entries preserve existing directory symlinks, so keep
-            // their resolution visible to subsequent members.
+            // Existing symlink-to-directory conversions use Inspection above;
+            // ordinary directory entries need no additional link overlay.
             if !kind.is_dir() {
                 overlays.insert(destination, if kind.is_symlink() { target } else { None });
             }
@@ -504,7 +553,7 @@ pub fn validate_package_archive(pkg_path: &Path, root_dir: &Path) -> Result<()> 
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(())
+    Ok(std::collections::HashSet::new())
 }
 
 // Canonicalize the existing prefix without creating a missing installation root.
@@ -1155,6 +1204,101 @@ mod tests {
                 metadata.backup_md5["etc/config"],
                 format!("{:x}", md5::compute(incoming))
             );
+        }
+    }
+
+    #[test]
+    fn hardlink_recheck_rejects_a_source_after_symlink_directory_conversion() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/config"), "untouched B destination").unwrap();
+        symlink("etc", root.join("link")).unwrap();
+        let archive = package(
+            temp.path(),
+            b"B-data",
+            Some(("copy", "link/config", tar::EntryType::Link)),
+        );
+        crate::preflight::inspect_archive(&archive, &root, None).unwrap();
+        validate_package_archive(&archive, &root).unwrap();
+
+        // Model an earlier package changing the namespace between transaction
+        // preflight and B's extraction-time validation.
+        std::fs::remove_file(root.join("link")).unwrap();
+        std::fs::create_dir(root.join("link")).unwrap();
+        std::fs::write(root.join("link/config"), "A-data").unwrap();
+        let before = std::fs::metadata(root.join("link/config")).unwrap();
+        let error = extract_package(&archive, &root, &HashMap::new())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains(
+            "copy: hardlink source link/config is not an earlier regular payload in this archive"
+        ), "{error}");
+        assert_eq!(
+            std::fs::read(root.join("etc/config")).unwrap(),
+            b"untouched B destination"
+        );
+        assert_eq!(std::fs::read(root.join("link/config")).unwrap(), b"A-data");
+        let after = std::fs::metadata(root.join("link/config")).unwrap();
+        assert_eq!((before.ino(), before.nlink()), (after.ino(), after.nlink()));
+        assert!(!root.join("copy").exists());
+        assert!(!root.join("etc/config.pacnew").exists());
+        assert_eq!(std::fs::read_dir(root.join("etc")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn hardlinks_to_earlier_backups_keep_alias_resolution_and_local_inode() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        for source in ["etc/config", "alias/config"] {
+            for old in ["original", "incoming"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("root");
+                std::fs::create_dir_all(root.join("etc")).unwrap();
+                std::fs::write(root.join("etc/config"), "local changes").unwrap();
+                symlink("etc", root.join("alias")).unwrap();
+                let before = std::fs::metadata(root.join("etc/config")).unwrap();
+                let archive = package(
+                    temp.path(),
+                    b"incoming",
+                    Some(("copy", source, tar::EntryType::Link)),
+                );
+                crate::preflight::inspect_archive(&archive, &root, None).unwrap();
+                let metadata = extract_package(
+                    &archive,
+                    &root,
+                    &HashMap::from([("etc/config".into(), format!("{:x}", md5::compute(old)))]),
+                )
+                .unwrap();
+                assert_eq!(std::fs::read(root.join("copy")).unwrap(), b"local changes");
+                assert_eq!(
+                    std::fs::read(root.join("etc/config")).unwrap(),
+                    b"local changes"
+                );
+                assert_eq!(
+                    std::fs::metadata(root.join("copy")).unwrap().ino(),
+                    before.ino()
+                );
+                assert_eq!(
+                    std::fs::metadata(root.join("etc/config")).unwrap().ino(),
+                    before.ino()
+                );
+                assert_eq!(
+                    metadata.backup_md5["etc/config"],
+                    format!("{:x}", md5::compute("incoming"))
+                );
+                assert_eq!(root.join("etc/config.pacnew").exists(), old == "original");
+                if old == "original" {
+                    assert_eq!(
+                        std::fs::read(root.join("etc/config.pacnew")).unwrap(),
+                        b"incoming"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read_link(root.join("alias")).unwrap(),
+                    Path::new("etc")
+                );
+            }
         }
     }
 

@@ -111,8 +111,11 @@ fn signature_status_valid(success: bool, status: &str, trust: SigTrust) -> bool 
             }
             "VALIDSIG" => valid = true,
             "TRUST_FULLY" | "TRUST_ULTIMATE" if valid => trusted = true,
+            // GPG also reports expired, unused subkeys here. EXPKEYSIG below
+            // identifies an expired key that actually made this signature.
+            "KEYEXPIRED" => {}
             "BADSIG" | "ERRSIG" | "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG" | "NO_PUBKEY" | "NODATA"
-            | "FAILURE" | "KEYREVOKED" | "KEYEXPIRED" | "SIGEXPIRED" => return false,
+            | "FAILURE" | "KEYREVOKED" | "SIGEXPIRED" => return false,
             _ => {}
         }
     }
@@ -205,13 +208,83 @@ mod tests {
                 "REVKEYSIG",
                 "NO_PUBKEY",
                 "EXPSIG",
-                "KEYEXPIRED",
             ] {
                 assert!(!signature_status_valid(
                     true,
                     &format!("{trusted}[GNUPG:] {failure} key"),
                     trust
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn expired_unused_subkeys_do_not_reject_a_valid_trusted_signer() {
+        for trust_record in ["TRUST_FULLY", "TRUST_ULTIMATE"] {
+            let status = format!(
+                "[GNUPG:] NEWSIG\n[GNUPG:] KEYEXPIRED 1603268110\n\
+                 [GNUPG:] GOODSIG active signer\n[GNUPG:] VALIDSIG active-fingerprint\n\
+                 [GNUPG:] KEYEXPIRED 1603268110\n[GNUPG:] {trust_record} 0 pgp\n"
+            );
+            assert!(signature_status_valid(true, &status, SigTrust::TrustedOnly));
+            assert!(signature_status_valid(true, &status, SigTrust::TrustAll));
+            assert!(!signature_status_valid(
+                false,
+                &status,
+                SigTrust::TrustedOnly
+            ));
+        }
+        let untrusted = "[GNUPG:] KEYEXPIRED 1603268110\n\
+                         [GNUPG:] VALIDSIG active-fingerprint\n[GNUPG:] TRUST_UNDEFINED 0 pgp\n";
+        assert!(!signature_status_valid(
+            true,
+            untrusted,
+            SigTrust::TrustedOnly
+        ));
+        assert!(!signature_status_valid(
+            true,
+            "[GNUPG:] KEYEXPIRED 1603268110\n[GNUPG:] TRUST_FULLY 0 pgp\n",
+            SigTrust::TrustAll
+        ));
+    }
+
+    #[test]
+    fn expired_actual_signer_is_rejected_even_with_validsig_and_exit_zero() {
+        let status = "[GNUPG:] NEWSIG\n[GNUPG:] KEYEXPIRED 1603268110\n\
+                      [GNUPG:] EXPKEYSIG expired signer\n[GNUPG:] VALIDSIG expired-fingerprint\n\
+                      [GNUPG:] TRUST_FULLY 0 pgp\n";
+        for trust in [SigTrust::TrustedOnly, SigTrust::TrustAll] {
+            assert!(!signature_status_valid(true, status, trust));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PAX_TEST_EXPIRED_SUBKEY_FIXTURE with active and expired signing subkeys"]
+    fn real_active_signer_with_expired_sibling_subkey() {
+        let fixture = std::path::PathBuf::from(
+            std::env::var_os("PAX_TEST_EXPIRED_SUBKEY_FIXTURE")
+                .expect("set PAX_TEST_EXPIRED_SUBKEY_FIXTURE to the isolated GPG fixture"),
+        );
+        for level in [SigLevel::Required, SigLevel::Optional] {
+            for trust in [SigTrust::TrustedOnly, SigTrust::TrustAll] {
+                verify_signature(
+                    &fixture.join("payload.txt"),
+                    Some(&fixture.join("active-signing-subkey.sig")),
+                    &fixture.join("gnupg"),
+                    level,
+                    trust,
+                )
+                .unwrap();
+                assert!(
+                    verify_signature(
+                        &fixture.join("payload.txt"),
+                        Some(&fixture.join("expired-signing-subkey.sig")),
+                        &fixture.join("gnupg"),
+                        level,
+                        trust,
+                    )
+                    .is_err()
+                );
             }
         }
     }

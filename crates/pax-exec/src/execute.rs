@@ -12,7 +12,7 @@ use crate::extract::{
 };
 use crate::hooks::{HookWhen, TransactionPackages, collect_hooks, load_hooks, run_hooks};
 use crate::log::PaxLogger;
-use crate::preflight::ArchivePlan;
+use crate::preflight::{ArchivePlan, below_directory_replacement};
 use crate::prepared::PreparedArchive;
 use crate::register::{register_package, remove_db_entry};
 use crate::removal::{RemovalTarget, remove_package_paths, remove_transaction_package};
@@ -53,7 +53,7 @@ pub fn execute_transaction(tx: &Transaction, ctx: &mut InstallContext) -> Result
             package.name()
         );
         package.verify_for_database(ctx.db_path)?;
-        let plan = crate::preflight::inspect_archive(
+        let plan = crate::preflight::inspect_transaction_archive(
             package.path(),
             ctx.root_dir,
             Some(ctx.architecture),
@@ -332,6 +332,9 @@ fn extract_prepared(
 ) -> Result<PackageMetadata> {
     // Hooks and scriptlets ran since preflight; verify the prepared bytes once more.
     archive.verify_for_database(db_path)?;
+    // Cleanup has run; no deferred directory is authorized here. In particular,
+    // a hook-created child must stop extraction, not trigger recursive removal.
+    crate::preflight::inspect_archive(archive.path(), root, None)?;
     extract_package(archive.path(), root, backups).map_err(|error| ExecError::Extraction {
         pkg: archive.name().to_string(),
         message: format!(
@@ -673,18 +676,21 @@ fn read_installed_packages(db_path: &Path) -> Result<Vec<PackageInfo>> {
 struct OwnershipParent {
     resolved: PathBuf,
     symlinks: Vec<String>,
+    traversed_directories: Vec<PathBuf>,
 }
 
 struct OwnershipPath {
     resolved: String,
     spelling: String,
     symlinks: Vec<String>,
+    traversed_directories: Vec<PathBuf>,
 }
 
 struct PathOwner {
     package: String,
     spelling: String,
     directory: bool,
+    retirement: Option<usize>,
 }
 
 // A marker distinguishes missing ordinary parents (which extraction may create)
@@ -695,7 +701,13 @@ enum OwnershipComponent {
     EndLink,
 }
 
-fn resolve_ownership_parent(root: &Path, parent: &Path, file: &str) -> Result<OwnershipParent> {
+fn resolve_ownership_parent(
+    root: &Path,
+    parent: &Path,
+    file: &str,
+    replacements: &HashSet<PathBuf>,
+    directories: &HashSet<PathBuf>,
+) -> Result<OwnershipParent> {
     use std::collections::VecDeque;
 
     let mut pending: VecDeque<_> = parent
@@ -704,6 +716,7 @@ fn resolve_ownership_parent(root: &Path, parent: &Path, file: &str) -> Result<Ow
         .collect();
     let mut resolved = PathBuf::new();
     let mut symlinks = Vec::new();
+    let mut traversed_directories = Vec::new();
     let mut link_depth = 0;
     let mut followed = 0;
     let mut missing = false;
@@ -730,11 +743,21 @@ fn resolve_ownership_parent(root: &Path, parent: &Path, file: &str) -> Result<Ow
         // Once an ordinary parent is absent, its remaining ordinary children
         // cannot be symlinks. No link target can reach this branch while missing.
         if missing {
+            traversed_directories.push(candidate.clone());
+            resolved = candidate;
+            continue;
+        }
+        if directories.contains(&candidate) {
+            traversed_directories.push(candidate.clone());
             resolved = candidate;
             continue;
         }
         let absolute = root.join(&candidate);
-        let metadata = match std::fs::symlink_metadata(&absolute) {
+        let metadata = match if below_directory_replacement(&candidate, replacements) {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        } else {
+            std::fs::symlink_metadata(&absolute)
+        } {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if link_depth != 0 {
@@ -744,6 +767,7 @@ fn resolve_ownership_parent(root: &Path, parent: &Path, file: &str) -> Result<Ow
                     )));
                 }
                 missing = true;
+                traversed_directories.push(candidate.clone());
                 resolved = candidate;
                 continue;
             }
@@ -802,6 +826,8 @@ fn resolve_ownership_parent(root: &Path, parent: &Path, file: &str) -> Result<Ow
             }
             link_depth += 1;
         } else if metadata.is_dir() {
+            // Keep namespace dependencies even when a later '..' pops them.
+            traversed_directories.push(candidate.clone());
             resolved = candidate;
         } else {
             return Err(invalid_transaction(format!(
@@ -810,7 +836,11 @@ fn resolve_ownership_parent(root: &Path, parent: &Path, file: &str) -> Result<Ow
             )));
         }
     }
-    Ok(OwnershipParent { resolved, symlinks })
+    Ok(OwnershipParent {
+        resolved,
+        symlinks,
+        traversed_directories,
+    })
 }
 
 fn ownership_path(
@@ -818,13 +848,23 @@ fn ownership_path(
     file: &str,
     parents: &mut HashMap<PathBuf, OwnershipParent>,
 ) -> Result<OwnershipPath> {
+    ownership_path_with_directories(root, file, parents, &HashSet::new(), &HashSet::new())
+}
+
+fn ownership_path_with_directories(
+    root: &Path,
+    file: &str,
+    parents: &mut HashMap<PathBuf, OwnershipParent>,
+    replacements: &HashSet<PathBuf>,
+    directories: &HashSet<PathBuf>,
+) -> Result<OwnershipPath> {
     let relative = crate::extract::safe_relative_path(Path::new(file))?;
     let name = relative
         .file_name()
         .ok_or_else(|| invalid_transaction(format!("empty ownership path: {file}")))?;
     let parent = relative.parent().unwrap_or(Path::new(""));
     if !parents.contains_key(parent) {
-        let resolved = resolve_ownership_parent(root, parent, file)?;
+        let resolved = resolve_ownership_parent(root, parent, file, replacements, directories)?;
         parents.insert(parent.to_path_buf(), resolved);
     }
     let parent = &parents[parent];
@@ -840,6 +880,7 @@ fn ownership_path(
             .ok_or_else(|| invalid_transaction(format!("{file}: non-UTF-8 ownership spelling")))?
             .to_string(),
         symlinks: parent.symlinks.clone(),
+        traversed_directories: parent.traversed_directories.clone(),
     })
 }
 
@@ -942,7 +983,54 @@ fn check_file_conflicts_inner(
     let mut parents = HashMap::new();
     let mut directory_aliases = Vec::new();
     let mut old_owners: HashMap<String, Vec<PathOwner>> = HashMap::new();
+    let mut old_symlink_users: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // Empty conversions have no subtree proof; nonempty ones cannot prove paths
+    // resolving outside the traversed candidate either (e.g. through '..').
+    let mut old_directory_users: HashMap<PathBuf, Vec<(String, String)>> = HashMap::new();
+    let mut old_backups = HashSet::new();
+    // Only filter old DB hazards here; this union is never an incoming path view.
+    let conversion_candidates: HashSet<PathBuf> = plans
+        .into_iter()
+        .flat_map(|plans| plans.values())
+        .flat_map(|plan| plan.directory_replacements.iter().cloned())
+        .collect();
+    let leaf_candidates: HashSet<PathBuf> = plans
+        .into_iter()
+        .flat_map(|plans| plans.values())
+        .flat_map(|plan| plan.directory_to_leaf_replacements.iter().cloned())
+        .collect();
+    let deferred_candidates: HashSet<PathBuf> = plans
+        .into_iter()
+        .flat_map(|plans| plans.values())
+        .flat_map(|plan| plan.deferred_directory_replacements.iter().cloned())
+        .collect();
+    // Preserve the actual cleanup order, including linked removals within a slot.
+    let cleanup_positions: HashMap<_, _> = steps
+        .iter()
+        .flat_map(|step| {
+            step.remove_before
+                .iter()
+                .chain(std::iter::once(&step.incoming))
+        })
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
     let local_dir = db_path.join("local");
+    let retiring_entries: HashMap<_, _> = tx
+        .upgrades
+        .iter()
+        .map(|action| (&action.name, &action.old_version))
+        .chain(
+            tx.removals
+                .iter()
+                .map(|action| (&action.name, &action.version)),
+        )
+        .filter_map(|(name, version)| {
+            cleanup_positions
+                .get(name.as_str())
+                .map(|position| (local_dir.join(format!("{name}-{version}")), *position))
+        })
+        .collect();
     match std::fs::read_dir(&local_dir) {
         Ok(entries) => {
             for entry in entries {
@@ -958,8 +1046,65 @@ fn check_file_conflicts_inner(
                     ))
                 })?;
                 let content = read_file_metadata(&entry.path().join("files"))?;
+                if !conversion_candidates.is_empty() || !leaf_candidates.is_empty() {
+                    let mut in_backup = false;
+                    for line in content.lines() {
+                        if line.starts_with('%') || line.is_empty() {
+                            in_backup = line == "%BACKUP%";
+                        } else if in_backup {
+                            let file = line.split('\t').next().unwrap();
+                            let ownership = ownership_path(&root, file, &mut parents)?;
+                            for directory in &ownership.traversed_directories {
+                                if leaf_candidates.contains(directory)
+                                    && (!deferred_candidates.contains(directory)
+                                        || !Path::new(&ownership.resolved).starts_with(directory))
+                                {
+                                    old_directory_users
+                                        .entry(directory.clone())
+                                        .or_default()
+                                        .push((name.clone(), file.to_string()));
+                                }
+                            }
+                            old_backups.insert(ownership.resolved);
+                            for symlink in ownership.symlinks {
+                                if conversion_candidates.contains(Path::new(&symlink))
+                                    || below_directory_replacement(
+                                        Path::new(&symlink),
+                                        &deferred_candidates,
+                                    )
+                                {
+                                    old_symlink_users
+                                        .entry(symlink)
+                                        .or_default()
+                                        .push((name.clone(), file.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
                 for file in parse_file_list(&content) {
                     let ownership = ownership_path(&root, &file, &mut parents)?;
+                    for directory in &ownership.traversed_directories {
+                        if leaf_candidates.contains(directory)
+                            && (!deferred_candidates.contains(directory)
+                                || !Path::new(&ownership.resolved).starts_with(directory))
+                        {
+                            old_directory_users
+                                .entry(directory.clone())
+                                .or_default()
+                                .push((name.clone(), file.clone()));
+                        }
+                    }
+                    for symlink in &ownership.symlinks {
+                        if conversion_candidates.contains(Path::new(symlink))
+                            || below_directory_replacement(Path::new(symlink), &deferred_candidates)
+                        {
+                            old_symlink_users
+                                .entry(symlink.clone())
+                                .or_default()
+                                .push((name.clone(), file.clone()));
+                        }
+                    }
                     if file.ends_with('/') {
                         directory_aliases.push((
                             file.trim_end_matches('/').to_string(),
@@ -973,6 +1118,7 @@ fn check_file_conflicts_inner(
                             package: name.clone(),
                             spelling: ownership.spelling,
                             directory: file.ends_with('/'),
+                            retirement: retiring_entries.get(&entry.path()).copied(),
                         });
                 }
             }
@@ -1007,12 +1153,57 @@ fn check_file_conflicts_inner(
     }
     let mut incoming_owners: HashMap<String, (&str, bool)> = HashMap::new();
     let mut lexical_owners: HashMap<String, (&str, bool)> = HashMap::new();
+    let mut deferred_directories = Vec::new();
     let mut conflicts = Vec::new();
     for (name, package) in incoming {
+        // A package sees only its own earlier explicit conversions, never the
+        // future namespace of another archive or the old DB's parent cache.
+        let plan = plans.and_then(|plans| plans.get(*name));
+        // File lists contain destinations, not hardlink sources. Preserve the
+        // filesystem dependencies proved while inspecting the whole archive.
+        if let Some(plan) = plan {
+            for directory in plan
+                .directory_to_leaf_replacements
+                .difference(&plan.deferred_directory_replacements)
+            {
+                if let Some(users) = old_directory_users.get(directory) {
+                    conflicts.push(format!(
+                        "  {name}: /{} cannot become a non-directory: old database paths traverse this directory: {users:?}; cleanup namespace preservation is not proven",
+                        directory.display(),
+                    ));
+                }
+            }
+            for directory in plan.traversed_directories.intersection(&leaf_candidates) {
+                conflicts.push(format!(
+                    "  {name}: archive payload or hardlink source traverses directory /{} converted to a non-directory in this transaction; namespace preservation is not proven",
+                    directory.display(),
+                ));
+            }
+            for symlink in &plan.traversed_symlinks {
+                let symlink = symlink.to_str().ok_or_else(|| {
+                    invalid_transaction(format!(
+                        "{name}: non-UTF-8 archive symlink dependency {}",
+                        symlink.display()
+                    ))
+                })?;
+                if let Some(owners) = old_owners.get(symlink) {
+                    for owner in owners {
+                        if changing.contains(owner.package.as_str()) {
+                            conflicts.push(format!(
+                                "  {name}: archive payload or hardlink source traverses filesystem symlink /{symlink} owned by changing package {}; namespace preservation is not proven",
+                                owner.package,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let mut new_parents = HashMap::new();
+        let mut replacements = HashSet::new();
+        let mut directories = HashSet::new();
         // Reserve every actual backup's candidate, even if the later three-way
         // decision keeps the old file. Candidates are not package files or hook targets.
-        let backup_destinations: Vec<_> = plans
-            .and_then(|plans| plans.get(*name))
+        let backup_destinations: Vec<_> = plan
             .into_iter()
             .flat_map(|plan| &plan.backups)
             .map(|path| format!("{path}.pacnew"))
@@ -1024,7 +1215,13 @@ fn check_file_conflicts_inner(
             .chain(backup_destinations.iter().map(|file| (file, true)))
         {
             let directory = file.ends_with('/');
-            let ownership = ownership_path(&root, file, &mut parents)?;
+            let ownership = ownership_path_with_directories(
+                &root,
+                file,
+                &mut new_parents,
+                &replacements,
+                &directories,
+            )?;
             // File lists cannot prove that an upgraded symlink keeps its target.
             // Check every traversed link, including links inside other link targets.
             for symlink in &ownership.symlinks {
@@ -1040,6 +1237,55 @@ fn check_file_conflicts_inner(
                 }
             }
             let path = ownership.resolved;
+            if !directory
+                && !backup_destination
+                && plan.is_some_and(|plan| {
+                    plan.deferred_directory_replacements
+                        .contains(Path::new(&path))
+                })
+            {
+                deferred_directories.push((*name, path.clone(), ownership.spelling.clone()));
+            }
+            let conversion = directory
+                && plan.is_some_and(|plan| plan.directory_replacements.contains(Path::new(&path)));
+            if conversion {
+                if !old_owners.get(&path).is_some_and(|owners| {
+                    !owners.is_empty()
+                        && owners.iter().all(|owner| {
+                            !owner.directory && changing.contains(owner.package.as_str())
+                        })
+                }) {
+                    conflicts.push(format!(
+                        "  {name}: /{path} symlink-to-directory replacement requires changing old owners with non-directory records"
+                    ));
+                }
+                if let Some(users) = old_symlink_users.get(&path) {
+                    for (owner, old_file) in users {
+                        conflicts.push(format!(
+                            "  {name}: /{path} cannot become a directory: old database path /{old_file} from {owner} traverses this symlink; cleanup and backup namespace preservation is not proven"
+                        ));
+                    }
+                }
+                if old_backups.contains(&path) {
+                    conflicts.push(format!(
+                        "  {name}: /{path} cannot replace a symlink declared as an installed backup"
+                    ));
+                }
+                if replacements.insert(PathBuf::from(&path)) {
+                    new_parents.clear();
+                }
+            }
+            // Model only directories created inside this archive's converted
+            // subtree; unrelated live aliases must remain visible to the guards.
+            if !replacements.is_empty() {
+                for parent in Path::new(&path).ancestors().skip(usize::from(!directory)) {
+                    if replacements.contains(parent)
+                        || below_directory_replacement(parent, &replacements)
+                    {
+                        directories.insert(parent.to_path_buf());
+                    }
+                }
+            }
             lexical_owners.insert(file.trim_end_matches('/').to_string(), (*name, directory));
             if directory {
                 directory_aliases.push((file.trim_end_matches('/').to_string(), path.clone()));
@@ -1062,14 +1308,14 @@ fn check_file_conflicts_inner(
                         && !removals.contains_key(owner.package.as_str());
                     if retained_backup_owner
                         || (!changing.contains(owner.package.as_str())
-                            && !(directory && owner.directory))
+                            && (conversion || !(directory && owner.directory)))
                     {
                         conflicts.push(format!(
                             "  {name}: /{path} already owned by {}",
                             owner.package
                         ));
                     }
-                    if !(directory && owner.directory)
+                    if (conversion || !(directory && owner.directory))
                         && upgraded.contains(owner.package.as_str())
                         && owner.spelling != ownership.spelling
                     {
@@ -1078,7 +1324,7 @@ fn check_file_conflicts_inner(
                             ownership.spelling, owner.spelling, owner.package,
                         ));
                     }
-                    if !(directory && owner.directory)
+                    if (conversion || !(directory && owner.directory))
                         && removals.get(owner.package.as_str()).is_some_and(|slot| {
                             positions
                                 .get(name)
@@ -1087,11 +1333,25 @@ fn check_file_conflicts_inner(
                     {
                         conflicts.push(format!("  {name}: /{path} would be installed before old owner {} is removed; linked removal would delete the new payload", owner.package));
                     }
+                    if conversion
+                        && owner.package != *name
+                        && upgraded.contains(owner.package.as_str())
+                        && positions.get(owner.package.as_str()).is_some_and(|slot| {
+                            positions
+                                .get(name)
+                                .is_some_and(|incoming_slot| slot > incoming_slot)
+                        })
+                    {
+                        conflicts.push(format!(
+                            "  {name}: /{path} would replace a symlink before old owner {} is upgraded",
+                            owner.package
+                        ));
+                    }
                 }
             }
             // Existing unowned .pacnew files and final symlinks/hardlinks are
             // legitimate staging destinations, not payload conflicts.
-            if backup_destination {
+            if backup_destination || below_directory_replacement(Path::new(&path), &replacements) {
                 continue;
             }
             match std::fs::symlink_metadata(root.join(&path)) {
@@ -1137,6 +1397,158 @@ fn check_file_conflicts_inner(
                 ));
             }
             parent = directory.parent();
+        }
+    }
+    for (name, path, spelling) in deferred_directories {
+        let reject = |reason: String| {
+            ExecError::FileConflict(format!(
+                "  {name}: /{path}: cannot replace a nonempty directory: {reason}"
+            ))
+        };
+        if retained_directories.contains(&path) {
+            return Err(reject(
+                "directory is needed by retained or incoming descendants".into(),
+            ));
+        }
+        if let Some(backup) = old_backups
+            .iter()
+            .find(|backup| Path::new(backup).starts_with(&path))
+        {
+            return Err(reject(format!(
+                "installed backup /{backup} must be preserved"
+            )));
+        }
+        if let Some((link, users)) = old_symlink_users
+            .iter()
+            .find(|(link, _)| Path::new(link).starts_with(&path))
+        {
+            return Err(reject(format!(
+                "old database paths traverse /{link}: {users:?}; cleanup namespace preservation is not proven"
+            )));
+        }
+        if let Some(users) = old_directory_users.get(Path::new(&path)) {
+            return Err(reject(format!(
+                "old database paths traverse directory /{path} before resolving outside it: {users:?}; cleanup namespace preservation is not proven"
+            )));
+        }
+        let position = cleanup_positions
+            .get(name)
+            .copied()
+            .ok_or_else(|| reject("missing execution slot".into()))?;
+        // Even an absent DB path is a future cleanup operation. After this
+        // directory becomes a symlink, late cleanup could unlink its new target.
+        for (old_path, owners) in &old_owners {
+            let Ok(relative) = Path::new(old_path).strip_prefix(&path) else {
+                continue;
+            };
+            let lexical = Path::new(&spelling).join(relative);
+            for owner in owners {
+                if Path::new(&owner.spelling) != lexical {
+                    return Err(reject(format!(
+                        "old database path /{old_path}: owner {} uses unproven cleanup spelling /{}",
+                        owner.package, owner.spelling
+                    )));
+                }
+                if !owner
+                    .retirement
+                    .is_some_and(|retirement| retirement <= position)
+                {
+                    return Err(reject(format!(
+                        "old database path /{old_path}: owner {} does not retire this entry before directory conversion",
+                        owner.package
+                    )));
+                }
+            }
+        }
+        let mut pending = vec![(PathBuf::from(&path), PathBuf::from(&spelling), position)];
+        while let Some((current, lexical, deadline)) = pending.pop() {
+            let absolute = root.join(&current);
+            let metadata = std::fs::symlink_metadata(&absolute).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{name}: inspect deferred directory entry {}: {error}",
+                        absolute.display()
+                    ),
+                )
+            })?;
+            let current_name = current.to_str().ok_or_else(|| {
+                reject(format!(
+                    "non-UTF-8 entry {} has no exact database ownership",
+                    absolute.display()
+                ))
+            })?;
+            let owners = old_owners
+                .get(current_name)
+                .filter(|owners| !owners.is_empty())
+                .ok_or_else(|| {
+                    reject(format!(
+                        "/{current_name} has no exact old database ownership"
+                    ))
+                })?;
+            let mut last_cleanup = 0;
+            for owner in owners {
+                if Path::new(&owner.spelling) != lexical || owner.directory != metadata.is_dir() {
+                    return Err(reject(format!(
+                        "/{current_name}: owner {} has a different spelling or entry type (/{})",
+                        owner.package, owner.spelling
+                    )));
+                }
+                let retirement = owner.retirement.filter(|retirement| *retirement <= deadline).ok_or_else(|| reject(format!(
+                    "/{current_name}: owner {} does not retire this entry before extraction and its parent cleanup", owner.package
+                )))?;
+                last_cleanup = last_cleanup.max(retirement);
+            }
+            let filename = current
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if filename.ends_with(".pacsave")
+                || filename
+                    .rsplit_once(".pacsave.")
+                    .is_some_and(|(_, suffix)| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            {
+                return Err(reject(format!(
+                    "/{current_name} is a preserved .pacsave path"
+                )));
+            }
+            // lstat leaves links as leaves: never walk their targets. Every real
+            // subdirectory must have a cleanup after its children; the candidate
+            // root alone may be retained for extraction's empty-only remove_dir.
+            if metadata.is_dir() {
+                let deadline = if current == Path::new(&path) {
+                    deadline
+                } else {
+                    last_cleanup
+                };
+                let children = std::fs::read_dir(&absolute).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{name}: read deferred directory {}: {error}",
+                            absolute.display()
+                        ),
+                    )
+                })?;
+                for child in children {
+                    let child = child.map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "{name}: read entry in deferred directory {}: {error}",
+                                absolute.display()
+                            ),
+                        )
+                    })?;
+                    pending.push((
+                        current.join(child.file_name()),
+                        lexical.join(child.file_name()),
+                        deadline,
+                    ));
+                }
+            }
         }
     }
     conflicts.sort();
@@ -2465,15 +2877,30 @@ mod tests {
             assert_eq!(path.resolved, format!("real/implicit/{file}"));
             assert_eq!(path.spelling, format!("alias1/implicit/{file}"));
             assert_eq!(path.symlinks, ["alias1", "alias2"]);
+            assert_eq!(
+                path.traversed_directories,
+                [
+                    PathBuf::from("real"),
+                    PathBuf::from("real/sub"),
+                    PathBuf::from("real/implicit")
+                ]
+            );
             assert_eq!(parents.len(), 1);
         }
         let link = ownership_path(&root, "alias1", &mut parents).unwrap();
         assert_eq!(link.resolved, "alias1");
         assert!(link.symlinks.is_empty());
+        assert!(link.traversed_directories.is_empty());
+        let directory = ownership_path(&root, "real/", &mut parents).unwrap();
+        assert!(directory.traversed_directories.is_empty());
         std::os::unix::fs::symlink(root.join("alias1"), root.join("absolute")).unwrap();
         let path = ownership_path(&root, "absolute/file", &mut parents).unwrap();
         assert_eq!(path.resolved, "real/file");
         assert_eq!(path.symlinks, ["absolute", "alias1", "alias2"]);
+        assert_eq!(
+            path.traversed_directories,
+            [PathBuf::from("real"), PathBuf::from("real/sub")]
+        );
         assert!(!root.join("real/implicit").exists());
     }
 
@@ -2551,6 +2978,1526 @@ mod tests {
         DownloadedPackage {
             name: name.into(),
             path,
+        }
+    }
+
+    fn directory_conversion_archive(
+        dir: &Path,
+        name: &str,
+        version: &str,
+        members: &[(&str, tar::EntryType, &str)],
+        backup: Option<&str>,
+    ) -> DownloadedPackage {
+        let path = dir.join(format!("{name}-{version}.pkg.tar"));
+        let mut builder = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        let mut info = format!("pkgname = {name}\npkgver = {version}\narch = any\n");
+        if let Some(backup) = backup {
+            info.push_str(&format!("backup = {backup}\n"));
+        }
+        for (path, kind, contents) in
+            std::iter::once((".PKGINFO", tar::EntryType::Regular, info.as_str()))
+                .chain(members.iter().copied())
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(if kind.is_dir() { 0o755 } else { 0o644 });
+            header.set_mtime(1);
+            let bytes = if kind.is_symlink() || kind.is_hard_link() {
+                header.set_link_name(contents).unwrap();
+                b"".as_slice()
+            } else {
+                contents.as_bytes()
+            };
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, bytes).unwrap();
+        }
+        builder.finish().unwrap();
+        DownloadedPackage {
+            name: name.into(),
+            path,
+        }
+    }
+
+    #[test]
+    fn root_owned_empty_directory_to_leaf_preserves_foreign_target() {
+        use std::os::unix::fs::MetadataExt;
+        use tar::EntryType::{Link, Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for kind in [Regular, Symlink, Link] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            std::fs::create_dir_all(root.join("empty")).unwrap();
+            std::fs::create_dir(root.join("target")).unwrap();
+            std::fs::write(root.join("target/sentinel"), "keep foreign target").unwrap();
+            let sentinel = std::fs::metadata(root.join("target/sentinel")).unwrap();
+            let old = alias_test_entry(&db, "old", "%FILES%\nempty/\n\n");
+            let foreign_files = "%FILES%\ntarget/\ntarget/sentinel\n\n";
+            let foreign = alias_test_entry(&db, "foreign", foreign_files);
+            let raw = directory_conversion_archive(
+                temp.path(),
+                "old",
+                "2-1",
+                &[
+                    ("source", Regular, "new source"),
+                    (
+                        "empty",
+                        kind,
+                        if kind == Link { "source" } else { "target" },
+                    ),
+                ],
+                None,
+            );
+            let downloaded = prepare_archives(&db, &[raw]);
+            let mut tx = transaction(&[]);
+            tx.upgrades.push(alias_test_upgrade("old"));
+            tx.package_order.push("old".into());
+            let hooks = masked_hooks(temp.path());
+            let mut logger = PaxLogger::open(&temp.path().join("log"));
+            execute_transaction(
+                &tx,
+                &mut InstallContext {
+                    root_dir: &root,
+                    db_path: &db,
+                    architecture: "auto",
+                    downloaded: &downloaded,
+                    old_install_scripts: &HashMap::new(),
+                    old_backup_md5: &HashMap::new(),
+                    hook_dirs: &[hooks],
+                    check_space: false,
+                    logger: &mut logger,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+            if kind == Symlink {
+                assert_eq!(
+                    std::fs::read_link(root.join("empty")).unwrap(),
+                    Path::new("target")
+                );
+            } else {
+                assert!(
+                    std::fs::symlink_metadata(root.join("empty"))
+                        .unwrap()
+                        .is_file()
+                );
+                let contents = if kind == Link {
+                    b"new source".as_slice()
+                } else {
+                    b"target".as_slice()
+                };
+                assert_eq!(std::fs::read(root.join("empty")).unwrap(), contents);
+                if kind == Link {
+                    assert_eq!(
+                        std::fs::metadata(root.join("empty")).unwrap().ino(),
+                        std::fs::metadata(root.join("source")).unwrap().ino()
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read(root.join("target/sentinel")).unwrap(),
+                b"keep foreign target"
+            );
+            assert_eq!(
+                std::fs::metadata(root.join("target/sentinel"))
+                    .unwrap()
+                    .ino(),
+                sentinel.ino()
+            );
+            assert_eq!(
+                std::fs::read_to_string(foreign.join("files")).unwrap(),
+                foreign_files
+            );
+            assert!(!old.exists());
+            assert_eq!(
+                read_file_list(&db, "old", "2-1").unwrap(),
+                ["source", "empty"]
+            );
+        }
+    }
+
+    #[test]
+    fn root_owned_nonempty_directory_to_leaf_preserves_link_targets() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        use tar::EntryType::{Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for kind in [Regular, Symlink] {
+            for alias in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("root");
+                let db = temp.path().join("db");
+                std::fs::create_dir_all(root.join("usr/include/vapoursynth/nested")).unwrap();
+                std::fs::create_dir_all(root.join("usr/include/target")).unwrap();
+                symlink("usr/include", root.join("include")).unwrap();
+                let prefix = if alias {
+                    "include/vapoursynth"
+                } else {
+                    "usr/include/vapoursynth"
+                };
+                let target = temp.path().join("outside");
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("sentinel"), "keep external target").unwrap();
+                std::fs::write(root.join("usr/include/target/sentinel"), "keep new target")
+                    .unwrap();
+                let sentinel = std::fs::metadata(target.join("sentinel")).unwrap();
+                std::fs::write(root.join(prefix).join("nested/file"), "obsolete").unwrap();
+                symlink(&target, root.join(prefix).join("nested/link")).unwrap();
+                std::fs::hard_link(target.join("sentinel"), root.join(prefix).join("hardlink"))
+                    .unwrap();
+                let old = alias_test_entry(
+                    &db,
+                    "old",
+                    &format!(
+                        "%FILES%\n{prefix}/\n{prefix}/nested/\n{prefix}/nested/file\n{prefix}/nested/link\n{prefix}/hardlink\n\n"
+                    ),
+                );
+                let raw = directory_conversion_archive(
+                    temp.path(),
+                    "old",
+                    "2-1",
+                    &[(prefix, kind, "target")],
+                    None,
+                );
+                let downloaded = prepare_archives(&db, &[raw]);
+                let mut tx = transaction(&[]);
+                tx.upgrades.push(alias_test_upgrade("old"));
+                tx.package_order.push("old".into());
+                let hooks = masked_hooks(temp.path());
+                let mut logger = PaxLogger::open(&temp.path().join("log"));
+                execute_transaction(
+                    &tx,
+                    &mut InstallContext {
+                        root_dir: &root,
+                        db_path: &db,
+                        architecture: "auto",
+                        downloaded: &downloaded,
+                        old_install_scripts: &HashMap::new(),
+                        old_backup_md5: &HashMap::new(),
+                        hook_dirs: &[hooks],
+                        check_space: false,
+                        logger: &mut logger,
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{kind:?}, alias={alias}: {error}"));
+                let metadata = std::fs::symlink_metadata(root.join(prefix)).unwrap();
+                if kind == Symlink {
+                    assert!(metadata.file_type().is_symlink());
+                    assert_eq!(
+                        std::fs::read_link(root.join(prefix)).unwrap(),
+                        Path::new("target")
+                    );
+                } else {
+                    assert!(metadata.is_file());
+                    assert_eq!(std::fs::read(root.join(prefix)).unwrap(), b"target");
+                }
+                assert_eq!(
+                    std::fs::read(target.join("sentinel")).unwrap(),
+                    b"keep external target"
+                );
+                assert_eq!(
+                    std::fs::metadata(target.join("sentinel")).unwrap().ino(),
+                    sentinel.ino()
+                );
+                assert_eq!(
+                    std::fs::read(root.join("usr/include/target/sentinel")).unwrap(),
+                    b"keep new target"
+                );
+                assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+                assert_eq!(
+                    std::fs::read_dir(root.join("usr/include/target"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                assert!(!old.exists());
+                assert_eq!(read_file_list(&db, "old", "2-1").unwrap(), [prefix]);
+            }
+        }
+    }
+
+    #[test]
+    fn root_nonempty_directory_accepts_earlier_upgrade_and_linked_cleanup() {
+        use tar::EntryType::{Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for scenario in ["earlier-upgrade", "earlier-removal", "same-slot-removal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            std::fs::create_dir_all(root.join("tree/nested")).unwrap();
+            std::fs::write(root.join("tree/nested/file"), "obsolete").unwrap();
+            std::fs::create_dir(root.join("target")).unwrap();
+            std::fs::write(root.join("target/victim"), "keep retained target").unwrap();
+            alias_test_entry(&db, "retained", "%FILES%\ntarget/\ntarget/victim\n\n");
+            assert!(!root.join("tree/victim").exists());
+            alias_test_entry(&db, "old", "%FILES%\ntree/\n\n");
+            let other = alias_test_entry(
+                &db,
+                "other",
+                "%FILES%\ntree/nested/\ntree/nested/file\ntree/victim\n\n",
+            );
+            let mut tx = transaction(&[]);
+            tx.upgrades.push(alias_test_upgrade("old"));
+            tx.package_order.push("old".into());
+            let mut raw = vec![directory_conversion_archive(
+                temp.path(),
+                "old",
+                "2-1",
+                &[("tree", Symlink, "target")],
+                None,
+            )];
+            if scenario == "earlier-upgrade" {
+                tx.upgrades.push(alias_test_upgrade("other"));
+                tx.package_order.insert(0, "other".into());
+                raw.push(directory_conversion_archive(
+                    temp.path(),
+                    "other",
+                    "2-1",
+                    &[("other-new", Regular, "new")],
+                    None,
+                ));
+            } else {
+                let anchor = if scenario == "earlier-removal" {
+                    "early"
+                } else {
+                    "old"
+                };
+                if anchor == "early" {
+                    tx.installs = transaction(&["early"]).installs;
+                    tx.package_order.insert(0, "early".into());
+                    raw.push(alias_test_archive(temp.path(), "early", "1-1", "early-new"));
+                }
+                tx.removals.push(pax_resolver::RemovalAction {
+                    name: "other".into(),
+                    version: Version::parse("1-1").unwrap(),
+                    links: vec![pax_resolver::RemovalLink {
+                        incoming: anchor.into(),
+                        reason: RemovalReason::Replaced,
+                    }],
+                });
+            }
+            let downloaded = prepare_archives(&db, &raw);
+            let hooks = masked_hooks(temp.path());
+            let mut logger = PaxLogger::open(&temp.path().join("log"));
+            execute_transaction(
+                &tx,
+                &mut InstallContext {
+                    root_dir: &root,
+                    db_path: &db,
+                    architecture: "auto",
+                    downloaded: &downloaded,
+                    old_install_scripts: &HashMap::new(),
+                    old_backup_md5: &HashMap::new(),
+                    hook_dirs: &[hooks],
+                    check_space: false,
+                    logger: &mut logger,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{scenario}: {error}"));
+            assert_eq!(
+                std::fs::read_link(root.join("tree")).unwrap(),
+                Path::new("target")
+            );
+            assert_eq!(read_file_list(&db, "old", "2-1").unwrap(), ["tree"]);
+            assert!(!other.exists());
+            assert_eq!(
+                std::fs::read(root.join("tree/victim")).unwrap(),
+                b"keep retained target"
+            );
+            assert_eq!(
+                std::fs::read(root.join("target/victim")).unwrap(),
+                b"keep retained target"
+            );
+            assert_eq!(
+                read_file_list(&db, "retained", "1-1").unwrap(),
+                ["target/", "target/victim"]
+            );
+        }
+    }
+
+    #[test]
+    fn root_nonempty_directory_blockers_precede_hooks_and_mutation() {
+        use std::os::unix::fs::symlink;
+        use tar::EntryType::{Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for scenario in [
+            "unowned-root",
+            "unowned-file",
+            "unowned-subdir",
+            "unowned-pacsave",
+            "owned-pacsave",
+            "backup-child",
+            "backup-root",
+            "backup-missing",
+            "retained-child",
+            "retained-missing",
+            "incoming-child",
+            "later-upgrade",
+            "later-removal",
+            "absent-late-upgrade",
+            "absent-late-removal",
+            "absent-cross-spelling",
+            "early-parent-cleanup",
+            "cross-spelling-root",
+            "cross-spelling-child",
+            "old-traversal",
+            "wrong-directory-record",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            std::fs::create_dir_all(root.join("tree/nested")).unwrap();
+            std::fs::create_dir_all(root.join("target")).unwrap();
+            std::fs::write(root.join("tree/nested/file"), "old contents").unwrap();
+            std::fs::write(root.join("target/sentinel"), "keep target").unwrap();
+            symlink("tree", root.join("alias")).unwrap();
+            let mut files = vec!["tree/", "tree/nested/", "tree/nested/file"];
+            let mut backup = "";
+            let mut other_files = "";
+            match scenario {
+                "unowned-root" => {
+                    files.remove(0);
+                }
+                "wrong-directory-record" => files[0] = "tree",
+                "cross-spelling-root" => {
+                    files = vec!["alias/", "alias/nested/", "alias/nested/file"]
+                }
+                "cross-spelling-child" => files[2] = "alias/nested/file",
+                "unowned-file" => std::fs::write(root.join("tree/local"), "keep local").unwrap(),
+                "unowned-subdir" => std::fs::create_dir(root.join("tree/local-dir")).unwrap(),
+                "unowned-pacsave" | "owned-pacsave" => {
+                    std::fs::write(root.join("tree/file.pacsave"), "keep pacsave").unwrap();
+                    if scenario == "owned-pacsave" {
+                        files.push("tree/file.pacsave");
+                    }
+                }
+                "backup-child" => backup = "%BACKUP%\ntree/nested/file\tlegacy\n\n",
+                "backup-root" => backup = "%BACKUP%\ntree\tlegacy\n\n",
+                "backup-missing" => backup = "%BACKUP%\ntree/missing\n\n",
+                "retained-child" => {
+                    files.pop();
+                    alias_test_entry(&db, "retained", "%FILES%\ntree/nested/file\n\n");
+                }
+                "retained-missing" => {
+                    alias_test_entry(&db, "retained", "%FILES%\ntree/missing\n\n");
+                }
+                "later-upgrade" | "later-removal" => {
+                    files.pop();
+                    other_files = "%FILES%\ntree/nested/file\n\n";
+                }
+                "absent-late-upgrade" | "absent-late-removal" | "absent-cross-spelling" => {
+                    other_files = if scenario == "absent-cross-spelling" {
+                        "%FILES%\nalias/victim\n\n"
+                    } else {
+                        "%FILES%\ntree/victim\n\n"
+                    };
+                    std::fs::write(root.join("target/victim"), "keep retained target").unwrap();
+                    alias_test_entry(&db, "retained", "%FILES%\ntarget/\ntarget/victim\n\n");
+                    assert!(!root.join("tree/victim").exists());
+                }
+                "early-parent-cleanup" => {
+                    files.remove(1);
+                    other_files = "%FILES%\ntree/nested/\n\n";
+                }
+                "old-traversal" => {
+                    symlink("../target", root.join("tree/link")).unwrap();
+                    files.extend(["tree/link", "tree/link/sentinel"]);
+                }
+                _ => {}
+            }
+            let old_contents = format!("%FILES%\n{}\n\n{backup}", files.join("\n"));
+            let old = alias_test_entry(&db, "old", &old_contents);
+            let old_desc = std::fs::read(old.join("desc")).unwrap();
+            let mut tx = transaction(&[]);
+            tx.upgrades.push(alias_test_upgrade("old"));
+            tx.package_order.push("old".into());
+            let mut raw = vec![directory_conversion_archive(
+                temp.path(),
+                "old",
+                "2-1",
+                &[
+                    ("first-payload", Regular, "must not install"),
+                    ("tree", Symlink, "target"),
+                ],
+                None,
+            )];
+            if !other_files.is_empty() {
+                alias_test_entry(&db, "other", other_files);
+                if matches!(scenario, "later-removal" | "absent-late-removal") {
+                    tx.installs = transaction(&["late"]).installs;
+                    tx.package_order.push("late".into());
+                    tx.removals.push(pax_resolver::RemovalAction {
+                        name: "other".into(),
+                        version: Version::parse("1-1").unwrap(),
+                        links: vec![pax_resolver::RemovalLink {
+                            incoming: "late".into(),
+                            reason: RemovalReason::Replaced,
+                        }],
+                    });
+                    raw.push(alias_test_archive(
+                        temp.path(),
+                        "late",
+                        "1-1",
+                        "later-payload",
+                    ));
+                } else {
+                    tx.upgrades.push(alias_test_upgrade("other"));
+                    if matches!(scenario, "early-parent-cleanup" | "absent-cross-spelling") {
+                        tx.package_order.insert(0, "other".into());
+                    } else {
+                        tx.package_order.push("other".into());
+                    }
+                    raw.push(alias_test_archive(
+                        temp.path(),
+                        "other",
+                        "2-1",
+                        "later-payload",
+                    ));
+                }
+            }
+            if scenario == "incoming-child" {
+                tx.installs = transaction(&["new"]).installs;
+                tx.package_order.push("new".into());
+                raw.push(alias_test_archive(
+                    temp.path(),
+                    "new",
+                    "1-1",
+                    "tree/nested/next",
+                ));
+            }
+            let downloaded = prepare_archives(&db, &raw);
+            let hooks = masked_hooks(temp.path());
+            std::fs::write(hooks.join("00-nonempty-probe.hook"),
+                "[Trigger]\nType = Package\nOperation = Install\nOperation = Upgrade\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
+            let log = temp.path().join("log");
+            let mut logger = PaxLogger::open(&log);
+            let error = execute_transaction(
+                &tx,
+                &mut InstallContext {
+                    root_dir: &root,
+                    db_path: &db,
+                    architecture: "auto",
+                    downloaded: &downloaded,
+                    old_install_scripts: &HashMap::new(),
+                    old_backup_md5: &HashMap::new(),
+                    hook_dirs: &[hooks],
+                    check_space: false,
+                    logger: &mut logger,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ExecError::FileConflict(_)),
+                "{scenario}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot replace a nonempty directory"),
+                "{scenario}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(root.join("tree/nested/file")).unwrap(),
+                b"old contents",
+                "{scenario}"
+            );
+            assert_eq!(
+                std::fs::read(root.join("target/sentinel")).unwrap(),
+                b"keep target"
+            );
+            assert_eq!(
+                std::fs::read_to_string(old.join("files")).unwrap(),
+                old_contents
+            );
+            assert_eq!(std::fs::read(old.join("desc")).unwrap(), old_desc);
+            assert!(!root.join("first-payload").exists());
+            assert!(!root.join("later-payload").exists());
+            assert!(!db.join("local/old-2-1").exists());
+            assert!(
+                !std::fs::read_to_string(log)
+                    .unwrap()
+                    .contains("transaction started")
+            );
+            if scenario.starts_with("absent-") {
+                let message = error.to_string();
+                assert!(
+                    message.contains("old database path /tree/victim: owner other"),
+                    "{scenario}: {error}"
+                );
+                let reason = if scenario == "absent-cross-spelling" {
+                    "unproven cleanup spelling /alias/victim"
+                } else {
+                    "does not retire this entry before directory conversion"
+                };
+                assert!(message.contains(reason), "{scenario}: {error}");
+                assert!(
+                    std::fs::symlink_metadata(root.join("tree"))
+                        .unwrap()
+                        .is_dir()
+                );
+                assert!(!root.join("tree/victim").exists());
+                assert_eq!(
+                    std::fs::read(root.join("target/victim")).unwrap(),
+                    b"keep retained target"
+                );
+                assert_eq!(
+                    read_file_list(&db, "retained", "1-1").unwrap(),
+                    ["target/", "target/victim"]
+                );
+                assert_eq!(
+                    std::fs::read_to_string(db.join("local/other-1-1/files")).unwrap(),
+                    other_files
+                );
+                assert!(!db.join("local/other-2-1").exists());
+                assert!(!db.join("local/late-1-1").exists());
+            }
+            if scenario.ends_with("pacsave") {
+                assert_eq!(
+                    std::fs::read(root.join("tree/file.pacsave")).unwrap(),
+                    b"keep pacsave"
+                );
+            }
+            if scenario == "unowned-file" {
+                assert_eq!(
+                    std::fs::read(root.join("tree/local")).unwrap(),
+                    b"keep local"
+                );
+            }
+            if scenario == "unowned-subdir" {
+                assert!(root.join("tree/local-dir").is_dir());
+            }
+        }
+    }
+
+    #[test]
+    fn root_nonempty_directory_rejects_alias_dotdot_namespace_changes_before_hooks() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        use tar::EntryType::{Link, Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for scenario in [
+            "old-missing-late-upgrade",
+            "old-missing-late-removal",
+            "incoming-path",
+            "incoming-hardlink-source",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            for directory in ["tree", "landing", "other/dir", "other/landing"] {
+                std::fs::create_dir_all(root.join(directory)).unwrap();
+            }
+            std::fs::write(root.join("tree/obsolete"), "old contents").unwrap();
+            std::fs::write(root.join("other/landing/victim"), "keep C target").unwrap();
+            let sentinel = std::fs::metadata(root.join("other/landing/victim")).unwrap();
+            symlink("tree/../landing", root.join("alias")).unwrap();
+            alias_test_entry(&db, "a", "%FILES%\ntree/\ntree/obsolete\n\n");
+            alias_test_entry(
+                &db,
+                "c",
+                "%FILES%\nother/\nother/dir/\nother/landing/\nother/landing/victim\n\n",
+            );
+            let mut parents = HashMap::new();
+            let alias = ownership_path(&root, "alias/victim", &mut parents).unwrap();
+            assert_eq!(alias.resolved, "landing/victim");
+            assert_eq!(
+                alias.traversed_directories,
+                [PathBuf::from("tree"), PathBuf::from("landing")]
+            );
+            assert!(!root.join("alias/victim").exists());
+
+            let mut tx = transaction(&[]);
+            tx.upgrades.push(alias_test_upgrade("a"));
+            tx.package_order.push("a".into());
+            let a = directory_conversion_archive(
+                temp.path(),
+                "a",
+                "2-1",
+                &[
+                    ("a-new", Regular, "must not install"),
+                    ("tree", Symlink, "other/dir"),
+                ],
+                None,
+            );
+            let a_plan =
+                crate::preflight::inspect_transaction_archive(&a.path, &root, None).unwrap();
+            assert!(a_plan.traversed_directories.is_empty());
+            assert_eq!(
+                a_plan.deferred_directory_replacements,
+                HashSet::from([PathBuf::from("tree")])
+            );
+            let mut raw = vec![a];
+            if scenario.starts_with("old-") {
+                // There is deliberately no tree/ record in B and no current victim.
+                alias_test_entry(&db, "b", "%FILES%\nalias/victim\n\n");
+                if scenario == "old-missing-late-upgrade" {
+                    tx.upgrades.push(alias_test_upgrade("b"));
+                    tx.package_order.push("b".into());
+                    raw.push(alias_test_archive(temp.path(), "b", "2-1", "b-new"));
+                } else {
+                    tx.installs = transaction(&["replacement"]).installs;
+                    tx.package_order.push("replacement".into());
+                    tx.removals.push(pax_resolver::RemovalAction {
+                        name: "b".into(),
+                        version: Version::parse("1-1").unwrap(),
+                        links: vec![pax_resolver::RemovalLink {
+                            incoming: "replacement".into(),
+                            reason: RemovalReason::Replaced,
+                        }],
+                    });
+                    raw.push(alias_test_archive(
+                        temp.path(),
+                        "replacement",
+                        "1-1",
+                        "b-new",
+                    ));
+                }
+            } else {
+                tx.installs = transaction(&["b"]).installs;
+                tx.package_order.push("b".into());
+                let members = if scenario == "incoming-path" {
+                    vec![("alias/victim", Regular, "must not overwrite C")]
+                } else {
+                    vec![
+                        ("landing/victim", Regular, "new source"),
+                        ("copy", Link, "alias/victim"),
+                    ]
+                };
+                // No alias/ header: only the parent traversal depends on tree.
+                let b = directory_conversion_archive(temp.path(), "b", "1-1", &members, None);
+                let b_plan = crate::preflight::inspect_archive(&b.path, &root, None).unwrap();
+                assert!(b_plan.traversed_directories.contains(Path::new("tree")));
+                assert_eq!(
+                    b_plan.traversed_symlinks,
+                    HashSet::from([PathBuf::from("alias")])
+                );
+                raw.push(b);
+            }
+            let old_entries: Vec<_> = std::fs::read_dir(db.join("local"))
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let desc = std::fs::read(path.join("desc")).unwrap();
+                    let files = std::fs::read(path.join("files")).unwrap();
+                    (path, desc, files)
+                })
+                .collect();
+            let downloaded = prepare_archives(&db, &raw);
+            let hooks = masked_hooks(temp.path());
+            std::fs::write(hooks.join("00-dotdot-probe.hook"),
+                "[Trigger]\nType = Package\nOperation = Install\nOperation = Upgrade\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
+            let log = temp.path().join("log");
+            let mut logger = PaxLogger::open(&log);
+            let error = execute_transaction(
+                &tx,
+                &mut InstallContext {
+                    root_dir: &root,
+                    db_path: &db,
+                    architecture: "auto",
+                    downloaded: &downloaded,
+                    old_install_scripts: &HashMap::new(),
+                    old_backup_md5: &HashMap::new(),
+                    hook_dirs: &[hooks],
+                    check_space: false,
+                    logger: &mut logger,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ExecError::FileConflict(_)),
+                "{scenario}: {error}"
+            );
+            let expected = if scenario.starts_with("old-") {
+                "old database paths traverse directory /tree before resolving outside it"
+            } else {
+                "b: archive payload or hardlink source traverses directory /tree"
+            };
+            assert!(error.to_string().contains(expected), "{scenario}: {error}");
+            assert!(
+                std::fs::symlink_metadata(root.join("tree"))
+                    .unwrap()
+                    .is_dir()
+            );
+            assert_eq!(
+                std::fs::read(root.join("tree/obsolete")).unwrap(),
+                b"old contents"
+            );
+            assert_eq!(
+                std::fs::read(root.join("other/landing/victim")).unwrap(),
+                b"keep C target"
+            );
+            assert_eq!(
+                std::fs::metadata(root.join("other/landing/victim"))
+                    .unwrap()
+                    .ino(),
+                sentinel.ino()
+            );
+            assert!(root.join("other/dir").is_dir());
+            assert_eq!(
+                std::fs::read_link(root.join("alias")).unwrap(),
+                Path::new("tree/../landing")
+            );
+            for absent in ["landing/victim", "alias/victim", "a-new", "b-new", "copy"] {
+                assert!(!root.join(absent).exists(), "{scenario}: {absent}");
+            }
+            assert_eq!(
+                std::fs::read_dir(db.join("local")).unwrap().count(),
+                old_entries.len()
+            );
+            for (path, desc, files) in old_entries {
+                assert_eq!(std::fs::read(path.join("desc")).unwrap(), desc);
+                assert_eq!(std::fs::read(path.join("files")).unwrap(), files);
+            }
+            assert!(
+                !std::fs::read_to_string(log)
+                    .unwrap()
+                    .contains("transaction started")
+            );
+        }
+    }
+
+    #[test]
+    fn root_empty_directory_conversion_cannot_redirect_later_cleanup() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        use tar::EntryType::{Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for convert_tree in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            for directory in ["pivot", "landing/tree", "other/dir", "other/landing/tree"] {
+                std::fs::create_dir_all(root.join(directory)).unwrap();
+            }
+            std::fs::write(root.join("landing/tree/obsolete"), "old A contents").unwrap();
+            let victim = root.join("other/landing/tree/obsolete");
+            std::fs::write(&victim, "keep C contents").unwrap();
+            let sentinel = std::fs::metadata(&victim).unwrap();
+            symlink("pivot/../landing", root.join("alias")).unwrap();
+            alias_test_entry(&db, "b", "%FILES%\npivot/\n\n");
+            alias_test_entry(&db, "a", "%FILES%\nalias/tree/\nalias/tree/obsolete\n\n");
+            alias_test_entry(
+                &db,
+                "c",
+                "%FILES%\nother/\nother/dir/\nother/landing/\nother/landing/tree/\nother/landing/tree/obsolete\n\n",
+            );
+            let b = directory_conversion_archive(
+                temp.path(),
+                "b",
+                "2-1",
+                &[("pivot", Symlink, "other/dir")],
+                None,
+            );
+            let mut a_members = vec![("a-new", Regular, "must not install")];
+            if convert_tree {
+                a_members.push(("alias/tree", Symlink, "target"));
+            }
+            let a = directory_conversion_archive(temp.path(), "a", "2-1", &a_members, None);
+            let b_plan =
+                crate::preflight::inspect_transaction_archive(&b.path, &root, None).unwrap();
+            assert_eq!(
+                b_plan.directory_to_leaf_replacements,
+                HashSet::from([PathBuf::from("pivot")])
+            );
+            assert!(b_plan.deferred_directory_replacements.is_empty());
+            let a_plan =
+                crate::preflight::inspect_transaction_archive(&a.path, &root, None).unwrap();
+            if convert_tree {
+                assert_eq!(
+                    a_plan.deferred_directory_replacements,
+                    HashSet::from([PathBuf::from("landing/tree")])
+                );
+                assert!(a_plan.traversed_directories.contains(Path::new("pivot")));
+            } else {
+                // No incoming traversal: the old DB cleanup must independently block B.
+                assert!(a_plan.traversed_directories.is_empty());
+            }
+            let old_entries: Vec<_> = std::fs::read_dir(db.join("local"))
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let desc = std::fs::read(path.join("desc")).unwrap();
+                    let files = std::fs::read(path.join("files")).unwrap();
+                    (path, desc, files)
+                })
+                .collect();
+            let downloaded = prepare_archives(&db, &[b, a]);
+            let mut tx = transaction(&[]);
+            for name in ["b", "a"] {
+                tx.upgrades.push(alias_test_upgrade(name));
+                tx.package_order.push(name.into());
+            }
+            let hooks = masked_hooks(temp.path());
+            std::fs::write(hooks.join("00-empty-pivot-probe.hook"),
+                "[Trigger]\nType = Package\nOperation = Upgrade\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
+            let log = temp.path().join("log");
+            let mut logger = PaxLogger::open(&log);
+            let error = execute_transaction(
+                &tx,
+                &mut InstallContext {
+                    root_dir: &root,
+                    db_path: &db,
+                    architecture: "auto",
+                    downloaded: &downloaded,
+                    old_install_scripts: &HashMap::new(),
+                    old_backup_md5: &HashMap::new(),
+                    hook_dirs: &[hooks],
+                    check_space: false,
+                    logger: &mut logger,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ExecError::FileConflict(_)),
+                "convert_tree={convert_tree}: {error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("b: /pivot cannot become a non-directory: old database paths traverse this directory"), "{message}");
+            if convert_tree {
+                assert!(
+                    message.contains(
+                        "a: archive payload or hardlink source traverses directory /pivot"
+                    ),
+                    "{message}"
+                );
+            }
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep C contents");
+            assert_eq!(std::fs::metadata(&victim).unwrap().ino(), sentinel.ino());
+            assert!(
+                std::fs::symlink_metadata(root.join("other/landing/tree"))
+                    .unwrap()
+                    .is_dir()
+            );
+            assert_eq!(
+                std::fs::read(root.join("landing/tree/obsolete")).unwrap(),
+                b"old A contents"
+            );
+            assert!(
+                std::fs::symlink_metadata(root.join("landing/tree"))
+                    .unwrap()
+                    .is_dir()
+            );
+            assert!(
+                std::fs::symlink_metadata(root.join("pivot"))
+                    .unwrap()
+                    .is_dir()
+            );
+            assert_eq!(std::fs::read_dir(root.join("pivot")).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::read_link(root.join("alias")).unwrap(),
+                Path::new("pivot/../landing")
+            );
+            assert!(!root.join("a-new").exists());
+            assert_eq!(
+                std::fs::read_dir(db.join("local")).unwrap().count(),
+                old_entries.len()
+            );
+            for (path, desc, files) in old_entries {
+                assert_eq!(std::fs::read(path.join("desc")).unwrap(), desc);
+                assert_eq!(std::fs::read(path.join("files")).unwrap(), files);
+            }
+            assert!(
+                !std::fs::read_to_string(log)
+                    .unwrap()
+                    .contains("transaction started")
+            );
+        }
+    }
+
+    #[test]
+    fn root_nonempty_directory_recheck_preserves_unexpected_children() {
+        use tar::EntryType::{Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = temp.path().join("db");
+        std::fs::create_dir_all(root.join("tree/nested")).unwrap();
+        std::fs::write(root.join("tree/nested/old"), "obsolete").unwrap();
+        let old = alias_test_entry(
+            &db,
+            "old",
+            "%FILES%\ntree/\ntree/nested/\ntree/nested/old\n\n",
+        );
+        let raw = directory_conversion_archive(
+            temp.path(),
+            "old",
+            "2-1",
+            &[
+                ("first-payload", Regular, "must not install"),
+                ("tree", Symlink, "target"),
+            ],
+            None,
+        );
+        let plan = crate::preflight::inspect_transaction_archive(&raw.path, &root, None).unwrap();
+        let downloaded = prepare_archives(&db, &[raw]);
+        let mut tx = transaction(&[]);
+        tx.upgrades.push(alias_test_upgrade("old"));
+        tx.package_order.push("old".into());
+        let incoming = prepare_incoming(&tx, &downloaded).unwrap();
+        check_file_conflicts_inner(
+            &root,
+            &db,
+            &incoming,
+            &tx,
+            &simple_steps(&tx),
+            Some(&HashMap::from([("old", plan)])),
+        )
+        .unwrap();
+        // Model a hook/scriptlet adding data after the read-only ownership proof.
+        std::fs::write(root.join("tree/nested/local"), "keep unexpected").unwrap();
+        remove_package_paths(
+            &old,
+            &root,
+            &HashSet::from(["tree".into(), "first-payload".into()]),
+        )
+        .unwrap();
+        let error = extract_prepared(&downloaded[0], &db, &root, &HashMap::new())
+            .err()
+            .expect("unexpected child must prevent extraction");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot replace a nonempty directory"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("tree/nested/local")).unwrap(),
+            b"keep unexpected"
+        );
+        assert!(!root.join("tree/nested/old").exists());
+        assert!(!root.join("first-payload").exists());
+        assert!(old.exists());
+        assert!(!db.join("local/old-2-1").exists());
+    }
+
+    #[test]
+    fn root_owned_symlink_to_directory_upgrade_preserves_targets_and_hardlinks() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        use tar::EntryType::{Directory, Link, Regular};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for target_kind in [
+            "relative",
+            "absolute",
+            "external",
+            "escaping-relative",
+            "dangling",
+            "loop",
+        ] {
+            for alias in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("root");
+                let db = temp.path().join("db");
+                std::fs::create_dir_all(root.join("real-parent")).unwrap();
+                symlink("real-parent", root.join("alias")).unwrap();
+                let prefix = if alias {
+                    "alias/link"
+                } else {
+                    "real-parent/link"
+                };
+                let target = if matches!(target_kind, "external" | "escaping-relative") {
+                    temp.path().join("outside")
+                } else {
+                    root.join("target")
+                };
+                std::fs::create_dir_all(target.join("source")).unwrap();
+                std::fs::write(target.join("source/sentinel"), "keep sentinel").unwrap();
+                std::fs::write(target.join("child"), "not a future parent").unwrap();
+                let sentinel = std::fs::metadata(target.join("source/sentinel")).unwrap();
+                let link_target = match target_kind {
+                    "relative" => PathBuf::from("../target"),
+                    "escaping-relative" => PathBuf::from("../../outside"),
+                    "dangling" => temp.path().join("absent-external-target"),
+                    "loop" => PathBuf::from("link"),
+                    _ => target.clone(),
+                };
+                symlink(&link_target, root.join(prefix)).unwrap();
+                let old = alias_test_entry(&db, "old", &format!("%FILES%\n{prefix}\n\n"));
+                if target.starts_with(&root) {
+                    alias_test_entry(
+                        &db,
+                        "retained",
+                        "%FILES%\ntarget/\ntarget/child\ntarget/source/\ntarget/source/sentinel\n\n",
+                    );
+                }
+                let directory = format!("{prefix}/");
+                let source = format!("{prefix}/source");
+                let child = format!("{prefix}/child/file");
+                let hardlink = format!("{prefix}/child/hardlink");
+                let raw = directory_conversion_archive(
+                    temp.path(),
+                    "old",
+                    "2-1",
+                    &[
+                        (&directory, Directory, ""),
+                        (&source, Regular, "new source"),
+                        (&child, Regular, "new child"),
+                        (&hardlink, Link, &source),
+                    ],
+                    None,
+                );
+                let plan = crate::preflight::inspect_archive(&raw.path, &root, None).unwrap();
+                assert_eq!(
+                    plan.directory_replacements,
+                    HashSet::from([PathBuf::from("real-parent/link")])
+                );
+                let downloaded = prepare_archives(&db, &[raw]);
+                let mut tx = transaction(&[]);
+                tx.upgrades.push(alias_test_upgrade("old"));
+                tx.package_order.push("old".into());
+                let hooks = masked_hooks(temp.path());
+                let log = temp.path().join("log");
+                let mut logger = PaxLogger::open(&log);
+                execute_transaction(
+                    &tx,
+                    &mut InstallContext {
+                        root_dir: &root,
+                        db_path: &db,
+                        architecture: "auto",
+                        downloaded: &downloaded,
+                        old_install_scripts: &HashMap::new(),
+                        old_backup_md5: &HashMap::new(),
+                        hook_dirs: &[hooks],
+                        check_space: false,
+                        logger: &mut logger,
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{target_kind}, alias={alias}: {error}"));
+                assert!(
+                    std::fs::symlink_metadata(root.join(prefix))
+                        .unwrap()
+                        .is_dir()
+                );
+                assert_eq!(std::fs::read(root.join(&source)).unwrap(), b"new source");
+                assert_eq!(std::fs::read(root.join(&child)).unwrap(), b"new child");
+                assert_eq!(
+                    std::fs::metadata(root.join(&source)).unwrap().ino(),
+                    std::fs::metadata(root.join(&hardlink)).unwrap().ino()
+                );
+                assert_eq!(
+                    std::fs::read(target.join("source/sentinel")).unwrap(),
+                    b"keep sentinel"
+                );
+                assert_eq!(
+                    std::fs::metadata(target.join("source/sentinel"))
+                        .unwrap()
+                        .ino(),
+                    sentinel.ino()
+                );
+                assert_eq!(
+                    std::fs::read(target.join("child")).unwrap(),
+                    b"not a future parent"
+                );
+                assert!(!temp.path().join("absent-external-target").exists());
+                assert!(!old.exists());
+                let files = read_file_list(&db, "old", "2-1").unwrap();
+                for file in [&directory, &source, &child, &hardlink] {
+                    assert!(files.contains(file), "{files:?}");
+                }
+                assert_eq!(
+                    std::fs::read_link(root.join("alias")).unwrap(),
+                    Path::new("real-parent")
+                );
+                assert!(
+                    std::fs::read_to_string(log)
+                        .unwrap()
+                        .contains("transaction completed")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn root_directory_conversion_accepts_linked_removal_at_its_slot() {
+        use tar::EntryType::{Directory, Regular};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = temp.path().join("db");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/sentinel"), "keep").unwrap();
+        std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+        let old = alias_test_entry(&db, "old", "%FILES%\nlink\n\n");
+        let raw = directory_conversion_archive(
+            temp.path(),
+            "new",
+            "1-1",
+            &[("link/", Directory, ""), ("link/file", Regular, "new file")],
+            None,
+        );
+        let downloaded = prepare_archives(&db, &[raw]);
+        let mut tx = transaction(&["new"]);
+        tx.removals.push(pax_resolver::RemovalAction {
+            name: "old".into(),
+            version: Version::parse("1-1").unwrap(),
+            links: vec![pax_resolver::RemovalLink {
+                incoming: "new".into(),
+                reason: RemovalReason::Replaced,
+            }],
+        });
+        let hooks = masked_hooks(temp.path());
+        let mut logger = PaxLogger::open(&temp.path().join("log"));
+        execute_transaction(
+            &tx,
+            &mut InstallContext {
+                root_dir: &root,
+                db_path: &db,
+                architecture: "auto",
+                downloaded: &downloaded,
+                old_install_scripts: &HashMap::new(),
+                old_backup_md5: &HashMap::new(),
+                hook_dirs: &[hooks],
+                check_space: false,
+                logger: &mut logger,
+            },
+        )
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(root.join("link"))
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(std::fs::read(root.join("link/file")).unwrap(), b"new file");
+        assert_eq!(
+            std::fs::read(root.join("target/sentinel")).unwrap(),
+            b"keep"
+        );
+        assert!(!root.join("target/file").exists());
+        assert!(!old.exists());
+        assert_eq!(
+            read_file_list(&db, "new", "1-1").unwrap(),
+            ["link/", "link/file"]
+        );
+    }
+
+    #[test]
+    fn root_hardlink_source_cannot_traverse_another_packages_changing_symlink() {
+        use tar::EntryType::{Directory, Link, Regular};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = temp.path().join("db");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/sentinel"), "keep").unwrap();
+        std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+        let old = alias_test_entry(&db, "a", "%FILES%\nlink\n\n");
+        let old_desc = std::fs::read(old.join("desc")).unwrap();
+        let old_files = std::fs::read(old.join("files")).unwrap();
+        let a = directory_conversion_archive(
+            temp.path(),
+            "a",
+            "2-1",
+            &[("link/", Directory, ""), ("link/item", Regular, "A-data")],
+            None,
+        );
+        let b = directory_conversion_archive(
+            temp.path(),
+            "b",
+            "1-1",
+            &[
+                ("target/item", Regular, "B-data"),
+                ("copy", Link, "link/item"),
+            ],
+            None,
+        );
+        let a_plan = crate::preflight::inspect_archive(&a.path, &root, None).unwrap();
+        assert!(a_plan.traversed_symlinks.is_empty());
+        let b_plan = crate::preflight::inspect_archive(&b.path, &root, None).unwrap();
+        assert_eq!(
+            b_plan.traversed_symlinks,
+            HashSet::from([PathBuf::from("link")])
+        );
+        assert!(b_plan.directory_replacements.is_empty());
+        crate::extract::validate_package_archive(&b.path, &root).unwrap();
+        let downloaded = prepare_archives(&db, &[a, b]);
+        let mut tx = transaction(&["b"]);
+        tx.upgrades.push(alias_test_upgrade("a"));
+        tx.package_order.insert(0, "a".into());
+        let hooks = masked_hooks(temp.path());
+        std::fs::write(hooks.join("00-hardlink-probe.hook"),
+            "[Trigger]\nType = Package\nOperation = Install\nOperation = Upgrade\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
+        let log = temp.path().join("log");
+        let mut logger = PaxLogger::open(&log);
+        let error = execute_transaction(
+            &tx,
+            &mut InstallContext {
+                root_dir: &root,
+                db_path: &db,
+                architecture: "auto",
+                downloaded: &downloaded,
+                old_install_scripts: &HashMap::new(),
+                old_backup_md5: &HashMap::new(),
+                hook_dirs: &[hooks],
+                check_space: false,
+                logger: &mut logger,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ExecError::FileConflict(_)), "{error}");
+        assert!(error.to_string().contains(
+            "b: archive payload or hardlink source traverses filesystem symlink /link owned by changing package a"
+        ), "{error}");
+        assert_eq!(
+            std::fs::read_link(root.join("link")).unwrap(),
+            Path::new("target")
+        );
+        assert_eq!(
+            std::fs::read(root.join("target/sentinel")).unwrap(),
+            b"keep"
+        );
+        assert!(!root.join("link/item").exists());
+        assert!(!root.join("target/item").exists());
+        assert!(!root.join("copy").exists());
+        assert_eq!(std::fs::read(old.join("desc")).unwrap(), old_desc);
+        assert_eq!(std::fs::read(old.join("files")).unwrap(), old_files);
+        assert!(!db.join("local/a-2-1").exists());
+        assert!(!db.join("local/b-1-1").exists());
+        assert!(
+            !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("transaction started")
+        );
+    }
+
+    #[test]
+    fn root_directory_conversion_blockers_precede_hooks_and_all_mutations() {
+        use std::os::unix::fs::symlink;
+        use tar::EntryType::{Directory, Regular, Symlink};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        for scenario in [
+            "unowned",
+            "foreign",
+            "foreign-directory-record",
+            "upgraded-directory-record",
+            "regular-file",
+            "nonempty-directory",
+            "incoming-backup",
+            "old-backup-child",
+            "old-backup-declaration",
+            "old-link-backup",
+            "retained-child",
+            "earlier-member",
+            "later-archive",
+            "late-removal",
+            "late-upgrade",
+            "escaping-new-parent",
+            "dangling-new-parent",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let db = temp.path().join("db");
+            std::fs::create_dir_all(root.join("target")).unwrap();
+            for (path, contents) in [
+                ("target/config", "local changes"),
+                ("target/config.pacnew", "old pacnew"),
+                ("target/config.pacsave", "old pacsave"),
+                ("old-file", "old payload"),
+            ] {
+                std::fs::write(root.join(path), contents).unwrap();
+            }
+            match scenario {
+                "regular-file" => std::fs::write(root.join("link"), "keep ordinary file").unwrap(),
+                "nonempty-directory" => {
+                    std::fs::create_dir(root.join("link")).unwrap();
+                    std::fs::write(root.join("link/sentinel"), "keep directory contents").unwrap();
+                }
+                _ => symlink("target", root.join("link")).unwrap(),
+            }
+            let files = match scenario {
+                "unowned" | "foreign" | "foreign-directory-record" => "%FILES%\nold-file\n\n",
+                "old-backup-child" => {
+                    "%FILES%\nold-file\nlink\nlink/config\n\n%BACKUP%\nlink/config\tlegacy\n\n"
+                }
+                "old-backup-declaration" => {
+                    "%FILES%\nold-file\nlink\n\n%BACKUP%\nlink/config\tlegacy\n\n"
+                }
+                "old-link-backup" => "%FILES%\nold-file\nlink\n\n%BACKUP%\nlink\tlegacy\n\n",
+                "nonempty-directory" | "upgraded-directory-record" => {
+                    "%FILES%\nold-file\nlink/\n\n"
+                }
+                _ => "%FILES%\nold-file\nlink\n\n",
+            };
+            let old = alias_test_entry(&db, "old", files);
+            match scenario {
+                "foreign" => {
+                    alias_test_entry(&db, "retained", "%FILES%\nlink\n\n");
+                }
+                "foreign-directory-record" => {
+                    alias_test_entry(&db, "retained", "%FILES%\nlink/\n\n");
+                }
+                "retained-child" => {
+                    alias_test_entry(&db, "retained", "%FILES%\nlink/config\n\n");
+                }
+                _ => {}
+            }
+            let old_desc = std::fs::read(old.join("desc")).unwrap();
+            let mut tx = transaction(&[]);
+            tx.upgrades.push(alias_test_upgrade("old"));
+            tx.package_order.push("old".into());
+            let mut members = vec![("first-payload", Regular, "must not install")];
+            if scenario == "earlier-member" {
+                members.push(("link/earlier", Regular, "must not reach target"));
+            }
+            if scenario == "nonempty-directory" {
+                members.push(("link", Regular, "must not replace directory"));
+            } else {
+                members.extend([
+                    ("link/", Directory, ""),
+                    ("link/config", Regular, "new config"),
+                ]);
+            }
+            if matches!(scenario, "escaping-new-parent" | "dangling-new-parent") {
+                members.extend([
+                    (
+                        "link/parent",
+                        Symlink,
+                        if scenario == "escaping-new-parent" {
+                            "../../outside"
+                        } else {
+                            "missing"
+                        },
+                    ),
+                    ("link/parent/file", Regular, "must not follow"),
+                ]);
+            }
+            let conversion_name = if matches!(scenario, "late-removal" | "late-upgrade") {
+                "early"
+            } else {
+                "old"
+            };
+            let version = if conversion_name == "early" {
+                "1-1"
+            } else {
+                "2-1"
+            };
+            let mut raw = vec![directory_conversion_archive(
+                temp.path(),
+                conversion_name,
+                version,
+                &members,
+                (scenario == "incoming-backup").then_some("link/config"),
+            )];
+            if scenario == "later-archive" {
+                tx.installs = transaction(&["early"]).installs;
+                tx.package_order.insert(0, "early".into());
+                raw.insert(
+                    0,
+                    alias_test_archive(temp.path(), "early", "1-1", "link/earlier"),
+                );
+            } else if scenario == "late-upgrade" {
+                tx.installs = transaction(&["early"]).installs;
+                tx.package_order.insert(0, "early".into());
+                raw.push(alias_test_archive(temp.path(), "old", "2-1", "late-file"));
+            } else if scenario == "late-removal" {
+                tx = transaction(&["early", "late"]);
+                tx.removals.push(pax_resolver::RemovalAction {
+                    name: "old".into(),
+                    version: Version::parse("1-1").unwrap(),
+                    links: vec![pax_resolver::RemovalLink {
+                        incoming: "late".into(),
+                        reason: RemovalReason::Replaced,
+                    }],
+                });
+                raw.push(alias_test_archive(temp.path(), "late", "1-1", "late-file"));
+            }
+            let downloaded = prepare_archives(&db, &raw);
+            let hooks = masked_hooks(temp.path());
+            std::fs::write(hooks.join("00-directory-probe.hook"),
+                "[Trigger]\nType = Package\nOperation = Install\nOperation = Upgrade\nTarget = *\n[Action]\nWhen = PreTransaction\nExec = /must-not-run\nAbortOnFail\n").unwrap();
+            let log = temp.path().join("log");
+            let mut logger = PaxLogger::open(&log);
+            let error = execute_transaction(
+                &tx,
+                &mut InstallContext {
+                    root_dir: &root,
+                    db_path: &db,
+                    architecture: "auto",
+                    downloaded: &downloaded,
+                    old_install_scripts: &HashMap::new(),
+                    old_backup_md5: &HashMap::new(),
+                    hook_dirs: &[hooks],
+                    check_space: false,
+                    logger: &mut logger,
+                },
+            )
+            .unwrap_err();
+            let expected = match scenario {
+                "regular-file" => "cannot replace an existing non-directory",
+                "nonempty-directory" => "cannot replace a nonempty directory",
+                "incoming-backup" => "backup link/config is below",
+                "old-backup-child" | "old-backup-declaration" | "retained-child" => {
+                    "old database path /link/config"
+                }
+                "old-link-backup" => "declared as an installed backup",
+                "earlier-member" => "traversed by an earlier archive member",
+                "later-archive" => "traverses parent symlink /link",
+                "late-removal" => "before old owner old is removed",
+                "late-upgrade" => "before old owner old is upgraded",
+                "escaping-new-parent" => "parent symlink escapes installation root",
+                "dangling-new-parent" => "dangling parent symlink target",
+                _ => "requires changing old owners with non-directory records",
+            };
+            assert!(error.to_string().contains(expected), "{scenario}: {error}");
+            assert_eq!(std::fs::read_to_string(old.join("files")).unwrap(), files);
+            assert_eq!(std::fs::read(old.join("desc")).unwrap(), old_desc);
+            assert_eq!(
+                std::fs::read(root.join("old-file")).unwrap(),
+                b"old payload"
+            );
+            assert_eq!(
+                std::fs::read(root.join("target/config")).unwrap(),
+                b"local changes"
+            );
+            assert_eq!(
+                std::fs::read(root.join("target/config.pacnew")).unwrap(),
+                b"old pacnew"
+            );
+            assert_eq!(
+                std::fs::read(root.join("target/config.pacsave")).unwrap(),
+                b"old pacsave"
+            );
+            assert!(!root.join("target/config.pacsave.1").exists());
+            assert!(!root.join("target/earlier").exists());
+            assert!(!root.join("first-payload").exists());
+            assert!(!root.join("late-file").exists());
+            assert!(!db.join("local/old-2-1").exists());
+            assert!(
+                !std::fs::read_to_string(log)
+                    .unwrap()
+                    .contains("transaction started")
+            );
+            match scenario {
+                "regular-file" => assert_eq!(
+                    std::fs::read(root.join("link")).unwrap(),
+                    b"keep ordinary file"
+                ),
+                "nonempty-directory" => assert_eq!(
+                    std::fs::read(root.join("link/sentinel")).unwrap(),
+                    b"keep directory contents"
+                ),
+                _ => assert_eq!(
+                    std::fs::read_link(root.join("link")).unwrap(),
+                    Path::new("target")
+                ),
+            }
         }
     }
 

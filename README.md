@@ -235,7 +235,19 @@ state and planning changes, with a 30-second lock wait. Preflight checks archive
 metadata, architecture, paths, links, destination types, dependencies and file conflicts before
 hooks. Installs and upgrades retain dependency order; replacement removals are linked to
 incoming packages. Configuration handling uses archive checksums as baselines for
-`.pacnew`/`.pacsave`, preserving local edits across upgrades.
+`.pacnew`/`.pacsave`, preserving local edits across upgrades. Dependency cycles do not
+push unrelated dependents ahead of their providers, but steps within a cycle may
+have temporarily unsatisfied dependencies.
+
+An explicit archive directory can replace a symlink owned as a file by an upgraded
+or linked-removed package, without modifying the link's target. Retained ownership
+of the link, backup paths using it, and unproven cross-package symlink traversal
+are rejected before hooks. A nonempty directory can become a file or link only
+when every existing entry is owned and scheduled for obsolete-file cleanup before
+replacement. Unknown files, retained contents, backup paths and unsafe alias
+traversal block this conversion. Cleanup never recursively removes the directory;
+extraction replaces it only after it is empty. Regular-file-to-directory conversion
+remains unsupported.
 
 Signature policy applies to fresh and cached archives; invalid cache entries can be replaced
 by verified downloads. `Optional` permits missing, not invalid, signatures; `TrustedOnly`
@@ -245,7 +257,8 @@ archive copies under `DBPath/.pax-prepared/`, requiring extra disk space. These 
 retained recovery copies; download-only operations do not create them.
 
 Hooks support `AbortOnFail`, `Depends`, `NeedsTargets`, ordered exclusions and glob patterns.
-Hooks and scriptlets run inside the selected root with working directory `/`. A failing
+Hooks and scriptlets run inside the selected root with working directory `/` and
+`umask 022`, without changing the parent process's mask. A failing
 `PreTransaction` hook with `AbortOnFail` stops application. Nonfatal hook/scriptlet failures
 allow later maintenance but produce an error, not full success. After partial package
 application, post-transaction hooks are not run against the complete planned target set.
