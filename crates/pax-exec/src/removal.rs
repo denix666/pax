@@ -171,7 +171,14 @@ pub fn execute_removal_transaction(
         )?;
         packages.removed_files.clear();
         eprintln!(":: Applying package removals...");
-        for target in targets {
+        for (index, target) in targets.iter().enumerate() {
+            eprintln!(
+                "({}/{}) Removing {} ({})...",
+                index + 1,
+                targets.len(),
+                target.name,
+                target.version
+            );
             let removed = remove_transaction_package(
                 target,
                 root_dir,

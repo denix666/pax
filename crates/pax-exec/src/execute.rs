@@ -150,6 +150,12 @@ fn apply_transaction(
         failures,
     )?;
     eprintln!(":: Applying package changes...");
+    let total = steps.len()
+        + steps
+            .iter()
+            .map(|step| step.remove_before.len())
+            .sum::<usize>();
+    let mut current = 0;
 
     // Only retire packages belonging to this incoming slot. A failure must not
     // trigger removal of packages anchored to later, unrelated replacements.
@@ -166,6 +172,9 @@ fn apply_transaction(
                 .iter()
                 .find(|action| &action.name == removed_name)
                 .unwrap();
+            let version = removal.version.to_string();
+            current += 1;
+            eprintln!("({current}/{total}) Removing {removed_name} ({version})...");
             for link in &removal.links {
                 if link.reason == RemovalReason::Conflict {
                     eprintln!(
@@ -174,7 +183,6 @@ fn apply_transaction(
                     );
                 }
             }
-            let version = removal.version.to_string();
             remove_transaction_package(
                 &RemovalTarget {
                     name: removed_name.clone(),
@@ -192,6 +200,8 @@ fn apply_transaction(
         if let Some(upgrade) = tx.upgrades.iter().find(|upgrade| &upgrade.name == name) {
             let old_version = upgrade.old_version.to_string();
             let new_version = upgrade.new_version.to_string();
+            current += 1;
+            eprintln!("({current}/{total}) Upgrading {name} ({old_version} -> {new_version})...");
             let reason = get_existing_reason(ctx.db_path, name, &old_version);
             if let Some(script) = &package.install_script {
                 run_transaction_scriptlet(
@@ -261,6 +271,8 @@ fn apply_transaction(
             }
         } else if let Some(install) = tx.installs.iter().find(|install| &install.name == name) {
             let version = install.version.to_string();
+            current += 1;
+            eprintln!("({current}/{total}) Installing {name} ({version})...");
             if let Some(script) = &package.install_script {
                 run_transaction_scriptlet(
                     failures,
