@@ -110,9 +110,15 @@ fn scriptlet_output(
     script.flush()?;
     let script_path = Path::new("/tmp").join(script.path().file_name().unwrap());
     let mut command = command_in_root("/bin/bash", &root)?;
+    // Source without wrapper arguments so direct-execution dispatchers stay inert.
+    // Keep global scope for declarations, and preserve invocation across source-level shifts.
     command.args([
         "-c",
-        ". \"$1\" || exit $?; shift; if declare -F -- \"$1\" >/dev/null; then \"$@\"; fi",
+        r#"readonly -a __pax_scriptlet_argv=("$@")
+set --
+. "${__pax_scriptlet_argv[0]}" || exit $?
+set -- "${__pax_scriptlet_argv[@]:1}"
+if declare -F -- "$1" >/dev/null; then "$@"; fi"#,
         "pax-scriptlet",
     ]);
     command
@@ -236,6 +242,78 @@ mod tests {
             String::from_utf8(output.stdout).unwrap(),
             "2\n1; $(exit 89) ' \"\nold version *\n/\n"
         );
+    }
+
+    #[test]
+    fn source_dispatcher_receives_no_wrapper_arguments() {
+        // Some .INSTALL files also support direct execution, like sstp-client.
+        for (op, old) in [
+            (ScriptletOp::PreInstall, None),
+            (ScriptletOp::PostInstall, None),
+            (ScriptletOp::PreUpgrade, Some("old version *")),
+            (ScriptletOp::PostUpgrade, Some("old version *")),
+            (ScriptletOp::PreRemove, None),
+            (ScriptletOp::PostRemove, None),
+        ] {
+            let function = op.function_name();
+            let script = format!(
+                "printf 'source-argc:%s\\n' \"$#\"\n{function}() {{ printf 'called:{function}\\n'; printf 'arg:%s\\n' \"$@\"; }}\nop=$1\nshift\n$op \"$@\"\n"
+            );
+            let version = "2; $(exit 89) ' \"";
+            let output = scriptlet_output(&script, op, version, old, Path::new("/")).unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let mut expected = format!("source-argc:0\ncalled:{function}\narg:{version}\n");
+            if let Some(old) = old {
+                expected.push_str(&format!("arg:{old}\n"));
+            }
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+            assert!(output.stderr.is_empty(), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn source_dispatcher_with_absent_handler_is_noop() {
+        let output = scriptlet_output(
+            "post_upgrade() { printf 'must not run\\n'; }\nop=$1\nshift\n$op \"$@\"\n",
+            ScriptletOp::PreUpgrade,
+            "2",
+            Some("1"),
+            Path::new("/"),
+        )
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn source_dispatcher_preserves_handler_failure() {
+        let output = scriptlet_output(
+            "post_upgrade() { printf 'handler output\\n'; printf 'handler error\\n' >&2; return 42; }\nop=$1\nshift\n$op \"$@\"\n",
+            ScriptletOp::PostUpgrade,
+            "2",
+            Some("1"),
+            Path::new("/"),
+        ).unwrap();
+        assert_eq!(output.status.code(), Some(42), "{output:?}");
+        assert_eq!(output.stdout, b"handler output\n");
+        assert_eq!(output.stderr, b"handler error\n");
+    }
+
+    #[test]
+    fn source_keeps_global_declarations_and_cannot_rewrite_invocation() {
+        let output = scriptlet_output(
+            "declare -a settings=('global setting')\npost_upgrade() { printf '%s\\n' \"${settings[0]}\" \"$#\" \"$1\" \"$2\"; }\nset -- wrong_handler bogus\n:\n",
+            ScriptletOp::PostUpgrade,
+            "2; $(exit 89)",
+            Some("1 *"),
+            Path::new("/"),
+        ).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"global setting\n2\n2; $(exit 89)\n1 *\n");
+        assert!(output.stderr.is_empty());
     }
 
     #[test]
